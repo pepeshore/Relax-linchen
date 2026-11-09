@@ -75,6 +75,7 @@ from relax.utils.agentic_obs.records import utc_now
 from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
+from relax.utils.rl_agent_trace import start_agent_trace
 from relax.utils.types import get_spec_token_counts
 
 
@@ -1710,6 +1711,8 @@ class AgenticSessionShard:
         # Commit every Session ID and Runtime ownership before a drop can interleave at an await.
         for session in group.sessions:
             session.rollout_id = rollout_id
+            if session.observation is not None and session.observation.rl_trace is not None:
+                session.observation.rl_trace.assign(rollout_id)
         group.ownership = GroupOwnership.RUNTIME
         self._mark_group_timing(group, "group_runtime_leased_at")
         await self._set_group_timeout_active(group, self._group_generation_open(group))
@@ -1821,6 +1824,8 @@ class AgenticSessionShard:
                     async with session.lock:
                         if session.phase is SessionPhase.ACTIVE:
                             session.rollout_id = rollout_id
+                            if session.observation is not None and session.observation.rl_trace is not None:
+                                session.observation.rl_trace.assign(rollout_id)
                             if session.protection_pending_until_resume:
                                 session.protection_pending_until_resume = False
                                 session.protected_until_finalize = True
@@ -2208,6 +2213,12 @@ class AgenticSessionShard:
                 session.next_ir_sequence += 1
             if session.observation is not None:
                 session.observation.begin_call(request_id)
+                session.observation.calls[request_id].update(
+                    input_messages=copy.deepcopy(messages),
+                    tools=copy.deepcopy(tools),
+                    sampling_config=copy.deepcopy(sampling_params),
+                    model=self.args.hf_checkpoint,
+                )
                 session.observation.calls[request_id]["parent_state_hash"] = generation_parent.state_hash
             waiter = asyncio.get_running_loop().create_future()
             ir = InflightRequest(
@@ -2352,6 +2363,7 @@ class AgenticSessionShard:
     def _start_session(self, session: _SessionRecord, session_input: SessionInput) -> None:
         """Attach a record-owned process to one Session."""
 
+        start_agent_trace(self.args, session, session_input)
         process = self._agent_launcher.start_agent(session_input)
         if session.observation is not None:
             log_path = self._trajectory_recorder.session_log_path(session.session_id)
@@ -2605,6 +2617,10 @@ class AgenticSessionShard:
                         observation_attempt = (
                             observation.begin_attempt(ir.request_id, ir.rollout_id) if observation else None
                         )
+                        if observation_attempt is not None:
+                            observation_attempt.update(
+                                backend_request_id=backend_request_id, step_id=f"iteration:{ir.rollout_id}"
+                            )
                         try:
                             result = await self._generation_backend.generate(
                                 input_ids=ir.history_rollout_token_prefix + ir.pending_token_delta,
@@ -2622,6 +2638,9 @@ class AgenticSessionShard:
                                 # Count each returned delta before cleanup or a
                                 # superseding generation gate can discard it.
                                 observation.record_backend_timing(observation_attempt, result.meta_info)
+                                observation_attempt.update(
+                                    backend_request_id=backend_request_id, metadata=copy.deepcopy(result.meta_info)
+                                )
                                 observation.generated_tokens += len(result.new_tokens)
                                 observation_attempt.update(
                                     status="aborted" if result.finish_type == "abort" else "completed",
@@ -2945,6 +2964,14 @@ class AgenticSessionShard:
                 "total_tokens": prompt_tokens + completion_tokens,
             },
         }
+        if session.observation is not None:
+            session.observation.calls[ir.request_id].update(
+                response_messages=copy.deepcopy(response_messages),
+                usage=payload["usage"],
+                finish_reason=payload["finish_reason"],
+                response_state_hash=response_node.state_hash,
+                milestones=copy.deepcopy(agentic_trace_events(ir.pending_export_metadata_patch)),
+            )
         response_node.wall_elapsed_s = time.monotonic() - ir.wall_started_at
         return payload
 
@@ -2956,6 +2983,8 @@ class AgenticSessionShard:
         """Watch one process and finalize its Session result."""
 
         process_error = await asyncio.shield(process_wait)
+        if session.observation is not None and session.observation.rl_trace is not None:
+            session.observation.rl_trace.execution_end(process_error)
 
         group = session.group
         if isinstance(process_error, AgentExecutionError):
@@ -3092,6 +3121,7 @@ class AgenticSessionShard:
         finalize_events: dict[str, float],
     ) -> SessionExportTransport:
         forest = cast(SessionForest, session.forest)
+        export_started_at = time.time()
         prepared: list[tuple[str, dict[str, Any]]] = []
         if output_records:
             for output_record in output_records:
@@ -3147,6 +3177,8 @@ class AgenticSessionShard:
                     raise _NonFinalizableExportError(
                         f"R3 export routed-experts shape {actual_shape} does not match expected {expected_shape}"
                     )
+        if session.observation is not None and session.observation.rl_trace is not None:
+            session.observation.rl_trace.capture_exports(prepared, export_started_at)
         # Publish trajectories only after every export has passed validation.
         for state_hash, export_payload in prepared:
             sample_payload = export_payload["sample_payload"]
@@ -3289,6 +3321,8 @@ class AgenticSessionShard:
             session.observation.active_ms = getattr(resources.process, "active_ms", 0.0)
             session.observation.log_ref = getattr(resources.process, "observation_log_ref", None)
         async with session.lock:
+            if session.observation is not None and session.observation.rl_trace is not None:
+                session.observation.rl_trace.capture_states(session.forest)
             session.forest = None
             session.resp_state_hash_by_request_id.clear()
             session.resources = None
@@ -3352,6 +3386,11 @@ class AgenticSessionShard:
             )
         else:
             self._observe_session(session, "rollout", "completed", is_terminal=True)
+        if session.observation is not None and session.observation.rl_trace is not None:
+            trace_error = outcome if isinstance(outcome, BaseException) else None
+            if failure is not None and failure[1] in ("execution", "infra"):
+                trace_error = trace_error or RuntimeError(f"{failure[0]}: {failure[2]}")
+            session.observation.rl_trace.finish(trace_error)
         session.result_cell.publish(outcome)
         group.sessions.remove(session)
         self._notify_state_change(group)

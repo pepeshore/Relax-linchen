@@ -11,6 +11,8 @@ import ray
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.rl_trace_hooks import record_rewards, reward_attributes, trace_reward
+from relax.utils.rl_tracing import current_stage, stage
 from relax.utils.types import Sample
 
 from .dapo_genrm import async_compute_score_genrm
@@ -382,6 +384,10 @@ class RewardExecutor:
                 fallback=getattr(args, "rm_type_fallback", None),
                 sample_index=getattr(sample, "index", None),
             )
+            observation = current_stage()
+            if observation is not None and observation.span is not None and observation.span.name == "rl.reward.score":
+                observation.set("rl.reward.name", route.rm_type or "zero_fallback")
+                observation.set("rl.reward.type", "model" if route.rm_type in ("dapo-genrm", "remote_rm") else "rule")
             if route.zero_reward:
                 # Fallback "zero": no dispatch. Reuse the dummy reward so the
                 # 0.0 is reward-key aware and cannot mix dict/scalar shapes.
@@ -468,6 +474,7 @@ register_reward("dapo-genrm", async_compute_score_genrm, mode="async")
 register_reward("dummy", lambda args, sample: _dummy_reward(args), mode="async")
 
 
+@trace_reward
 async def async_rm(args, sample: Sample, **kwargs):
     """Single-sample reward computation.
 
@@ -488,5 +495,10 @@ async def batched_async_rm(
     Built-in rewards fan out through per-sample ``async_rm`` calls.
     """
     if args.custom_rm_path is not None and not kwargs.get("ignore_custom", False):
-        return await _get_reward_executor(args)._execute_custom_with_concurrency(args, samples, **kwargs)
+        with stage(
+            args, "rl.reward.score", attributes=reward_attributes(args, kwargs.get("evaluation", False))
+        ) as observation:
+            rewards = await _get_reward_executor(args)._execute_custom_with_concurrency(args, samples, **kwargs)
+            record_rewards(observation, samples, rewards, args)
+            return rewards
     return await asyncio.gather(*(async_rm(args, sample, **kwargs) for sample in samples))

@@ -90,6 +90,9 @@ from relax.utils.opd.opd_utils import (
 )
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from relax.utils.replay import capture_hooks
+from relax.utils.rl_trace_hooks import trace_forward, trace_iteration
+from relax.utils.rl_tracing import model_name, stage
+from relax.utils.rl_train_trace import training_rpc
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
@@ -1306,6 +1309,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         del rollout_data["rollout_indexer_topk"]
 
+    @trace_forward
     def compute_log_prob(
         self,
         data_iterator: list[DataIterator],
@@ -1393,6 +1397,8 @@ class MegatronTrainRayActor(TrainRayActor):
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
     @manual_gc_training
+    @trace_iteration
+    @training_rpc
     def train(self, rollout_id: int) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
@@ -1994,15 +2000,21 @@ class MegatronTrainRayActor(TrainRayActor):
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
-        rollout_data.update(
-            forward_only(
-                get_values,
-                self.args,
-                self.model,
-                data_iterator,
-                num_microbatches,
+        with stage(
+            self.args,
+            "rl.critic.forward",
+            attributes={"rl.model.name": model_name(self.args, "critic"), "rl.backend.name": "megatron"},
+            active=is_megatron_main_rank(),
+        ):
+            rollout_data.update(
+                forward_only(
+                    get_values,
+                    self.args,
+                    self.model,
+                    data_iterator,
+                    num_microbatches,
+                )
             )
-        )
         # Ship values to TransferQueue before we sleep — CP all-gather needs
         # live NCCL groups and .cpu() needs live GPU memory.
         self._put_critic_values_to_transfer_queue(rollout_data)
@@ -2306,6 +2318,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_train_done:
             self._wait_for_previous_eval()
 
+    @trace_iteration
     def compute_ref_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
@@ -2348,6 +2361,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.recv_weight_fully_async(rollout_id)
         log_perf_data_fwd(self.args, rollout_id)
 
+    @trace_iteration
     def compute_actor_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             if self.args.use_rollout_routing_replay:
@@ -2547,6 +2561,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 RoutingReplay.clear_all_forward()
 
     @manual_gc_training
+    @trace_iteration
+    @training_rpc
     def train_hybrid(self, rollout_id) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
@@ -2789,6 +2805,8 @@ class MegatronTrainRayActor(TrainRayActor):
             self._wait_for_previous_eval()
 
     @manual_gc_training
+    @trace_iteration
+    @training_rpc
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"

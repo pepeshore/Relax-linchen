@@ -24,6 +24,8 @@ from relax.core.node_group_affinity import maybe_pin_baseline_to_stable  # noqa:
 from relax.utils.agentic_obs.run_hooks import RunRecorder  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
+from relax.utils.rl_tracing import flush as flush_rl_traces  # noqa: E402
+from relax.utils.rl_tracing import initialize_run  # noqa: E402
 from relax.utils.tracking_utils import init_tracking  # noqa: E402
 from relax.utils.utils import post_process_env  # noqa: E402
 
@@ -45,6 +47,7 @@ _NORMAL_SHUTDOWN_TIMEOUT_SEC = 1800
 
 def _hard_exit(code: int):
     """Exit without running Python/native extension destructors."""
+    flush_rl_traces()
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.flush()
@@ -153,6 +156,7 @@ def main(args):
     signal.signal(signal.SIGINT, _graceful_shutdown)
     atexit.register(_graceful_shutdown)
 
+    initialize_run(args)
     _run_recorder = RunRecorder(args)
     _run_recorder.start()
     try:

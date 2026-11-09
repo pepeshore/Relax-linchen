@@ -53,6 +53,7 @@ from relax.utils.opd.opd_multimodal import (
     validate_prompt_token_ids,
 )
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
+from relax.utils.rl_trace_hooks import trace_generation, trace_iteration
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.score_centering import (
     append_score_centering_candidates,
@@ -653,6 +654,7 @@ async def generate(
     return sample
 
 
+@trace_generation
 async def _dispatch_generate(
     state: "GenerateState",
     args: Namespace,
@@ -907,6 +909,7 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
     return aborted_samples, completed_protected_samples
 
 
+@trace_iteration
 async def generate_rollout_async(
     args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]], data_system_client: Any
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
@@ -1325,6 +1328,7 @@ async def generate_rollout_async(
 EVAL_PROMPT_DATASET = {}
 
 
+@trace_iteration
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[RolloutFnEvalOutput, list[list[Sample]]]:
 
     state = GenerateState(args)

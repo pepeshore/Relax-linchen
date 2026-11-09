@@ -48,6 +48,7 @@ from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import available_memory, clear_memory, collect_manual_gc, log_step_peak_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
+from relax.utils.rl_trace_hooks import optimizer_result, trace_train
 from relax.utils.timer import timer
 from relax.utils.training.nonfinite_grad import (
     NonFiniteGradientNormError,
@@ -1340,6 +1341,7 @@ def train_one_step(
                     "rollout_topk_log_probs",
                     "max_seq_lens",
                     "sample_index_mask_sums",
+                    "sample_indices",
                     "pre_shifted_labels",
                     *(OBSERVATION_DATA_FIELDS if agentic_obs_enabled(args) else ()),
                     *_opd_keys,
@@ -1582,6 +1584,7 @@ def train_one_step(
         grad_norm = 0.0
         num_zeros_in_grad = None
         record_optimizer_result(False)
+        optimizer_result(rollout_id, step_id, False, "zero_effective_tokens")
     else:
         try:
             update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
@@ -1607,6 +1610,14 @@ def train_one_step(
                 exc_info=True,
             )
         record_optimizer_result(bool(update_successful))
+        optimizer_result(
+            rollout_id,
+            step_id,
+            bool(update_successful),
+            "nonfinite_gradient_norm"
+            if skipped_nonfinite_grad
+            else ("gradient_overflow" if not update_successful and grad_norm is None else None),
+        )
 
         if not getattr(args, "check_for_nan_in_loss_and_grad", True):
             # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
@@ -1701,6 +1712,7 @@ def should_disable_forward_pre_hook(args: Namespace) -> bool:
     return args.use_distributed_optimizer and args.overlap_param_gather
 
 
+@trace_train
 def train(
     rollout_id: int,
     model: Sequence[DDP],
@@ -1854,12 +1866,14 @@ def train(
     for step_id in range(num_steps_per_rollout):
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
         from relax.utils.agentic_obs.train_hooks import observe_train_step
+        from relax.utils.rl_train_trace import update as observe_rl_update
 
         # Cover all micro-batches, the optimizer, and post-step parameter gather.
         with log_step_peak_memory(rollout_id, rollout_id * num_steps_per_rollout + step_id, memory_ranks, memory_role):
             with (
                 timer(f"train_micro_batch_{step_id}", keep=False),
                 observe_train_step(args, rollout_id, step_id, role=getattr(model[0], "role", "actor")),
+                observe_rl_update(args, rollout_id, step_id, role=getattr(model[0], "role", "actor")),
             ):
                 loss_dict, grad_norm = train_one_step(
                     args,

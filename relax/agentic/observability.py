@@ -84,6 +84,7 @@ class SessionObservation:
     export_ids: list[int] = field(default_factory=list)
     failure: tuple[str, str, str] | None = None
     calls: dict[str, dict[str, Any]] = field(default_factory=dict)
+    rl_trace: Any = None
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
     def begin_call(self, request_id: str) -> None:

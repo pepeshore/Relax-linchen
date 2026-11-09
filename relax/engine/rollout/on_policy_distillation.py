@@ -15,6 +15,7 @@ from relax.utils.opd.opd_multimodal import (
     image_inputs,
     validate_image_input_ids,
 )
+from relax.utils.rl_trace_hooks import trace_opd_forward
 from relax.utils.types import Sample
 
 
@@ -381,6 +382,7 @@ class OpdManager:
         if ids is None or ids.shape != (response_length, self.topk_worker.top_k) or np.any(ids < 0):
             raise ValueError("Native image OPD requires complete R x K query IDs before cross-topk prefill.")
 
+    @trace_opd_forward("teacher")
     async def _teacher_prefill(self, sample: Sample, session: aiohttp.ClientSession) -> bool:
         response_length = int(sample.response_length or 0)
         if response_length <= 0:
@@ -494,6 +496,7 @@ class OpdManager:
 
         return True
 
+    @trace_opd_forward("actor")
     async def _student_prefill(
         self, sample: Sample, session: aiohttp.ClientSession, encode_mm_fn: EncodeMultimodalInputs | None
     ) -> None:

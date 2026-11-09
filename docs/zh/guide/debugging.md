@@ -162,3 +162,23 @@ python3 relax/entrypoints/train.py \
 ::: warning 注意
 batch 相关参数（`--global-batch-size`、`--n-samples-per-prompt`、并行度）要与产生 dump 的那次运行保持一致 —— dump 必须恰好包含一个 step 的样本量。**不要**与 `--debug-rollout-only` 或 `--load-debug-rollout-data` 同时使用，二者都会破坏其目的（不训练，或跳过 SGLang）。`forge_load` 不会触发解码期显存，因此不能替代对生成阶段峰值的测量。
 :::
+
+## 本地 RL Trace
+
+通过 `relax.entrypoints.train` 启动训练时，默认将 RL 阶段 trace 写入磁盘。每次启动都会生成新的 `rl.run.id`，从 checkpoint 恢复也不例外。文件默认位于 `<save>/otel-traces/<run_id>/`；没有设置 `--save` 时，使用 driver 工作目录下的 `otel-traces`。每个进程独立写入一个 OTLP JSONL 文件，每行是一次 OTLP trace 导出请求，分析时逐行合并读取。
+
+提交任务前设置 `RELAX_OTEL_DIR` 可更改输出根目录，设置 `RELAX_OTEL_ENABLED=0` 可关闭 RL trace，`OTEL_SDK_DISABLED=true` 也会关闭采集。若需要在一台机器上读取所有 worker 的数据，请使用共享持久化目录；使用节点本地磁盘时，需要分别收集各 worker 的文件。采集不依赖 Collector 地址。
+
+各阶段使用独立 trace，通过 `rl.run.id` 和 `rl.step.id` 关联；`rl.iteration.index` 保留框架从 0 开始的 rollout 轮次。能够直接确认的依赖使用 span Links。埋点不替换后端已有的 tracer provider，也不额外建立通用的跨进程 trace 上下文传递。
+
+结构化结果完整保存在运行目录下的 JSON 附件中，名称以 `_ref` 结尾的属性保存对应的绝对 `file:` URI。请同时保留 JSONL 和附件；迁移目录后，读取工具需要解析原 URI 对应的新位置。Agentic 运行还会启用已有 observation 记录，保存 Session 的请求、尝试、状态及 Export，并通过 Export ID 关联实际训练消费。无法观测的外部工具时间保持未知。这些记录包含模型输入输出，应根据训练数据设置目录权限和保留期限。
+
+阶段结束后即追加写入文件。进程在阶段执行中被强制终止时，该阶段可能没有结束记录。写入失败会记日志，训练继续运行；rank 数据不完整时，通过 `relax.observation.partial_ref` 保存诊断信息，不冒充完整训练结果。采集不会增加分布式通信，GPU 上的简要统计通过异步复制交给训练线程之外的读者处理。
+
+训练结束后，可检查文件格式、附件和阶段覆盖：
+
+```bash
+python scripts/tools/validate_rl_traces.py /path/to/otel-traces/RUN_ID --min-train-steps 2
+```
+
+如果存在失败 span、rank 数据不完整、附件不可读或训练轮次不足，检查会失败。工具汇总实际记录的阶段和优化器决策，不代表本次未运行的算法或路径也得到验证。

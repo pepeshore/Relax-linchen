@@ -16,7 +16,7 @@ import time
 import uuid
 from argparse import Namespace
 from collections import deque
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Deque, List, Optional, Tuple, cast
 
@@ -51,6 +51,8 @@ from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_values
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
+from relax.utils.rl_trace_hooks import trace_iteration
+from relax.utils.rl_tracing import iteration_context
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
 from relax.utils.types import Sample
@@ -119,25 +121,36 @@ async def _run_group(
 
     requires_complete_group = reward_domain.group_rm or reward_domain.custom_advantage_func is not None
 
-    def observe_reward(samples: list[Sample]):
-        return stage_recorder.observe(
-            samples,
-            rollout_id=current_rollout_id(),
-            group_id=stream.group_id,
-            stage="reward",
-            operation="provided_reward" if all(s.reward is not None for s in samples) else "rm",
-        )
+    @asynccontextmanager
+    async def observe_reward(samples: list[Sample]):
+        current = current_rollout_id()
+        with iteration_context(current):
+            async with stage_recorder.observe(
+                samples,
+                rollout_id=current,
+                group_id=stream.group_id,
+                stage="reward",
+                operation="provided_reward" if all(s.reward is not None for s in samples) else "rm",
+            ) as result:
+                yield result
 
-    def observe_filter(group: GroupExport, operation: str):
-        if stage_recorder is None:
-            return nullcontext({})
-        return stage_recorder.observe(
-            group.samples,
-            rollout_id=current_rollout_id(),
-            group_id=group.group_id,
-            stage="filter",
-            operation=operation,
-        )
+    @asynccontextmanager
+    async def observe_filter(group: GroupExport, operation: str):
+        current = current_rollout_id()
+        with iteration_context(current):
+            context = (
+                stage_recorder.observe(
+                    group.samples,
+                    rollout_id=current,
+                    group_id=group.group_id,
+                    stage="filter",
+                    operation=operation,
+                )
+                if stage_recorder is not None
+                else nullcontext({})
+            )
+            async with context as result:
+                yield result
 
     try:
         if requires_complete_group:
@@ -296,6 +309,7 @@ class AgenticResidentPipeline:
             "interrupted_runtime_group_count": len(self.runtime_domain.interrupted_group_ids),
         }
 
+    @trace_iteration
     async def run_step(self, rollout_id: int) -> RolloutFnTrainOutput:
         """Generate one rollout step while resident Group refs may cross
         steps."""
@@ -1216,6 +1230,7 @@ def _build_eval_samples(
         resources.shutdown()
 
 
+@trace_iteration
 async def eval_rollout(args, rollout_id: int) -> RolloutFnEvalOutput:
     recorder = StageRecorder(args, rollout_mode="eval")
     group_ids: set[str] = set()

@@ -21,6 +21,7 @@ from relax.engine.sft.runtime import (
 )
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
+from relax.utils.rl_train_trace import emit_windows
 from relax.utils.tq.lifecycle import attach_tq_client
 
 
@@ -298,13 +299,14 @@ class Actor(Base):
         # Use appropriate training method based on mode
         if self.config.hybrid:
             # hybrid mode: actor handles ref/actor_fwd/adv internally
-            ray.get(self.actor_model.train_hybrid(self.step))
+            trace_reports = ray.get(self.actor_model.train_hybrid(self.step))
         elif self.config.fully_async:
-            ray.get(self.actor_model.train_fully_async(self.step))
-            # Save model checkpoint if needed
-            self._maybe_save_model()
+            trace_reports = ray.get(self.actor_model.train_fully_async(self.step))
         else:
-            ray.get(self.actor_model.async_train(self.step))
+            trace_reports = ray.get(self.actor_model.async_train(self.step))
+        emit_windows(self.config, trace_reports)
+        if self.config.fully_async and not self.config.hybrid:
+            self._maybe_save_model()
         return True
 
     def _maybe_save_model(self) -> None:

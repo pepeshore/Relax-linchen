@@ -162,3 +162,23 @@ python3 relax/entrypoints/train.py \
 ::: warning
 Keep batch-related args (`--global-batch-size`, `--n-samples-per-prompt`, parallelism) identical to the dump run — the dump must contain exactly one step's worth of samples. Do **not** combine with `--debug-rollout-only` or `--load-debug-rollout-data`; both would defeat the purpose (no training, or SGLang skipped). `forge_load` does not exercise decode-time memory, so it is not a substitute for measuring the generation-phase peak.
 :::
+
+## Local RL traces
+
+Training launched through `relax.entrypoints.train` records RL stages to disk by default. Each launch gets a new `rl.run.id`, including checkpoint restarts. Files are written under `<save>/otel-traces/<run_id>/`; without `--save`, the root is `otel-traces` in the driver working directory. Each process writes its own OTLP JSONL file. Each line is an OTLP trace export request, so concatenate the files for analysis rather than parsing the entire directory as one JSON document.
+
+Set `RELAX_OTEL_DIR` before submission to choose another output root, or `RELAX_OTEL_ENABLED=0` to disable RL traces. `OTEL_SDK_DISABLED=true` also disables them. Use a shared, persistent filesystem when you want to read all workers' output from one machine; on node-local disks, collect files from each worker separately. No collector endpoint is required.
+
+Stages use independent traces. Join them using `rl.run.id` and `rl.step.id`; `rl.iteration.index` preserves the framework's zero-based rollout counter. Available direct dependencies use span Links. This instrumentation does not replace backend tracer providers or add general cross-process trace-context propagation.
+
+Structured results are saved in full JSON artifacts beneath the run directory. Attributes ending in `_ref` contain absolute `file:` URIs to these files. Keep the artifacts with the JSONL files; copying them to another path requires resolving the original URIs. Agentic runs also enable the existing observation records, retain Session requests, attempts, states and exports, and associate training consumption with Export IDs. Missing external tool timings are left unknown. These records include model inputs and outputs, so choose output permissions and retention appropriate to the training data.
+
+A completed stage is appended when it ends. A process killed during an active stage can leave that stage absent. An observation write failure is logged without failing training; incomplete rank summaries use `relax.observation.partial_ref` instead of claiming complete training results. Trace collection does not add distributed collectives; compact GPU summaries are copied asynchronously and read off the training thread.
+
+To check a completed run's file format, references and stage coverage, run:
+
+```bash
+python scripts/tools/validate_rl_traces.py /path/to/otel-traces/RUN_ID --min-train-steps 2
+```
+
+The check fails on failed spans, incomplete rank summaries, unreadable artifacts or insufficient training steps. It summarizes recorded stages and optimizer decisions; it does not assert that algorithms or paths absent from the run were exercised.

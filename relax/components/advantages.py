@@ -16,6 +16,8 @@ from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
     consume_opd_advantage_data,
 )
+from relax.utils.rl_trace_hooks import record_cpu_advantage
+from relax.utils.rl_tracing import enabled, stage
 from relax.utils.tq.lifecycle import attach_tq_client
 from relax.utils.training.ppo_utils import compute_approx_kl
 
@@ -88,6 +90,8 @@ class Advantages(Base):
                     if self.config.kl_coef != 0 or self.config.use_kl_loss:
                         adv_data_fields.append("ref_log_probs")
                     consume_opd_advantage_data(adv_data_fields, self.config)
+                    if enabled(self.config) and getattr(self.config, "use_agentic_rollout", False):
+                        adv_data_fields.append("sample_export_ids")
                     batch_meta = run_(
                         self.data_system_client.async_get_meta(
                             data_fields=adv_data_fields,
@@ -103,7 +107,15 @@ class Advantages(Base):
                     self._logger.info(
                         f"Successfully got rollout_id: {step} data from transfer queue for compute advantages and returns."
                     )
-                    advantages_and_returns = self.compute_advantages_and_returns(rollout_data)
+                    with stage(
+                        self.config,
+                        "rl.advantage.compute",
+                        iteration=step,
+                        attributes={"rl.advantage.estimator": self.config.advantage_estimator},
+                    ) as observation:
+                        advantages_and_returns = self.compute_advantages_and_returns(rollout_data)
+                        if "sample_export_ids" in rollout_data and advantages_and_returns is not None:
+                            record_cpu_advantage(observation, rollout_data, advantages_and_returns)
                     advantages_and_returns = TensorDict(advantages_and_returns, batch_size=[len(batch_meta.samples)])
                     # Actor can delete the partition as soon as the final advantages become readable.
                     partition_drained = getattr(self.config, "fully_async", False) and run_(

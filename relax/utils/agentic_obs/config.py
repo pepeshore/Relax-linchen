@@ -100,7 +100,9 @@ def train_generation_args(args: Namespace) -> Namespace:
     intact. This does not communicate with workers or touch distributed
     initialization.
     """
-    if not agentic_obs_enabled(args):
+    from relax.utils.rl_tracing import enabled as trace_enabled
+
+    if not agentic_obs_enabled(args) and not trace_enabled(args):
         return args
     import copy
     import uuid

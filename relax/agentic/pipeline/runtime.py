@@ -41,6 +41,7 @@ from relax.utils.agentic_obs.records import utc_now
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
+from relax.utils.rl_trace_hooks import trace_agentic_generation
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.score_centering import (
     configure_score_centering_request,
@@ -856,6 +857,7 @@ class RuntimeGroupStream:
     shard: _SessionShardBinding
     first_request_barrier: "asyncio.Future[bool]"
     session_results: Tuple[_SessionResultRef, ...]
+    trace_iterations: set[int] = field(default_factory=set)
     interrupted: bool = False
     protected: bool = False
     dropping: bool = False
@@ -1069,6 +1071,7 @@ class RuntimeDomain:
 
         try:
             await stream.shard.handle.lease_group.remote(stream.group_id, rollout_id)
+            stream.trace_iterations.add(rollout_id)
         except BaseException:
             await finish_before_cancellation(
                 self.drop_group(stream),
@@ -1084,6 +1087,10 @@ class RuntimeDomain:
             *(shard.handle.resume_generation.remote(rollout_id) for shard in self._shards)
         )
         await self._wait_for_shard_revisions(revisions)
+        for shard in self._shards:
+            for stream in shard.group_streams.values():
+                if stream.trace_iterations:
+                    stream.trace_iterations.add(rollout_id)
 
     async def pause_generation(self) -> None:
         """Seal train IR admission, abort active attempts, and join
@@ -1234,6 +1241,7 @@ class RuntimeDomain:
             if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
                 raise outcome
 
+    @trace_agentic_generation
     async def collect_group(self, stream: RuntimeGroupStream) -> Optional[GroupExport]:
         """Gather original Session exports into one complete Group export.
 

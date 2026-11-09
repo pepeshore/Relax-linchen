@@ -20,6 +20,7 @@ from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.rl_trace_hooks import trace_transfer
 from relax.utils.types import Sample
 
 
@@ -460,6 +461,10 @@ def post_process_env(args, env):
     if "env_vars" not in env or not isinstance(env["env_vars"], dict):
         env["env_vars"] = {}
 
+    from relax.utils.rl_tracing import runtime_env as trace_runtime_env
+
+    env["env_vars"].update(trace_runtime_env())
+
     # Dynamic-batch streaming ends via the producer's is_last signal, not a
     # pre-allocated partition, so pre-allocate the minimum (1) and let it grow.
     # The non-dynamic path still pre-allocates the exact count for its .all() check.
@@ -623,6 +628,7 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
     return convert_samples_to_train_data(args, selected_rows)
 
 
+@trace_transfer
 async def transfer_batch_to_data_system(
     args: Namespace,
     batch_samples: List,

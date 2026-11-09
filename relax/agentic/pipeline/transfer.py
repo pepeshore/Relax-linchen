@@ -15,12 +15,14 @@ from typing import Any, Callable, List, Optional, Tuple, cast
 
 from relax.agentic.pipeline import GroupExport
 from relax.agentic.profile import mark_sample_agentic_event, mark_sample_agentic_event_once
+from relax.utils.rl_trace_hooks import trace_agentic_transfer
 from relax.utils.types import Sample
 
 
 TransferBatch = Tuple[int, Tuple[GroupExport, ...], bool]
 
 
+@trace_agentic_transfer
 async def _transfer_batch_to_data_system(
     *,
     args: Namespace,
