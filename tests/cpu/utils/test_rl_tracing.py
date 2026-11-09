@@ -348,6 +348,10 @@ def test_training_rpc_combines_cp_facts_without_duplicate_stage(run, monkeypatch
         }
         with train.window(args, "actor", rollout_id, data=data):
             with train.update(args, rollout_id, 0, "actor"):
+                train.prepare_batch(data)
+                # Device tensors cannot be read on the host; use the CPU snapshot
+                # retained before the existing batch-to-device conversion.
+                data["sample_export_ids"] = torch.tensor([23], device="meta")
                 train.capture(args, data, masks=[torch.tensor([1.0, 0.0, 1.0, 0.0])])
                 train.optimizer_result(False, "zero_effective_tokens")
         time.sleep(0.01)  # checkpoint/offload outside the observed window
@@ -437,3 +441,19 @@ def test_checkpoint_failure_preserves_finished_training_without_changing_excepti
     record = spans(root)[0]
     assert record.get("status", {}).get("code", 0) == 0
     assert artifact(record, "relax.observation.partial")["updates"][0]["status"] == "committed"
+
+
+@pytest.mark.parametrize(
+    "versions, expected", [(["3", "3"], "3"), (["3", "4"], None), ([], None), ([None, "3"], None)]
+)
+def test_generation_reports_only_confirmed_unique_weight_version(run, versions, expected):
+    args, root = run
+    value = sample()
+    value.weight_versions = versions
+
+    @hooks.trace_generation
+    async def generate(state, args, value):
+        return value
+
+    assert asyncio.run(generate(None, args, value)) is value
+    assert attrs(spans(root)[0]).get("rl.model.version") == expected

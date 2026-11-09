@@ -25,7 +25,7 @@ EXP_NAME="${EXP_NAME:-qwen3-30b-a3b-dapo-16xgpu-otel-smoke}"
 : "${MODEL_DIR:?Set MODEL_DIR to the model root}"
 : "${DATA_DIR:?Set DATA_DIR to the dataset root}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
-NUM_ROLLOUT=2
+NUM_ROLLOUT="${NUM_ROLLOUT:-2}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 
 # Preserve the network interface selected by the experiment environment.

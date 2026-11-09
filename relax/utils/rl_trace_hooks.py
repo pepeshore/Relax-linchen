@@ -74,6 +74,19 @@ def _publish_source(samples: list[Any], observation: Any) -> None:
             sample.metadata["_rl_source"] = carrier
 
 
+@best_effort
+def _record_generation_version(observation: Any, samples: list[Any]) -> None:
+    histories = [getattr(sample, "weight_versions", []) for sample in samples]
+    if not histories or any(not history for history in histories):
+        return
+    versions = [version for history in histories for version in history]
+    if any(version is None or version == "" for version in versions):
+        return
+    unique = {str(version) for version in versions}
+    if len(unique) == 1:
+        observation.set("rl.model.version", next(iter(unique)))
+
+
 def trace_generation(function: Callable) -> Callable:
     @wraps(function)
     async def call(state: Any, args: Any, sample: Any, *rest: Any, **kwargs: Any) -> Any:
@@ -91,6 +104,7 @@ def trace_generation(function: Callable) -> Callable:
         }
         with stage(args, "rl.rollout.generate", attributes=attrs) as observation:
             result = await function(state, args, sample, *rest, **kwargs)
+            _record_generation_version(observation, _samples(result))
             _publish_source(_samples(result), observation)
             return result
 
@@ -300,7 +314,9 @@ def trace_agentic_generation(function: Callable) -> Callable:
             },
         ) as observation:
             try:
-                return await function(owner, stream)
+                result = await function(owner, stream)
+                _record_generation_version(observation, getattr(result, "samples", []))
+                return result
             finally:
                 if len(stream.trace_iterations) == 1:
                     from relax.utils.rl_tracing import iteration_attributes

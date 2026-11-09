@@ -201,18 +201,36 @@ def optimizer_result(successful: bool, reason: str | None = None) -> None:
 
 
 @best_effort
+def prepare_batch(batch: Any) -> None:
+    """Retain CPU identities before get_batch moves ordinary tensors to GPU."""
+    current = _CURRENT.get()
+    if current is None or not current["owner"] or batch.get("__is_dummy__", False):
+        return
+    try:
+        batch["_rl_observation_ids"] = {
+            key: _cpu_list(batch[key]) for key in ("sample_export_ids", "sample_indices") if batch.get(key) is not None
+        }
+    except Exception as error:
+        mark_incomplete(str(error))
+        logger.warning("RL OTel input identity capture failed: %s", error)
+
+
+@best_effort
 def capture(args: Any, batch: Any, masks: Any = None, *, local_gate: Any = None) -> None:
     current = _CURRENT.get()
     if current is None or not current["owner"] or batch.get("__is_dummy__", False):
         return
-    ids = batch.get("sample_export_ids")
-    member_ids = ids if ids is not None else batch.get("sample_indices")
-    if member_ids is not None:
-        prefix = "export" if ids is not None else "sample"
-        current.setdefault("members", []).extend(f"{prefix}:{value}" for value in _cpu_list(member_ids) if value >= 0)
-    if ids is None:
-        return
+    identity_data = batch.get("_rl_observation_ids", batch)
+    ids = identity_data.get("sample_export_ids")
+    member_ids = ids if ids is not None else identity_data.get("sample_indices")
     try:
+        if member_ids is not None:
+            prefix = "export" if ids is not None else "sample"
+            current.setdefault("members", []).extend(
+                f"{prefix}:{value}" for value in _cpu_list(member_ids) if value >= 0
+            )
+        if ids is None:
+            return
         import torch
 
         from relax.backends.megatron.cp_utils import slice_log_prob_with_cp
