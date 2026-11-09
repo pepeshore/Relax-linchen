@@ -71,10 +71,10 @@ def training_rpc(function: Callable) -> Callable:
         try:
             result = function(owner, rollout_id, *args, **kwargs)
             payload = _finish_windows(windows)
-            return {"rl_trace_windows": payload, "rl_trace_producer": _producer()} if result is None else result
+            return {"rl_trace_windows": payload, "rl_trace_producer": _producer(windows)} if result is None else result
         except BaseException:
             # Preserve completed training when a later checkpoint/eval fails.
-            producer = _producer()
+            producer = _producer(windows)
             if producer and producer["owner"] and producer["rank"]["dp"] == producer["rank"]["cp"] == 0:
                 completed = [w for w in windows if "end_time" in w and "error" not in w]
                 for item in _finish_windows(completed):
@@ -91,19 +91,12 @@ def training_rpc(function: Callable) -> Callable:
     return call
 
 
-@best_effort
-def _producer() -> dict[str, Any]:
-    from megatron.core import mpu
-
-    return {
-        "owner": _owner(),
-        "rank": {
-            "dp": mpu.get_data_parallel_rank(with_context_parallel=False),
-            "cp": mpu.get_context_parallel_rank(),
-            "tp": mpu.get_tensor_model_parallel_rank(),
-            "pp": mpu.get_pipeline_model_parallel_rank(),
-        },
-    }
+def _producer(windows: list[dict[str, Any]]) -> dict[str, Any]:
+    # Colocate sleep can destroy NCCL groups before the RPC returns. Preserve
+    # the ranks captured inside the operation while those groups were live.
+    if windows:
+        return {"owner": windows[0]["owner"], "rank": windows[0]["rank"]}
+    return {"owner": False, "rank": {}}
 
 
 def _finish_windows(windows: list[dict]) -> list[dict]:

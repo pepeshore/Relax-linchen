@@ -351,6 +351,7 @@ def test_training_rpc_combines_cp_facts_without_duplicate_stage(run, monkeypatch
                 train.capture(args, data, masks=[torch.tensor([1.0, 0.0, 1.0, 0.0])])
                 train.optimizer_result(False, "zero_effective_tokens")
         time.sleep(0.01)  # checkpoint/offload outside the observed window
+        cp["rank"] += 10  # live group queries are no longer valid after offload
 
     reports = []
     for rank in (0, 1):
