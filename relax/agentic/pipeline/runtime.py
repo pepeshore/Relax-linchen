@@ -858,6 +858,7 @@ class RuntimeGroupStream:
     first_request_barrier: "asyncio.Future[bool]"
     session_results: Tuple[_SessionResultRef, ...]
     trace_iterations: set[int] = field(default_factory=set)
+    trace_admitted_at: int | None = None
     interrupted: bool = False
     protected: bool = False
     dropping: bool = False
@@ -1069,6 +1070,9 @@ class RuntimeDomain:
     async def lease_group(self, stream: RuntimeGroupStream, rollout_id: int) -> None:
         """Move one prepared group into Runtime and release its IR gate."""
 
+        # The lease RPC can release generation before collect_group starts.
+        if stream.trace_admitted_at is None:
+            stream.trace_admitted_at = time.time_ns()
         try:
             await stream.shard.handle.lease_group.remote(stream.group_id, rollout_id)
             stream.trace_iterations.add(rollout_id)

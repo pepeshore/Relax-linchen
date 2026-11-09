@@ -4,18 +4,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from typing import Any, Callable
 
 from relax.utils.agentic_obs.writers import best_effort
-from relax.utils.rl_tracing import enabled, iteration_context, model_name, stage
+from relax.utils.rl_tracing import Stage, current_stage, enabled, iteration_context, model_name, stage
 
 
 _PURPOSE: ContextVar[str] = ContextVar("rl_purpose", default="training")
+_GENERATION_BATCH: ContextVar[GenerationBatch | None] = ContextVar("rl_generation_batch", default=None)
+_REWARD_BATCH: ContextVar[RewardBatch | None] = ContextVar("rl_reward_batch", default=None)
 
 
 def trace_iteration(function: Callable) -> Callable:
@@ -87,11 +92,156 @@ def _record_generation_version(observation: Any, samples: list[Any]) -> None:
         observation.set("rl.model.version", next(iter(unique)))
 
 
+class GenerationBatch:
+    """Observe admitted tasks without waiting for their reward/transfer
+    tails."""
+
+    def __init__(self, args: Any, evaluation: bool) -> None:
+        self.args = args
+        self.evaluation = evaluation
+        self.observation: Stage | None = None
+        self.members: dict[int, Any] = {}
+        self.pending: set[int] = set()
+        self.owners: dict[int, asyncio.Task] = {}
+        self.versions: set[str] = set()
+        self.unknown_version = False
+        self.error: BaseException | None = None
+        self.end_time: int | None = None
+        self.sealed = False
+
+    @best_effort
+    def track(self, task: asyncio.Task, samples: Any) -> None:
+        identities = []
+        for sample in _samples(samples):
+            # The existing completed-result fast path performs no generation.
+            if getattr(getattr(sample, "status", None), "name", None) in ("COMPLETED", "TRUNCATED"):
+                continue
+            identity = id(sample)
+            if identity not in self.members:
+                self.members[identity] = sample
+                self.pending.add(identity)
+            identities.append(identity)
+            # A child replaces its group task as owner. A failing gather must
+            # not close siblings that are still generating.
+            self.owners[identity] = task
+        if identities and self.observation is None:
+            self.observation = Stage(
+                self.args,
+                "rl.rollout.generate",
+                attributes={
+                    "rl.batch.id": uuid.uuid4().hex,
+                    "rl.purpose": "evaluation" if self.evaluation else "training",
+                    "rl.model.name": model_name(self.args),
+                    "rl.backend.name": "sglang",
+                },
+            )
+        if self.observation is not None:
+            self.observation.set("rl.batch.size", len(self.members))
+            multi_turn = getattr(self.args, "custom_generate_function_path", None) or any(
+                getattr(sample, "generate_function_path", None) for sample in self.members.values()
+            )
+            self.observation.set("rl.rollout.mode", "multi_turn" if multi_turn else "single_turn")
+
+        @best_effort
+        def done(finished: asyncio.Task) -> None:
+            remaining = [i for i in identities if i in self.pending and self.owners.get(i) is finished]
+            if remaining:
+                error = asyncio.CancelledError() if finished.cancelled() else finished.exception()
+                for identity in remaining:
+                    # Only a pre-dispatch failure/cancellation/abort reaches
+                    # this fallback; successful generation finishes below.
+                    self.finish(self.members[identity], [], error)
+
+        task.add_done_callback(done)
+
+    @best_effort
+    def finish(self, sample: Any, results: list[Any], error: BaseException | None) -> None:
+        identity = id(sample)
+        if identity not in self.pending:
+            return
+        self.end_time = time.time_ns()
+        self.pending.remove(identity)
+        self.owners.pop(identity, None)
+        if error is not None and self.error is None:
+            self.error = error
+        histories = [getattr(result, "weight_versions", []) for result in results]
+        if not histories or any(not history for history in histories):
+            self.unknown_version = True
+        for history in histories:
+            for version in history or []:
+                if version is None or version == "":
+                    self.unknown_version = True
+                else:
+                    self.versions.add(str(version))
+        if self.observation is not None:
+            _publish_source(results, self.observation)
+        self.close_if_finished()
+
+    @best_effort
+    def close_if_finished(self) -> None:
+        if self.sealed and not self.pending and self.observation is not None:
+            if not self.unknown_version and len(self.versions) == 1:
+                self.observation.set("rl.model.version", next(iter(self.versions)))
+            self.observation.end(self.error, end_time=self.end_time)
+            self.members.clear()
+            self.owners.clear()
+
+
+@contextmanager
+def generation_batch(args: Any, *, evaluation: bool = False) -> Iterator[None]:
+    batch = GenerationBatch(args, evaluation) if enabled(args) else None
+    token = _GENERATION_BATCH.set(batch)
+    try:
+        yield
+    finally:
+        if batch is not None:
+            batch.sealed = True
+            batch.close_if_finished()
+        _GENERATION_BATCH.reset(token)
+
+
+def track_generation_task(task: asyncio.Task, samples: Any) -> asyncio.Task:
+    batch = _GENERATION_BATCH.get()
+    if batch is not None:
+        batch.track(task, samples)
+    return task
+
+
+def seal_generation_batch() -> None:
+    batch = _GENERATION_BATCH.get()
+    if batch is not None:
+        batch.sealed = True
+        batch.close_if_finished()
+
+
+def trace_generation_window(function: Callable) -> Callable:
+    @wraps(function)
+    async def call(args: Any, *rest: Any, **kwargs: Any) -> Any:
+        with generation_batch(args, evaluation=True):
+            return await function(args, *rest, **kwargs)
+
+    return call
+
+
 def trace_generation(function: Callable) -> Callable:
     @wraps(function)
     async def call(state: Any, args: Any, sample: Any, *rest: Any, **kwargs: Any) -> Any:
         if not enabled(args):
             return await function(state, args, sample, *rest, **kwargs)
+        batch = _GENERATION_BATCH.get()
+        if batch is not None:
+            results = []
+            error = None
+            try:
+                result = await function(state, args, sample, *rest, **kwargs)
+                results = _samples(result)
+                return result
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                batch.finish(sample, results, error)
+        # Standalone callers have a genuine singleton input operation.
         attrs = {
             "rl.batch.id": uuid.uuid4().hex,
             "rl.batch.size": 1,
@@ -150,6 +300,18 @@ def trace_reward(function: Callable) -> Callable:
     async def call(args: Any, sample: Any, **kwargs: Any) -> Any:
         if not enabled(args):
             return await function(args, sample, **kwargs)
+        batch = _REWARD_BATCH.get()
+        if batch is not None:
+            batch.active += 1
+            value, error = None, None
+            try:
+                value = await function(args, sample, **kwargs)
+                return value
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                batch.record(sample, value, error)
         samples = _samples(sample)
         with stage(
             args,
@@ -160,6 +322,112 @@ def trace_reward(function: Callable) -> Callable:
             result = await function(args, sample, **kwargs)
             record_rewards(observation, samples, result if isinstance(sample, list) else [result], args)
             return result
+
+    return call
+
+
+@best_effort
+def record_reward_route(sample: Any, name: str, kind: str) -> None:
+    batch = _REWARD_BATCH.get()
+    if batch is not None:
+        batch.routes[id(sample)] = (name, kind)
+        return
+    observation = current_stage()
+    if observation is not None and observation.span is not None and observation.span.name == "rl.reward.score":
+        observation.set("rl.reward.name", name)
+        observation.set("rl.reward.type", kind)
+
+
+class RewardBatch:
+    """Keep fanout results even when gather returns an early failure."""
+
+    def __init__(self, args: Any, samples: list[Any], evaluation: bool) -> None:
+        self.args = args
+        self.samples = samples
+        self.routes: dict[int, tuple[str, str]] = {}
+        self.values: dict[int, Any] = {}
+        self.failures: dict[int, str] = {}
+        self.active = 0
+        self.sealed = False
+        self.error: BaseException | None = None
+        self.end_time: int | None = None
+        self.observation = Stage(
+            args, "rl.reward.score", attributes=reward_attributes(args, evaluation), links=_sources(samples)
+        )
+
+    @best_effort
+    def record(self, sample: Any, value: Any, error: BaseException | None) -> None:
+        self.active -= 1
+        self.end_time = time.time_ns()
+        if error is not None:
+            self.failures[id(sample)] = f"{type(error).__name__}: {error}"
+        else:
+            self.values[id(sample)] = value
+        self.close_if_finished()
+
+    @best_effort
+    def close(self, values: Any, error: BaseException | None) -> None:
+        self.sealed = True
+        self.error = error
+        self.end_time = time.time_ns()
+        if error is None:
+            self.values.update((id(sample), value) for sample, value in zip(self.samples, values, strict=True))
+        self.close_if_finished()
+
+    @best_effort
+    def close_if_finished(self) -> None:
+        if not self.sealed or self.active:
+            return
+        kinds = set(self.routes.values())
+        if len(kinds) == 1:
+            name, kind = next(iter(kinds))
+            self.observation.set("rl.reward.name", name)
+            self.observation.set("rl.reward.type", kind)
+        elif kinds:
+            self.observation.set("rl.reward.name", "router")
+            self.observation.set("rl.reward.type", "hybrid")
+        results = []
+        default_source = reward_attributes(self.args)["rl.reward.name"]
+        for sample in self.samples:
+            identity = id(sample)
+            if identity not in self.values and identity not in self.failures:
+                continue  # Never invent a value/status for an unfinished child.
+            item = {
+                "export_id": export_id(sample),
+                "source": self.routes.get(identity, (default_source, ""))[0],
+            }
+            if identity in self.failures:
+                item.update(status="error", reason=self.failures[identity])
+            else:
+                value = self.values[identity]
+                item.update(status="valid" if value is not None else "invalid", value=value)
+                if value is None:
+                    item["reason"] = "scorer returned no reward"
+                if isinstance(value, dict) and getattr(self.args, "reward_key", None):
+                    item["scalar_key"] = self.args.reward_key
+            results.append(item)
+        self.observation.data("rl.reward.results", results)
+        _publish_source(self.samples, self.observation)
+        self.observation.end(self.error, end_time=self.end_time)
+
+
+def trace_batched_reward(function: Callable) -> Callable:
+    @wraps(function)
+    async def call(args: Any, samples: list[Any], **kwargs: Any) -> Any:
+        if not enabled(args) or not samples or _REWARD_BATCH.get() is not None:
+            return await function(args, samples, **kwargs)
+        batch = RewardBatch(args, samples, kwargs.get("evaluation", False))
+        token = _REWARD_BATCH.set(batch)
+        values, error = None, None
+        try:
+            values = await function(args, samples, **kwargs)
+            return values
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            _REWARD_BATCH.reset(token)
+            batch.close(values, error)
 
     return call
 
@@ -304,6 +572,7 @@ def trace_agentic_generation(function: Callable) -> Callable:
             owner.args,
             "rl.rollout.generate",
             inherit_iteration=False,
+            start_time=getattr(stream, "trace_admitted_at", None),
             attributes={
                 "rl.batch.id": uuid.uuid4().hex,
                 "rl.batch.size": len(stream.session_results),

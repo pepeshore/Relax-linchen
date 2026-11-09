@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 from argparse import Namespace
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -150,6 +151,346 @@ def test_generation_finishes_before_reward(run):
     generation, reward_span = spans(root)
     assert int(generation["endTimeUnixNano"]) <= int(reward_span["startTimeUnixNano"])
     assert reward_span["links"][0]["spanId"] == generation["spanId"]
+
+
+def test_generation_batch_records_128_inputs_without_waiting_for_rewards(run):
+    args, root = run
+
+    async def execute():
+        release_reward = asyncio.Event()
+        all_generated = asyncio.Event()
+        generated = 0
+
+        @hooks.trace_generation
+        async def generate(state, args, value):
+            nonlocal generated
+            value.weight_versions = ["snapshot-1"]
+            generated += 1
+            if generated == 128:
+                all_generated.set()
+            return value
+
+        @hooks.trace_reward
+        async def reward(args, value):
+            await release_reward.wait()
+            return 0.0
+
+        async def pipeline(value):
+            value = await generate(None, args, value)
+            return await reward(args, value)
+
+        with tracing.iteration_context(0), hooks.generation_batch(args):
+            tasks = []
+            for _ in range(128):
+                value = sample()
+                tasks.append(hooks.track_generation_task(asyncio.create_task(pipeline(value)), [value]))
+        await all_generated.wait()
+        (generation,) = spans(root)
+        assert generation["name"] == "rl.rollout.generate"
+        assert attrs(generation)["rl.batch.size"] == "128"
+        assert attrs(generation)["rl.model.version"] == "snapshot-1"
+        assert not any(task.done() for task in tasks)
+        release_reward.set()
+        assert await asyncio.gather(*tasks) == [0.0] * 128
+        return generation
+
+    generation = asyncio.run(execute())
+    records = spans(root)
+    assert len(records) == 129
+    assert all(s["name"] != "rl.agent.run" for s in records)
+    rewards = [s for s in records if s["name"] == "rl.reward.score"]
+    assert all(s["links"][0]["spanId"] == generation["spanId"] for s in rewards)
+    # Streaming scoring can begin before the entire generation batch closes.
+    assert int(rewards[0]["startTimeUnixNano"]) < int(generation["endTimeUnixNano"])
+
+
+@pytest.mark.parametrize("failure", ["before_dispatch", "during_generation", "during_reward", "cancel_before_start"])
+def test_generation_batch_failure_keeps_running_siblings_and_native_end(run, failure):
+    args, root = run
+    original = ValueError(failure)
+
+    async def execute():
+        release = asyncio.Event()
+        started = asyncio.Event()
+        values = [sample(), sample()]
+        children = []
+
+        @hooks.trace_generation
+        async def generate(state, args, value):
+            if value is values[0]:
+                if failure == "during_generation":
+                    raise original
+            else:
+                started.set()
+                await release.wait()
+            return value
+
+        async def pipeline(value):
+            result = await generate(None, args, value)
+            if value is values[0] and failure == "during_reward":
+                raise original
+            return result
+
+        async def group():
+            if failure == "before_dispatch":
+                raise original
+            for value in values:
+                children.append(hooks.track_generation_task(asyncio.create_task(pipeline(value)), [value]))
+            return await asyncio.gather(*children)
+
+        with hooks.generation_batch(args):
+            task = hooks.track_generation_task(asyncio.create_task(group()), values)
+        if failure == "cancel_before_start":
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError if failure == "cancel_before_start" else ValueError):
+            await task
+        if children:
+            await started.wait()
+            assert not spans(root), "A failed group must not end a still-generating sibling"
+            release.set()
+            await asyncio.gather(*children, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    asyncio.run(execute())
+    (record,) = spans(root)
+    assert attrs(record)["rl.batch.size"] == "2"
+    assert record.get("status", {}).get("code", 0) == (0 if failure == "during_reward" else 2)
+
+
+def test_generation_batches_keep_topups_eval_and_cached_members_distinct(run):
+    args, root = run
+    cached = sample()
+    cached.status = SimpleNamespace(name="COMPLETED")
+    cached.metadata["_rl_source"] = {"original": True}
+
+    @hooks.trace_generation
+    async def generate(state, args, value):
+        await asyncio.sleep(0)
+        value.weight_versions = ["snapshot-1"]
+        return value
+
+    async def pipeline(value):
+        if value is cached:
+            return value
+        return await generate(None, args, value)
+
+    @hooks.trace_generation_window
+    async def evaluate(args):
+        tasks = []
+        for _ in range(3):
+            value = sample()
+            tasks.append(hooks.track_generation_task(asyncio.create_task(pipeline(value)), [value]))
+        return await asyncio.gather(*tasks)
+
+    async def execute():
+        tasks = []
+        with tracing.iteration_context(4):
+            # Two real admissions in one iteration, plus a cached-only batch.
+            for size in [2, 1, 0]:
+                with hooks.generation_batch(args):
+                    for value in [cached] + [sample() for _ in range(size)]:
+                        tasks.append(hooks.track_generation_task(asyncio.create_task(pipeline(value)), [value]))
+            tasks.append(asyncio.create_task(evaluate(args)))
+        await asyncio.gather(*tasks)
+
+    asyncio.run(execute())
+    records = spans(root)
+    assert len(records) == 3
+    assert len({attrs(s)["rl.batch.id"] for s in records}) == 3
+    assert {(attrs(s)["rl.purpose"], attrs(s)["rl.batch.size"]) for s in records} == {
+        ("training", "1"),
+        ("training", "2"),
+        ("evaluation", "3"),
+    }
+    assert cached.metadata["_rl_source"] == {"original": True}
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_batched_reward_suppresses_fanout_spans_and_preserves_sources(run, mixed):
+    args, root = run
+    values = [sample(), sample()]
+
+    @hooks.trace_reward
+    async def reward(args, value):
+        hooks.record_reward_route(value, "verifier" if mixed and value is values[1] else "math", "rule")
+        await asyncio.sleep(0)
+        return 0.0 if value is values[0] else 1.0
+
+    @hooks.trace_batched_reward
+    async def batch(args, samples):
+        return await asyncio.gather(*(reward(args, value) for value in samples))
+
+    with tracing.stage(args, "rl.rollout.generate") as generation:
+        hooks._publish_source(values, generation)
+    assert asyncio.run(batch(args, values)) == [0.0, 1.0]
+    records = spans(root)
+    assert len(records) == 2
+    scored = next(s for s in records if s["name"] == "rl.reward.score")
+    assert len(scored["links"]) == 1
+    assert attrs(scored)["rl.reward.name"] == ("router" if mixed else "math")
+    results = artifact(scored, "rl.reward.results")
+    assert [r["source"] for r in results] == ["math", "verifier" if mixed else "math"]
+    assert [r["value"] for r in results] == [0.0, 1.0]
+    assert len({r["export_id"] for r in results}) == 2
+    # Context reset: a later standalone score still emits its own span.
+    assert asyncio.run(reward(args, sample())) == 1.0
+    assert len(spans(root)) == 3
+
+
+def test_batched_reward_preserves_success_and_running_sibling_after_failure(run):
+    args, root = run
+    original = ValueError("scorer failed")
+
+    async def execute():
+        release = asyncio.Event()
+        values = [sample() for _ in range(3)]
+        children = []
+
+        @hooks.trace_reward
+        async def reward(args, value):
+            hooks.record_reward_route(value, "math", "rule")
+            if value is values[1]:
+                raise original
+            if value is values[2]:
+                await release.wait()
+            return 1.0
+
+        @hooks.trace_batched_reward
+        async def batch(args, samples):
+            children.extend(asyncio.create_task(reward(args, value)) for value in samples)
+            return await asyncio.gather(*children)
+
+        with pytest.raises(ValueError) as error:
+            await batch(args, values)
+        assert error.value is original
+        assert not spans(root), "Do not publish incomplete results while a real scoring child is running"
+        release.set()
+        await asyncio.gather(*children, return_exceptions=True)
+
+    asyncio.run(execute())
+    (record,) = spans(root)
+    assert record["status"]["code"] == 2
+    results = artifact(record, "rl.reward.results")
+    assert [item["status"] for item in results] == ["valid", "error", "valid"]
+    assert results[0]["value"] == results[2]["value"] == 1.0
+    assert "scorer failed" in results[1]["reason"]
+
+
+def test_eval_generation_is_exported_while_rewards_are_pending(run):
+    args, root = run
+
+    async def execute():
+        generated = asyncio.Event()
+        release = asyncio.Event()
+
+        @hooks.trace_generation
+        async def generate(state, args, value):
+            generated.set()
+            return value
+
+        async def pipeline(value):
+            await generate(None, args, value)
+            await release.wait()
+
+        @hooks.trace_generation_window
+        async def evaluate(args):
+            value = sample()
+            task = hooks.track_generation_task(asyncio.create_task(pipeline(value)), [value])
+            hooks.seal_generation_batch()
+            return await task
+
+        evaluation = asyncio.create_task(evaluate(args))
+        await generated.wait()
+        (record,) = spans(root)
+        assert attrs(record)["rl.purpose"] == "evaluation"
+        assert not evaluation.done()
+        release.set()
+        await evaluation
+
+    asyncio.run(execute())
+
+
+def test_agentic_generation_includes_lease_before_collection(run):
+    args, root = run
+    admitted_at = 1794182400000000000
+    stream = SimpleNamespace(trace_admitted_at=admitted_at, trace_iterations={0}, session_results=[object()])
+
+    @hooks.trace_agentic_generation
+    async def collect(owner, stream):
+        return SimpleNamespace(samples=[])
+
+    asyncio.run(collect(SimpleNamespace(args=args, rollout_mode="train"), stream))
+    (record,) = spans(root)
+    assert int(record["startTimeUnixNano"]) == admitted_at
+    assert attrs(record)["rl.rollout.mode"] == "agentic"
+
+
+def test_sglang_submission_emits_one_generation_batch_with_streaming_rewards(run, monkeypatch):
+    pytest.importorskip("ray")
+    pytest.importorskip("sglang_router")
+    from relax.engine.rollout import sglang_rollout as rollout
+    from relax.utils.types import Sample
+
+    args, root = run
+    args.custom_generate_function_path = None
+    args.group_rm = args.partial_rollout = False
+
+    async def execute():
+        release = asyncio.Event()
+        generated = asyncio.Event()
+        count = 0
+        state = object.__new__(rollout.GenerateState)
+        state.args = args
+        state.sampling_params = {}
+        state.semaphore = asyncio.Semaphore(128)
+        state.dp_rank_context = nullcontext
+        state.reset()
+
+        async def generate(args, sample, params, evaluation=False):
+            nonlocal count
+            sample.status = Sample.Status.COMPLETED
+            sample.weight_versions = ["1"]
+            count += 1
+            if count == 128:
+                generated.set()
+            return sample
+
+        @hooks.trace_reward
+        async def reward(args, sample):
+            await release.wait()
+            return 0.0
+
+        monkeypatch.setattr(rollout, "GenerateState", lambda args: state)
+        monkeypatch.setattr(rollout, "generate", generate)
+        monkeypatch.setattr(rollout, "async_rm", reward)
+        monkeypatch.setattr(rollout.opd, "is_opd_enabled", lambda *a, **kw: False)
+        state.submit_generate_tasks([[Sample() for _ in range(8)] for _ in range(16)])
+        await generated.wait()
+        (record,) = spans(root)
+        assert attrs(record)["rl.batch.size"] == "128"
+        assert record["name"] == "rl.rollout.generate"
+        release.set()
+        await asyncio.gather(*state.pendings)
+
+    asyncio.run(execute())
+    assert len([s for s in spans(root) if s["name"] == "rl.rollout.generate"]) == 1
+
+
+def test_real_batched_reward_entrypoint_keeps_one_span(run, monkeypatch):
+    pytest.importorskip("ray")
+    from relax.engine import rewards
+
+    args, root = run
+
+    async def execute(args, sample, **kwargs):
+        hooks.record_reward_route(sample, "math", "rule")
+        return 1.0
+
+    monkeypatch.setattr(rewards, "_get_reward_executor", lambda args: SimpleNamespace(execute=execute))
+    assert asyncio.run(rewards.batched_async_rm(args, [sample(), sample()])) == [1.0, 1.0]
+    (record,) = spans(root)
+    assert record["name"] == "rl.reward.score"
+    assert len(artifact(record, "rl.reward.results")) == 2
 
 
 def test_filter_callable_and_normal_drop(run):
@@ -444,9 +785,10 @@ def test_checkpoint_failure_preserves_finished_training_without_changing_excepti
 
 
 @pytest.mark.parametrize(
-    "versions, expected", [(["3", "3"], "3"), (["3", "4"], None), ([], None), ([None, "3"], None)]
+    "versions, expected", [(["3", "3"], "3"), (["3", "4"], None), ([], None), ([None, "3"], None), (None, None)]
 )
-def test_generation_reports_only_confirmed_unique_weight_version(run, versions, expected):
+@pytest.mark.parametrize("batched", [False, True])
+def test_generation_reports_only_confirmed_unique_weight_version(run, versions, expected, batched):
     args, root = run
     value = sample()
     value.weight_versions = versions
@@ -455,5 +797,12 @@ def test_generation_reports_only_confirmed_unique_weight_version(run, versions, 
     async def generate(state, args, value):
         return value
 
-    assert asyncio.run(generate(None, args, value)) is value
+    async def execute():
+        if batched:
+            with hooks.generation_batch(args):
+                task = hooks.track_generation_task(asyncio.create_task(generate(None, args, value)), [value])
+            return await task
+        return await generate(None, args, value)
+
+    assert asyncio.run(execute()) is value
     assert attrs(spans(root)[0]).get("rl.model.version") == expected

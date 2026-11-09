@@ -1741,6 +1741,77 @@ def _session_observation_fixture(tmp_path):
     return shard, session
 
 
+@pytest.mark.parametrize("outcome", ["completed", "failed", "pause_resume"])
+def test_session_lifecycle_exports_one_otel_agent_span(tmp_path, rollout_module, monkeypatch, outcome):
+    from urllib.parse import unquote, urlparse
+
+    from relax.agentic.runner import AgentExecutionError
+    from relax.utils.rl_tracing import initialize_run
+
+    monkeypatch.setenv("RELAX_OTEL_DIR", str(tmp_path / "otel"))
+    monkeypatch.setenv("RELAX_OTEL_ENABLED", "1")
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+    monkeypatch.delenv("RELAX_OTEL_RUN_ID", raising=False)
+
+    async def scenario():
+        shard, session = _session_observation_fixture(tmp_path)
+        shard.args.use_agentic_rollout = True
+        shard.args.agent_command = "test-agent"
+        initialize_run(shard.args)
+        shard._state_revision = 0
+        session.forest, _ = _two_turn_forest()
+        finished = asyncio.Event()
+
+        async def wait():
+            await finished.wait()
+            if outcome == "failed":
+                raise AgentExecutionError("test failure", reason_code="agent_exit_nonzero")
+
+        process = SimpleNamespace(
+            wait=wait,
+            configure_observability=lambda path: None,
+            terminate_and_join=AsyncMock(),
+            set_timeout_active=AsyncMock(),
+            output=SimpleNamespace(reward=1.0, metadata={}, records=()),
+        )
+        shard._agent_launcher = SimpleNamespace(start_agent=lambda payload: process)
+        shard._start_session(session, SimpleNamespace(input_payload={"messages": [{"role": "user", "content": "hi"}]}))
+        watcher = session.resources.watcher_task
+        await shard.resume_generation(0)
+        original_context = session.observation.rl_trace.span.context()
+        if outcome == "pause_resume":
+            await shard.pause_generation()
+            assert not list((tmp_path / "otel").rglob("*.jsonl"))
+            await shard.resume_generation(1)
+            assert session.observation.rl_trace.span.context() == original_context
+        finished.set()
+        await asyncio.wait_for(watcher, timeout=5)
+        assert session.result_cell.terminal and not shard._session_records
+        process.terminate_and_join.assert_awaited_once()
+        await shard._trajectory_recorder.aclose()
+
+    asyncio.run(scenario())
+    records = []
+    for path in (tmp_path / "otel").rglob("*.jsonl"):
+        for payload in _read_jsonl(path):
+            for resource in payload["resourceSpans"]:
+                for scope in resource["scopeSpans"]:
+                    records.extend(scope["spans"])
+    (record,) = records
+    assert record["name"] == "rl.agent.run"
+    attributes = {item["key"]: next(iter(item["value"].values())) for item in record["attributes"]}
+    assert attributes["rl.session.id"] == "s"
+    assert attributes["rl.session.export_count"] == ("0" if outcome == "failed" else "1")
+    assert record.get("status", {}).get("code", 0) == (2 if outcome == "failed" else 0)
+    if outcome == "pause_resume":
+        assert "rl.step.id" not in attributes
+    else:
+        assert attributes["rl.step.id"] == "iteration:0"
+    path = Path(unquote(urlparse(attributes["rl.trajectory.data_ref"]).path))
+    data = json.loads(path.read_text())
+    assert data["execution"]["result"] == ("failed" if outcome == "failed" else "completed")
+
+
 @pytest.mark.parametrize("failure_code", ["agent_timeout", "agent_exit_nonzero", "agent_output_invalid"])
 def test_session_failure_has_single_terminal_without_export(tmp_path, rollout_module, failure_code):
     from relax.agentic.runner import AgentExecutionError
