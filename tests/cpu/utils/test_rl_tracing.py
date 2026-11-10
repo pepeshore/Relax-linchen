@@ -34,7 +34,7 @@ def spans(root, name=None):
         for line in path.read_text().splitlines():
             for resource in json.loads(line)["resourceSpans"]:
                 for scope in resource["scopeSpans"]:
-                    assert scope["scope"] == {"name": "relax.rl", "version": "0.11.0"}
+                    assert scope["scope"] == {"name": "relax.rl", "version": "0.12.0"}
                     result.extend(scope["spans"])
     return [span for span in result if name is None or span["name"] == name]
 
@@ -825,8 +825,11 @@ def test_complete_sample_continues_across_windows_and_keeps_input(run):
     value.response = "partial"
     value.status = SimpleNamespace(name="ABORTED")
 
+    headers = []
+
     @hooks.trace_generation
     async def generate(state, args, value):
+        headers.append(tracing.inference_headers())
         return value
 
     async def window(value, iteration):
@@ -842,6 +845,7 @@ def test_complete_sample_continues_across_windows_and_keeps_input(run):
 
     @hooks.trace_generation
     async def finish(state, args, value):
+        headers.append(tracing.inference_headers())
         value.response = "完整答案" * 10000
         value.status = SimpleNamespace(name="COMPLETED")
         return value
@@ -860,6 +864,8 @@ def test_complete_sample_continues_across_windows_and_keeps_input(run):
     assert artifact(detail, "rl.sample.input") == value.prompt
     assert artifact(detail, "rl.sample.response")[0]["text"] == resumed.response
     assert len(detail["links"]) == 1
+
+    assert len(headers) == 2 and headers[0]["traceparent"] == headers[1]["traceparent"]
 
 
 def test_custom_batch_reward_keeps_results_without_synthetic_children(run):
@@ -1031,3 +1037,94 @@ def test_validator_rejects_synthetic_result_spans_in_new_scope(run):
     parent.end()
     with pytest.raises(ValueError, match="Result rows must be stored on the batch"):
         validate(root)
+
+
+def test_inference_headers_use_explicit_parent_without_mutating_routing(run, monkeypatch):
+    from opentelemetry.trace import get_current_span
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    args, _ = run
+    headers = {"X-SMG-Routing-Key": "session-1", "TraceParent": "stale", "tracestate": "stale=state"}
+    assert tracing.inference_headers(headers) is headers
+    parent = tracing.Stage(args, "rl.rollout.sample")
+    try:
+        with tracing.inference_context(parent):
+            carrier = tracing.inference_headers(headers)
+            context = get_current_span(TraceContextTextMapPropagator().extract(carrier)).get_span_context()
+            assert context.trace_id == parent.span.get_span_context().trace_id
+            assert context.span_id == parent.span.get_span_context().span_id
+            assert carrier["X-SMG-Routing-Key"] == "session-1"
+            assert "TraceParent" not in carrier and "tracestate" not in carrier
+            assert headers["TraceParent"] == "stale"
+            with tracing.inference_context(None):
+                assert tracing.inference_headers() is None
+            assert tracing.inference_headers()["traceparent"] == carrier["traceparent"]
+            monkeypatch.setenv("RELAX_OTEL_ENABLED", "0")
+            assert tracing.inference_headers(headers) is headers
+            monkeypatch.setenv("RELAX_OTEL_ENABLED", "1")
+        assert tracing.inference_headers() is None
+    finally:
+        parent.end()
+    with tracing.inference_context(parent):
+        assert tracing.inference_headers() is None
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_concurrent_generation_requests_inherit_their_own_sample(run, batched):
+    args, root = run
+    carriers = {}
+
+    async def execute():
+        ready = asyncio.Event()
+        entered = 0
+
+        @hooks.trace_generation
+        async def generate(state, args, value):
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                ready.set()
+            await ready.wait()
+            carriers[value.index] = tracing.inference_headers({"X-SMG-Routing-Key": str(value.index)})
+            await asyncio.sleep(0)
+            assert tracing.inference_headers()["traceparent"] == carriers[value.index]["traceparent"]
+            return value
+
+        values = [sample(), sample()]
+        for index, value in enumerate(values):
+            value.index = index
+        if batched:
+            with hooks.generation_batch(args):
+                tasks = [
+                    hooks.track_generation_task(asyncio.create_task(generate(None, args, value)), [value])
+                    for value in values
+                ]
+        else:
+            tasks = [asyncio.create_task(generate(None, args, value)) for value in values]
+        await asyncio.gather(*tasks)
+        assert tracing.inference_headers() is None
+
+    asyncio.run(execute())
+    records = spans(root, "rl.rollout.sample")
+    assert len(records) == 2
+    for record in records:
+        index = int(attrs(record)["rl.sample.index"])
+        assert carriers[index]["traceparent"].split("-")[1:3] == [record["traceId"], record["spanId"]]
+        assert carriers[index]["X-SMG-Routing-Key"] == str(index)
+
+
+def test_generation_context_resets_after_failure(run):
+    args, root = run
+
+    @hooks.trace_generation
+    async def generate(state, args, value):
+        assert tracing.inference_headers()["traceparent"]
+        raise RuntimeError("generation failed")
+
+    async def execute():
+        with pytest.raises(RuntimeError, match="generation failed"):
+            await generate(None, args, sample())
+        assert tracing.inference_headers() is None
+
+    asyncio.run(execute())
+    assert spans(root, "rl.rollout.sample")[0]["status"]["code"] == 2

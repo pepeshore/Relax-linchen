@@ -36,7 +36,12 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                             raise ValueError(f"Missing Resource {key}")
                     for scope in resource["scopeSpans"]:
                         version = scope["scope"].get("version")
-                        if scope["scope"].get("name") != "relax.rl" or version not in ("0.9.0", "0.10.0", "0.11.0"):
+                        if scope["scope"].get("name") != "relax.rl" or version not in (
+                            "0.9.0",
+                            "0.10.0",
+                            "0.11.0",
+                            "0.12.0",
+                        ):
                             raise ValueError("Unexpected instrumentation scope")
                         for span in scope["spans"]:
                             for key, length in (("traceId", 32), ("spanId", 16)):
@@ -89,11 +94,11 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
         if version == "0.9.0":
             continue
         name = span["name"]
-        if version == "0.11.0":
+        if version in ("0.11.0", "0.12.0"):
             if attrs.get("rl.sample.timing") == "result":
                 raise ValueError("Result rows must be stored on the batch, not emitted as spans")
             if name.endswith(".sample") and name != "rl.rollout.sample":
-                raise ValueError(f"Redundant member span in 0.11: {name}")
+                raise ValueError(f"Redundant member span in {version}: {name}")
         parent_name = {"rl.rollout.sample": "rl.rollout.generate", "rl.reward.score": "rl.reward.batch"}.get(name)
         if parent_name is None and name.endswith(".sample"):
             parent_name = name[:-7]

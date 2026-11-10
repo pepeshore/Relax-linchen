@@ -17,7 +17,15 @@ from typing import Any, Callable
 
 from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.rl_sample_trace import admit_sample, sample_attributes
-from relax.utils.rl_tracing import Stage, current_stage, enabled, iteration_context, model_name, stage
+from relax.utils.rl_tracing import (
+    Stage,
+    current_stage,
+    enabled,
+    inference_context,
+    iteration_context,
+    model_name,
+    stage,
+)
 
 
 _PURPOSE: ContextVar[str] = ContextVar("rl_purpose", default="training")
@@ -257,7 +265,9 @@ def trace_generation(function: Callable) -> Callable:
             results = []
             error = None
             try:
-                result = await function(state, args, sample, *rest, **kwargs)
+                detail = batch.sample_observations.get(id(sample))
+                with inference_context(detail.span if detail is not None else None):
+                    result = await function(state, args, sample, *rest, **kwargs)
                 results = _samples(result)
                 return result
             except BaseException as exc:
@@ -280,7 +290,8 @@ def trace_generation(function: Callable) -> Callable:
             detail = admit_sample(args, sample, observation)
             results, error = [], None
             try:
-                result = await function(state, args, sample, *rest, **kwargs)
+                with inference_context(detail.span if detail is not None else None):
+                    result = await function(state, args, sample, *rest, **kwargs)
                 results = _samples(result)
                 _record_generation_version(observation, results)
                 return result

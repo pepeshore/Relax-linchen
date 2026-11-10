@@ -2,7 +2,7 @@
 
 **Status:** Development
 
-**Version:** 0.11.0
+**Version:** 0.12.0
 
 **Date:** 2026-11-10
 
@@ -71,12 +71,14 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 3. **依赖关联。** 无论同 trace 还是跨 trace，有实际调用触发、数据消费或参数版本来源关系时，由被触发方／消费方的 span Link 到直接来源 span 的真实 SpanContext；阶段之间不通过 parent 表达该依赖。例如，训练 Link 到实际消费的优势计算／数据交付，权重加载 Link 到对应权重发布，Agent Link 到实际接纳或恢复它的 rollout。多来源操作关联各实际直接来源，并按 `(traceId, spanId)` 去重；不因同轮、时间相近或仅先后执行而建立 Link，不要求补齐所有间接祖先。
 4. **上下文传递。** 跨进程、线程、队列及权重交付时，按实际关系传递 Context：符合第 1 条的共同上游 Context 可用于创建同级阶段、复用 traceId；直接来源的阶段 SpanContext 则用于 Link，不作为接收阶段 span 的 parent。创建时已知的依赖直接加入 Links，执行中确认的依赖在 span 结束前追加；不修改已经结束的来源 span。来源未被采集或上下文确实不可取得时，保留已有业务 ID 和明细，不根据 Run／Step／Export ID 生成虚假的 traceId 或 spanId。
 5. **后端工作的 RL 封装。** SGLang、Megatron 的后端工作必须归属于负责该次操作的 RL 框架 span，由该 span 记录框架侧调用的完整起止与结果。直接复用本规范已有的阶段 span，不为每个后端内部 span 另建 RL 包装 span。例如，策略训练归属于 `rl.actor.train`，价值训练归属于 `rl.critic.train`，独立前向归属于对应的 forward span；普通生成归属于 `rl.rollout.sample`，其 parent 为首次接纳的 `rl.rollout.generate`；Agent 调用中的生成归属于 `rl.agent.run`，再由 Agent Link 到对应 sample。
-6. **后端 trace 隔离与关联。** 上述封装表示业务归属，不建立 RL 与后端 span 的父子关系。后端 trace 必须独立于对应 RL trace，不继承 RL span 的 traceId，也不以 RL span 为 parent。后端 trace 的根 span 或对应调用的子树入口 span，通过 Span Link 指向负责该次操作的 RL span 的真实 SpanContext；传入的 RL Context 仅作为 Link 来源。SGLang、Megatron 内部已有的 span 名称、语义和真实父子关系继续沿用，同一后端子树中的后代通过入口 Link 追溯 RL 归属，无需逐个复制相同 Link。一个 RL span 可以关联多个后端 trace；共享后端工作涉及多个 RL 调用时，关联实际相关的 RL spans，不任选一个归属。
-7. **规模与耗时。** 不将不同请求、rank 或更新已有的后端 traces 强行合并到一个 RL trace；通过上述隔离避免一次迭代的后端细节集中到同一条 trace。该规则控制单条 trace 的规模，不减少后端实际产生的 span 总量。各阶段按自己的真实起止时间结束；RL 阶段与后端操作，以及嵌套或并行阶段之间的耗时重叠，不得重复相加作为 Step 总耗时。
+6. **SGLang 推理父子关系。** SGLang 请求入口 span 继承负责本次调用的 RL span 的 traceId，并将其作为 parent：普通生成指向 `rl.rollout.sample`，Agentic 模型请求指向 `rl.agent.run`。通过 HTTP `traceparent`／`tracestate` 传递真实 SpanContext，在进入 Ray HTTP worker 或 router 前完成注入；中间层应保留该上下文。SGLang 内部 spans 保持原有名称和父子树，不为每个内部 span 再创建 RL 包装。单个 sample／Agent 可以包含多次请求，它们分别归属于同一个 RL span；重试和恢复不把请求挂到其他样本。若启用 router 自身 tracing，允许真实的 router span 位于 RL 与 SGLang 之间，并保持可追溯的父链。
+7. **其他后端与耗时。** 其他后端（如 Megatron）仍可使用独立 trace，通过入口 Span Link 指向负责该操作的 RL span；当前未实现 Megatron 内部 trace 的自动关联。SGLang 与 RL 共享 trace 后，一条 rollout 批次 trace 可以包含多个样本及其推理细节，不再要求这些 SGLang 请求使用独立 trace。各阶段保留真实起止；父子、并行阶段及 RL／后端耗时不能相加作为 Step 总耗时。
 
-**当前实现范围（Relax RL 0.11.0）：** 上述后端隔离与 Link 规则定义接入后端 tracing 时的要求，不表示当前已经完成该集成。当前 RL 埋点没有向 SGLang 生成请求注入 RL SpanContext，也没有建立 SGLang／Megatron 内部 trace 到 RL span 的自动 Link。仅开启 SGLang tracing 不会自动获得这些关联，也不会将后端 spans 写入 RL 的本地 JSONL 文件。后端仍需单独配置采集和导出。
+**当前实现范围（Relax RL 0.12.0）：** 内置普通 rollout、`GenerateState.post_generate` 和 Agentic SGLang adapter 注入上述 W3C 上下文。RL tracing 关闭或无有效来源 span 时不注入。现有路由 headers 保留；独立并发样本／Session 的上下文相互隔离。自定义生成若绕过这些入口、自行调用 HTTP 客户端，需使用相同的 `inference_headers` 辅助函数。
 
-接入时应在真实请求边界传递负责该调用的 RL SpanContext，并确保经过 router／代理后仍可取得；后端将该上下文用于 Span Link，保留自身独立 trace。普通生成关联 `rl.rollout.sample`，Agent 内模型调用关联 `rl.agent.run`。仅把 RL 上下文放进标准 `traceparent` 并让后端直接作为 parent，会形成共享 trace 的父子关系，不符合本规范的后端隔离要求。`rl.run.id`、`rl.step.id`、样本／请求 ID 用于业务查询，不能代替真实 SpanContext。
+SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL 的进程内文件 exporter 自动写出。采集两端后按 `(traceId, spanId, parentSpanId)` 还原父子关系；`rl.run.id`／`rl.step.id` 等属性不会由 parent 自动复制，可沿父链定位所属 RL span。不要用时间接近或业务 ID 伪造父关系。
+
+**Agent 应用自身的 spans：** `rl.agent.run` 是 Relax Session 侧的框架 span，继续作为独立 trace 根并 Link 到对应 `rl.rollout.sample`。本次 SGLang 关联不会自动为外部 Agent 应用、工具或 Agent SDK 创建 spans，也不向外部 Agent 进程注入 W3C carrier。外部应用已有的 spans 不会因此自动成为 `rl.agent.run` 的子 span；需在应用边界另外显式接入，不能把轨迹 JSON 中的请求／工具记录当成这些 spans。
 
 结构化数据直接保存为 span 的 string 类型 JSON 属性，包括题目、response、评分、优势、过滤、传输及训练结果。自 0.10.0 起，新采集不再输出对应的 `_ref`；完整内容随 OTLP JSONL 保存，不依赖附件或旧详情接口。禁止按长度截断，也不使用随机采样结果冒充全量数据。读取工具可以兼容旧版 `_ref`，但不能将旧引用当作新数据已内联的证据。
 

@@ -76,6 +76,7 @@ from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
 from relax.utils.rl_agent_trace import start_agent_trace, trace_agentic_group
+from relax.utils.rl_tracing import inference_context
 from relax.utils.types import get_spec_token_counts
 
 
@@ -2623,18 +2624,20 @@ class AgenticSessionShard:
                                 backend_request_id=backend_request_id, step_id=f"iteration:{ir.rollout_id}"
                             )
                         try:
-                            result = await self._generation_backend.generate(
-                                input_ids=ir.history_rollout_token_prefix + ir.pending_token_delta,
-                                sampling_params={**ir.sampling_params, "max_new_tokens": remaining_tokens},
-                                session_id=session.session_id,
-                                request_id=backend_request_id,
-                                image_data=ir.history_backend_image_data,
-                                audio_data=ir.history_backend_audio_data,
-                                video_data=ir.history_backend_video_data,
-                                return_logprob=group.rollout_mode == "train" or ir.logprobs,
-                                collect_score_centering=group.rollout_mode == "train",
-                                fail_fast_no_workers=router_recovery_enabled,
-                            )
+                            rl_trace = getattr(observation, "rl_trace", None)
+                            with inference_context(rl_trace.span if rl_trace is not None else None):
+                                result = await self._generation_backend.generate(
+                                    input_ids=ir.history_rollout_token_prefix + ir.pending_token_delta,
+                                    sampling_params={**ir.sampling_params, "max_new_tokens": remaining_tokens},
+                                    session_id=session.session_id,
+                                    request_id=backend_request_id,
+                                    image_data=ir.history_backend_image_data,
+                                    audio_data=ir.history_backend_audio_data,
+                                    video_data=ir.history_backend_video_data,
+                                    return_logprob=group.rollout_mode == "train" or ir.logprobs,
+                                    collect_score_centering=group.rollout_mode == "train",
+                                    fail_fast_no_workers=router_recovery_enabled,
+                                )
                             if observation is not None:
                                 # Count each returned delta before cleanup or a
                                 # superseding generation gate can discard it.

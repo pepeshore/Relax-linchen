@@ -169,7 +169,19 @@ batch 相关参数（`--global-batch-size`、`--n-samples-per-prompt`、并行�
 
 提交任务前设置 `RELAX_OTEL_DIR` 可更改输出根目录，设置 `RELAX_OTEL_ENABLED=0` 可关闭 RL trace，`OTEL_SDK_DISABLED=true` 也会关闭采集。若需要在一台机器上读取所有 worker 的数据，请使用共享持久化目录；使用节点本地磁盘时，需要分别收集各 worker 的文件。采集不依赖 Collector 地址。
 
-这些文件仅包含 Relax 的 RL 埋点。当前尚未将 RL SpanContext 传入 SGLang 生成请求，也未建立后端 trace 到 RL span 的自动 Link。仅开启 SGLang tracing 不会自动关联两者；SGLang 的采集和导出需要单独配置，其 spans 不会自动进入上述 RL JSONL 文件。语义约定要求后端使用独立 trace 并通过 Span Link 关联负责调用的 RL span，这部分接入尚未实现。
+内置普通 rollout 和 Agentic rollout 会通过 W3C headers 将对应 RL span 传给 SGLang：普通请求的 parent 是 `rl.rollout.sample`，Agentic 请求的 parent 是 `rl.agent.run`。SGLang 请求继承相同 trace ID，其内部父子树保持不变。使用 `--sglang-enable-trace --sglang-otlp-traces-endpoint "$SGLANG_TRACE_ENDPOINT"` 启用后端采集；该地址必须能被各推理节点访问。后端仍单独导出，不会自动写入上述 RL 文件。
+
+仓库提供一个用于实验验证的 OTLP/gRPC 接收器，在装有 SGLang tracing 依赖的环境中运行：
+
+```bash
+PYTHONPATH=. python scripts/tools/collect_otlp_traces.py \
+  --listen "$OTLP_LISTEN" \
+  --output "$SAVE_DIR/$EXP_NAME/backend-traces/sglang.jsonl"
+```
+
+`OTLP_LISTEN` 为本机绑定的 `host:port`，`SGLANG_TRACE_ENDPOINT` 为推理节点可访问的对应地址。接收器每收到一批数据就追加一行 OTLP JSONL，关闭前等待训练请求完成及 SGLang 导出。合并分析 RL 与后端文件时，按 trace/span/parent ID 还原调用树；RL 业务属性可沿父链查询，不会自动复制到 SGLang span。
+
+`rl.agent.run` 是 Relax 的 Session span。外部 Agent 应用及工具不会自动产生自己的 OTel spans，也不会自动接入这个父链。自定义 rollout 如果自行使用 HTTP 客户端，可在真实生成调用内用 `relax.utils.rl_tracing.inference_headers` 合并出站 headers；绕过内置入口的请求需要自行接入。
 
 各批次阶段使用独立 trace，通过 `rl.run.id` 和 `rl.step.id` 关联；`rl.iteration.index` 保留从 0 开始的 rollout 轮次。每个批次记录自身 `rl.batch.id` 和实际输入数，真实成员操作 span 与批次共用 trace 并指定真实 parent：`rl.rollout.sample` 记录一条输入的完整 rollout，`rl.reward.score` 归属于 `rl.reward.batch`。不同阶段的依赖使用 Links。Agent 调用保持独立 trace，并 Link 到对应样本。
 

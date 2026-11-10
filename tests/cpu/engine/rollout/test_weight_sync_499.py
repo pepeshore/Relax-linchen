@@ -341,3 +341,46 @@ async def test_old_partition_is_paid_before_current(monkeypatch, max_staleness, 
     assert len(requests) == expected_requests
     assert transfers == ([(0, True, 1)] if max_staleness == 2 else [(0, True, 1), (1, True, 8)])
     assert state.last_step_current_deficit == expected_deficit
+
+
+@pytest.mark.asyncio
+async def test_standard_generation_retry_preserves_parent_and_routing(monkeypatch, tmp_path):
+    from relax.utils import rl_tracing as tracing
+
+    monkeypatch.setenv("RELAX_OTEL_ENABLED", "1")
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+    args = _router_args(fully_async=True)
+    args.rl_trace_run_id = "retry-parent"
+    args.rl_trace_dir = str(tmp_path)
+    parent = tracing.Stage(args, "rl.rollout.sample")
+    calls = []
+
+    async def post(url, payload, headers=None, **kwargs):
+        calls.append(dict(headers))
+        if len(calls) == 1:
+            raise _status_error(503, body={"error": {"code": "no_available_workers"}})
+        return {"ok": True}
+
+    async def timeout(*args, **kwargs):
+        args[0].close()
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(sglang_rollout, "post", post)
+    monkeypatch.setattr(sglang_rollout.asyncio, "wait_for", timeout)
+    try:
+        with tracing.inference_context(parent):
+            assert await _post_generation(
+                args,
+                SimpleNamespace(abort_event=asyncio.Event()),
+                "http://test/generate",
+                {},
+                {"X-SMG-Routing-Key": "group"},
+                False,
+            ) == {"ok": True}
+        assert tracing.inference_headers() is None
+        assert len(calls) == 2 and calls[0] == calls[1]
+        context = parent.context()
+        assert calls[0]["traceparent"] == f"00-{context['trace_id']}-{context['span_id']}-{context['trace_flags']:02x}"
+        assert calls[0]["X-SMG-Routing-Key"] == "group"
+    finally:
+        parent.end()

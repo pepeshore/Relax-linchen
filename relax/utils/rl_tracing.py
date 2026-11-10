@@ -1,11 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""RL semantic conventions 0.11.0, with process-local OTLP JSON files.
+"""RL semantic conventions 0.12.0, with process-local OTLP JSON files.
 
 RL batch stages are independent roots; their member spans are explicit
 children. Business identities cross Ray boundaries in the existing args
 Namespace; SDK objects never do. No global tracer provider is replaced, so
-backend instrumentation keeps its own trace topology.
+SGLang requests explicitly inherit their responsible RL span via W3C headers.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ _LOCK = threading.RLock()
 _RUNTIMES: dict[tuple[int, str, str], Any] = {}
 _ITERATION: ContextVar[int | None] = ContextVar("rl_iteration", default=None)
 _CURRENT: ContextVar[Stage | None] = ContextVar("rl_stage", default=None)
+_INFERENCE_PARENT: ContextVar[Stage | None] = ContextVar("rl_inference_parent", default=None)
 _ENV_NAMES = ("RELAX_OTEL_ENABLED", "RELAX_OTEL_DIR", "RELAX_OTEL_RUN_ID", "OTEL_SDK_DISABLED")
 
 
@@ -159,7 +160,7 @@ def _runtime(args: Namespace | None) -> Any:
             ),
         )
         provider.add_span_processor(SimpleSpanProcessor(DiskExporter()))
-        tracer = provider.get_tracer("relax.rl", "0.11.0")
+        tracer = provider.get_tracer("relax.rl", "0.12.0")
         result = (provider, tracer, root)
         _RUNTIMES[key] = result
         return result
@@ -339,6 +340,38 @@ class Stage:
             self.span.set_status(Status(StatusCode.ERROR, f"{type(error).__name__}: {str(error)[:512]}"))
         self._ended = True
         self.span.end(end_time=end_time)
+
+
+@contextmanager
+def inference_context(parent: Stage | None) -> Iterator[None]:
+    """Bind one sample/Session during its generation calls, never across
+    Ray."""
+    token = _INFERENCE_PARENT.set(parent)
+    try:
+        yield
+    finally:
+        _INFERENCE_PARENT.reset(token)
+
+
+def inference_headers(headers: dict[str, str] | None = None) -> dict[str, str] | None:
+    """Serialize the explicit RL parent before HTTP dispatch or Ray
+    forwarding."""
+    parent = _INFERENCE_PARENT.get()
+    if parent is None or parent.span is None or parent._ended or not enabled(parent.args):
+        return headers
+    try:
+        from opentelemetry.context import Context
+        from opentelemetry.trace import set_span_in_context
+        from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+        carrier = {
+            key: value for key, value in (headers or {}).items() if key.lower() not in ("traceparent", "tracestate")
+        }
+        TraceContextTextMapPropagator().inject(carrier, context=set_span_in_context(parent.span, Context()))
+        return carrier
+    except Exception:
+        logger.exception("RL OTel inference context unavailable")
+        return headers
 
 
 @contextmanager

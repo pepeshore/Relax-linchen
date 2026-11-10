@@ -3,6 +3,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
 # Qwen3-30B-A3B two-iteration OTel verification on 16 GPUs.
+# Set OTEL_SMOKE_AGENTIC=1 for the local two-turn agent.
+# Set SGLANG_TRACE_ENDPOINT to an OTLP/gRPC receiver to collect backend spans.
 #
 # Usage:
 #   bash scripts/training/text/run-qwen3-30B-A3B-16xgpu-otel-smoke.sh
@@ -64,11 +66,11 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 16
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-16}"
+   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-8}"
+   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-8192}"
    --rollout-temperature 1.0
-   --global-batch-size 128
+   --global-batch-size "${GLOBAL_BATCH_SIZE:-128}"
    --balance-data
 )
 
@@ -138,6 +140,22 @@ SGLANG_ARGS=(
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
    --sglang-expert-parallel-size 8
 )
+
+if [[ -n "${SGLANG_TRACE_ENDPOINT:-}" ]]; then
+   SGLANG_ARGS+=(--sglang-enable-trace --sglang-otlp-traces-endpoint "${SGLANG_TRACE_ENDPOINT}")
+fi
+
+if [[ "${OTEL_SMOKE_AGENTIC:-0}" == 1 ]]; then
+   OTEL_SMOKE_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+   ROLLOUT_ARGS+=(
+      --use-agentic-rollout
+      --agent-command "python3 ${OTEL_SMOKE_ROOT}/examples/otel_tracing/agent.py"
+      --agent-cwd "${OTEL_SMOKE_ROOT}"
+      --agent-timeout 600
+      --agentic-concurrency 4
+      --agentic-reasoning-parser qwen3
+   )
+fi
 
 WANDB_ARGS=(
    --use-clearml

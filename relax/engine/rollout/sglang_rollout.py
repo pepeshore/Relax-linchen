@@ -61,6 +61,7 @@ from relax.utils.rl_trace_hooks import (
     trace_iteration,
     track_generation_task,
 )
+from relax.utils.rl_tracing import inference_headers
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.score_centering import (
     append_score_centering_candidates,
@@ -194,7 +195,7 @@ class GenerateState(metaclass=SingletonMeta):
         if rollout abort has been signalled by the time the permit is acquired.
         """
         async with self.inference_permit():
-            return await post(url, payload, headers=headers)
+            return await post(url, payload, headers=inference_headers(headers))
 
     def reset(self) -> None:
         self.remaining_batch_size = 0
@@ -362,6 +363,7 @@ def _decode_rollout_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np
 async def _post_generation(
     args: Namespace, state: "GenerateState", url: str, payload: dict, headers: dict | None, evaluation: bool
 ) -> Any:
+    headers = inference_headers(headers)
     router_recovery_enabled = not evaluation and args.fully_async and not args.use_slime_router
     for attempt in range(2):
         if attempt and state.abort_event.is_set():

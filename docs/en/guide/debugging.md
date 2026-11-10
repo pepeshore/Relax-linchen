@@ -169,7 +169,19 @@ Training launched through `relax.entrypoints.train` records RL stages to disk by
 
 Set `RELAX_OTEL_DIR` before submission to choose another output root, or `RELAX_OTEL_ENABLED=0` to disable RL traces. `OTEL_SDK_DISABLED=true` also disables them. Use a shared, persistent filesystem when you want to read all workers' output from one machine; on node-local disks, collect files from each worker separately. No collector endpoint is required.
 
-These files contain Relax RL instrumentation only. Relax does not yet pass its RL SpanContext into SGLang generation requests or create automatic Links from backend traces to RL spans. Enabling SGLang tracing alone does not associate the two. Configure SGLang collection and export separately; its spans are not automatically included in the RL JSONL files above. The semantic convention requires independent backend traces linked to the responsible RL span, but that integration is not implemented yet.
+Built-in ordinary and Agentic rollouts propagate the responsible RL span to SGLang through W3C headers. Ordinary requests use `rl.rollout.sample` as their parent; Agentic requests use `rl.agent.run`. SGLang requests inherit the trace ID and retain their internal span tree. Enable backend collection with `--sglang-enable-trace --sglang-otlp-traces-endpoint "$SGLANG_TRACE_ENDPOINT"`; every inference node must be able to reach that endpoint. Backend export remains separate from the RL files above.
+
+For experiments, the repository includes an OTLP/gRPC receiver. Run it in an environment with SGLang tracing dependencies installed:
+
+```bash
+PYTHONPATH=. python scripts/tools/collect_otlp_traces.py \
+  --listen "$OTLP_LISTEN" \
+  --output "$SAVE_DIR/$EXP_NAME/backend-traces/sglang.jsonl"
+```
+
+`OTLP_LISTEN` is the receiver bind `host:port`; `SGLANG_TRACE_ENDPOINT` is the corresponding address reachable by inference nodes. The receiver appends one OTLP JSONL line per exported batch. Wait for training requests and SGLang export to finish before stopping it. Join RL and backend files by trace/span/parent IDs. RL business attributes can be resolved through the parent chain; they are not automatically copied to SGLang spans.
+
+`rl.agent.run` is a Relax Session span. External Agent applications and tools do not automatically create their own OTel spans or join this parent chain. Custom rollouts that use their own HTTP client can merge outgoing headers with `relax.utils.rl_tracing.inference_headers` inside the actual generation call; requests bypassing the built-in paths require explicit integration.
 
 Batch stages use independent traces. Join stages using `rl.run.id` and `rl.step.id`; `rl.iteration.index` preserves the framework's zero-based rollout counter. Each batch has its own `rl.batch.id` and actual input count. Spans for actual member operations share the batch trace and name their parent explicitly: `rl.rollout.sample` records a complete input rollout, and `rl.reward.score` belongs to `rl.reward.batch`. Dependencies between different stages use Links. Agent calls retain independent traces and Link to their sample.
 
