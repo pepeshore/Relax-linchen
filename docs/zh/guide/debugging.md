@@ -183,6 +183,8 @@ PYTHONPATH=. python scripts/tools/collect_otlp_traces.py \
 
 `rl.agent.run` 是 Relax 的 Session span。外部 Agent 应用及工具不会自动产生自己的 OTel spans，也不会自动接入这个父链。自定义 rollout 如果自行使用 HTTP 客户端，可在真实生成调用内用 `relax.utils.rl_tracing.inference_headers` 合并出站 headers；绕过内置入口的请求需要自行接入。
 
+采集高吞吐、多轮推理时，导出队列不足可能导致 spans 丢失，即使请求入口关联正确也会出现缺失的父节点。上述 smoke 脚本启用 SGLang tracing 时默认使用 `OTEL_BSP_MAX_QUEUE_SIZE=65536` 和 `SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE=512`，可通过环境变量覆盖。接收器建议先写节点本地磁盘，训练及导出结束后再复制到持久化存储；应校验完整父链，不能仅检查请求入口数量。
+
 各批次阶段使用独立 trace，通过 `rl.run.id` 和 `rl.step.id` 关联；`rl.iteration.index` 保留从 0 开始的 rollout 轮次。每个批次记录自身 `rl.batch.id` 和实际输入数，真实成员操作 span 与批次共用 trace 并指定真实 parent：`rl.rollout.sample` 记录一条输入的完整 rollout，`rl.reward.score` 归属于 `rl.reward.batch`。不同阶段的依赖使用 Links。Agent 调用保持独立 trace，并 Link 到对应样本。
 
 结构化结果、题目和 response 直接以完整 JSON 字符串保存在 span 属性中，新 trace 不依赖 `_ref` 附件。仅真实的逐样本 rollout 和评分调用创建子 span，标记 `rl.sample.timing=operation`。批量评分、前向、优势、过滤、传输和训练将成员结果保存在批次 span 上，不生成零时长结果 span。OPD 单样本前向只保留一个真实请求 span。训练 uses 通过 update_id 关联 updates 中的更新结果。旧版 0.10 的 result span 可兼容读取，但应与执行时间线分开展示。父子 span 的耗时也不能相加。Agentic 运行还会启用已有 observation 记录，保存 Session 的请求、尝试、状态及 Export，并通过 Export ID 关联实际训练消费。无法观测的外部工具时间保持未知。这些记录包含模型输入输出，应根据训练数据设置目录权限和保留期限。

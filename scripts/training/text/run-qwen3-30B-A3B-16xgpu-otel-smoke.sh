@@ -143,6 +143,23 @@ SGLANG_ARGS=(
 
 if [[ -n "${SGLANG_TRACE_ENDPOINT:-}" ]]; then
    SGLANG_ARGS+=(--sglang-enable-trace --sglang-otlp-traces-endpoint "${SGLANG_TRACE_ENDPOINT}")
+   # Multi-turn decoding can outpace the SDK's small default export queue.
+   RUNTIME_ENV_JSON=$(python3 - <<'INNER_PY'
+import json, os
+runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON", "{}"))
+env = runtime.setdefault("env_vars", {})
+trace_defaults = {
+    "OTEL_BSP_MAX_QUEUE_SIZE": "65536",
+    "SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE": "512",
+}
+for name, default in trace_defaults.items():
+    env.setdefault(name, os.environ.get(name, default))
+propagate = env.get("RELAX_PROPAGATE_ENV_VARS", os.environ.get("RELAX_PROPAGATE_ENV_VARS", ""))
+env["RELAX_PROPAGATE_ENV_VARS"] = ",".join(filter(None, [propagate, *trace_defaults]))
+print(json.dumps(runtime))
+INNER_PY
+)
+   export RUNTIME_ENV_JSON
 fi
 
 if [[ "${OTEL_SMOKE_AGENTIC:-0}" == 1 ]]; then
