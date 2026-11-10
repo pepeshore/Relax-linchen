@@ -171,7 +171,7 @@ batch 相关参数（`--global-batch-size`、`--n-samples-per-prompt`、并行�
 
 各批次阶段使用独立 trace，通过 `rl.run.id` 和 `rl.step.id` 关联；`rl.iteration.index` 保留从 0 开始的 rollout 轮次。每个批次记录自身 `rl.batch.id` 和实际输入数，明细 span 与批次共用 trace 并指定真实 parent：`rl.rollout.sample` 记录一条输入的完整 rollout，`rl.reward.score` 归属于 `rl.reward.batch`。不同阶段的依赖使用 Links。Agent 调用保持独立 trace，并 Link 到对应样本。
 
-结构化结果、题目和 response 直接以完整 JSON 字符串保存在 span 属性中，新 trace 不依赖 `_ref` 附件。可独立计时的样本调用标记 `rl.sample.timing=operation`；共享批次计算无法取得单条耗时时，在实际确认结果的时刻生成 `result` 明细 span。这类 span 的时长为零，不能解释为样本计算耗时。父子 span 的耗时也不能相加。Agentic 运行还会启用已有 observation 记录，保存 Session 的请求、尝试、状态及 Export，并通过 Export ID 关联实际训练消费。无法观测的外部工具时间保持未知。这些记录包含模型输入输出，应根据训练数据设置目录权限和保留期限。
+结构化结果、题目和 response 直接以完整 JSON 字符串保存在 span 属性中，新 trace 不依赖 `_ref` 附件。仅真实的逐样本 rollout 和评分调用创建子 span，标记 `rl.sample.timing=operation`。批量评分、前向、优势、过滤、传输和训练将成员结果保存在批次 span 上，不生成零时长结果 span。OPD 单样本前向只保留一个真实请求 span。训练 uses 通过 update_id 关联 updates 中的更新结果。旧版 0.10 的 result span 可兼容读取，但应与执行时间线分开展示。父子 span 的耗时也不能相加。Agentic 运行还会启用已有 observation 记录，保存 Session 的请求、尝试、状态及 Export，并通过 Export ID 关联实际训练消费。无法观测的外部工具时间保持未知。这些记录包含模型输入输出，应根据训练数据设置目录权限和保留期限。
 
 阶段结束后即追加写入文件。进程在阶段执行中被强制终止时，该阶段可能没有结束记录。写入失败会记日志，训练继续运行；rank 数据不完整时，通过 `relax.observation.partial` 保存诊断信息，不冒充完整训练结果。采集不会增加分布式通信，GPU 上的简要统计通过异步复制交给训练线程之外的读者处理。
 

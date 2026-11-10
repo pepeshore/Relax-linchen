@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""RL semantic conventions 0.10.0, with process-local OTLP JSON files.
+"""RL semantic conventions 0.11.0, with process-local OTLP JSON files.
 
 RL batch stages are independent roots; their member spans are explicit
 children. Business identities cross Ray boundaries in the existing args
@@ -159,7 +159,7 @@ def _runtime(args: Namespace | None) -> Any:
             ),
         )
         provider.add_span_processor(SimpleSpanProcessor(DiskExporter()))
-        tracer = provider.get_tracer("relax.rl", "0.10.0")
+        tracer = provider.get_tracer("relax.rl", "0.11.0")
         result = (provider, tracer, root)
         _RUNTIMES[key] = result
         return result
@@ -271,8 +271,10 @@ class Stage:
     def result_detail(
         self, key: str, row: dict[str, Any], *, name: str | None = None, links: list[dict] | None = None
     ) -> Stage | None:
-        """A result confirmation point, never a fabricated execution
-        duration."""
+        """Legacy explicit result-span helper, retained for API compatibility.
+
+        Built-in 0.11 instrumentation stores member rows with data() instead.
+        """
         if self.span is None or self._ended:
             return None
         timestamp = time.time_ns()

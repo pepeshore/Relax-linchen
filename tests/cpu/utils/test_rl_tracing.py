@@ -34,7 +34,7 @@ def spans(root, name=None):
         for line in path.read_text().splitlines():
             for resource in json.loads(line)["resourceSpans"]:
                 for scope in resource["scopeSpans"]:
-                    assert scope["scope"] == {"name": "relax.rl", "version": "0.10.0"}
+                    assert scope["scope"] == {"name": "relax.rl", "version": "0.11.0"}
                     result.extend(scope["spans"])
     return [span for span in result if name is None or span["name"] == name]
 
@@ -503,6 +503,7 @@ def test_filter_callable_and_normal_drop(run):
     values = [sample(), sample()]
     assert not call(Filter(), values).keep
     assert not call(partial(lambda args, values: Filter()(values)), args, values).keep
+    assert not spans(root, "rl.data.filter.sample")
     for record in spans(root, "rl.data.filter"):
         assert record.get("status", {}).get("code", 0) == 0
         results = artifact(record, "rl.filter.results")
@@ -517,12 +518,16 @@ def test_transfer_backfill_keeps_source_iteration_and_real_ack(run):
     async def transfer(args, samples, batch_count, rollout_id, client):
         return "ack"
 
+    member = sample()
     with tracing.iteration_context(4):
-        assert asyncio.run(transfer(args, [[sample()]], 0, 3, None)) == "ack"
+        assert asyncio.run(transfer(args, [[member]], 0, 3, None)) == "ack"
     record = spans(root, "rl.data.transfer")[0]
     assert attrs(record)["rl.step.id"] == "iteration:4"
     assert attrs(record)["rl.transfer.target.step_id"] == "iteration:3"
     assert artifact(record, "rl.transfer.data")["receive_ack_time"] > 0
+    assert not spans(root, "rl.data.transfer.sample")
+    assert member.metadata["_rl_source"]["span_id"] == record["spanId"]
+    assert artifact(record, "rl.transfer.data")["members"] == [{"export_id": hooks.export_id(member)}]
 
 
 def test_failed_transfer_does_not_invent_ack(run):
@@ -707,7 +712,7 @@ def test_training_rpc_combines_cp_facts_without_duplicate_stage(
     train.emit_windows(args, reports)
     record = spans(root, "rl.actor.train")[0]
     assert len(spans(root, "rl.actor.train")) == 1
-    assert len(spans(root, "rl.actor.train.sample")) == 1
+    assert not spans(root, "rl.actor.train.sample")
     assert attrs(record)["rl.batch.size"] == "1"
     assert int(record["endTimeUnixNano"]) < before_export
     result = artifact(record, "rl.train.results")
@@ -857,7 +862,7 @@ def test_complete_sample_continues_across_windows_and_keeps_input(run):
     assert len(detail["links"]) == 1
 
 
-def test_custom_batch_reward_has_zero_duration_result_children(run):
+def test_custom_batch_reward_keeps_results_without_synthetic_children(run):
     args, root = run
     values = [sample(), sample()]
 
@@ -867,13 +872,10 @@ def test_custom_batch_reward_has_zero_duration_result_children(run):
 
     assert asyncio.run(reward(args, values)) == [0.0, 1.0]
     (batch,) = spans(root, "rl.reward.batch")
-    details = spans(root, "rl.reward.score")
-    assert len(details) == 2
+    assert not spans(root, "rl.reward.score")
     assert attrs(batch)["rl.batch.size"] == "2"
-    for detail in details:
-        assert detail["parentSpanId"] == batch["spanId"] and detail["traceId"] == batch["traceId"]
-        assert attrs(detail)["rl.sample.timing"] == "result"
-        assert detail["startTimeUnixNano"] == detail["endTimeUnixNano"]
+    assert [row["value"] for row in artifact(batch, "rl.reward.results")] == [0.0, 1.0]
+    assert all(value.metadata["_rl_source"]["span_id"] == batch["spanId"] for value in values)
 
 
 @pytest.mark.parametrize("startup_failure", [False, True])
@@ -963,3 +965,69 @@ def test_discarded_partial_sample_preserves_known_response(run):
     assert attrs(detail)["rl.sample.cancelled"] is True
     assert artifact(detail, "rl.sample.response")[0]["text"] == value.response
     assert artifact(detail, "rl.sample.response")[0]["status"] == "aborted"
+
+
+@pytest.mark.parametrize("mutable", [False, True])
+def test_custom_batch_reward_keeps_final_values_and_real_inner_calls(run, mutable):
+    args, root = run
+    values = [sample(), sample()]
+
+    @hooks.trace_reward
+    async def inner(args, value):
+        return {"score": 1.0} if mutable else 1.0
+
+    @hooks.trace_batched_reward
+    async def outer(args, values):
+        results = await asyncio.gather(*(inner(args, value) for value in values))
+        if mutable:
+            for result in results:
+                result["score"] *= 2
+            return results
+        return [2 * result for result in results]
+
+    expected = [{"score": 2.0}] * 2 if mutable else [2.0, 2.0]
+    assert asyncio.run(outer(args, values)) == expected
+    (batch,) = spans(root, "rl.reward.batch")
+    assert [row["value"] for row in artifact(batch, "rl.reward.results")] == expected
+    children = spans(root, "rl.reward.score")
+    assert len(children) == 2
+    intermediate = {"score": 1.0} if mutable else 1.0
+    assert all(artifact(child, "rl.reward.results")[0]["value"] == intermediate for child in children)
+    assert all(attrs(child)["rl.sample.timing"] == "operation" for child in children)
+    assert all(value.metadata["_rl_source"]["span_id"] == batch["spanId"] for value in values)
+
+
+@pytest.mark.parametrize("role", ["actor", "teacher"])
+@pytest.mark.parametrize("success", [True, False])
+def test_opd_forward_uses_one_request_span_and_reports_result(run, role, success):
+    args, root = run
+    value = sample()
+    value.response_length = 2
+    owner = SimpleNamespace(args=args, topk_worker=None)
+    source = tracing.Stage(args, "rl.rollout.generate", attributes={"rl.batch.id": "source"})
+    value.metadata["_rl_source"] = source.context()
+    source.end()
+
+    @hooks.trace_opd_forward(role)
+    async def forward(owner, value):
+        return success
+
+    assert asyncio.run(forward(owner, value)) is success
+    (record,) = spans(root, f"rl.{role}.forward")
+    assert not spans(root, f"rl.{role}.forward.sample")
+    assert attrs(record)["rl.batch.size"] == "1"
+    assert attrs(record)["rl.export.id"] == hooks.export_id(value)
+    assert record["links"][0]["spanId"] == source.context()["span_id"]
+    assert artifact(record, "rl.forward.results")[0]["status"] == ("valid" if success else "invalid")
+    assert record.get("status", {}).get("code", 0) == (0 if success else 2)
+
+
+def test_validator_rejects_synthetic_result_spans_in_new_scope(run):
+    from scripts.tools.validate_rl_traces import validate
+
+    args, root = run
+    parent = tracing.Stage(args, "rl.data.filter", attributes={"rl.batch.id": "batch"})
+    parent.result_detail("rl.filter.results", {"sample_index": "1", "decision": "keep"})
+    parent.end()
+    with pytest.raises(ValueError, match="Result rows must be stored on the batch"):
+        validate(root)

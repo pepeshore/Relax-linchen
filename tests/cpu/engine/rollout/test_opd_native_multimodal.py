@@ -214,7 +214,7 @@ async def test_student_cross_topk_uses_student_images_and_checks_query_order(pro
             input_token_ids_logprobs=[None, [[-1.0, 0], [-2.0, 5]], [[-3.0, 7], [-4.0, 9]]],
         )
     )
-    await _manager(opd_token_selection="teacher_topk")._student_prefill(sample, session, None)
+    assert await _manager(opd_token_selection="teacher_topk")._student_prefill(sample, session, None)
     payload = session.requests[0][1]
     assert payload["image_data"] == ["student-image"]
     assert payload["input_ids"] == sample.rollout_tokens
@@ -530,3 +530,15 @@ async def test_image_processor_excludes_transport_cache_from_local_and_worker_in
     assert train_inputs is None
     assert received == [["raw-image"]]
     assert media["_opd_image_b64_cache"] == ["encoded-image"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 500])
+async def test_text_student_prefill_missing_result_returns_false(status):
+    sample = Sample(tokens=[1, 2, 10, 11], response_length=2)
+    sample.teacher_topk_token_ids = np.array([[0, 5], [7, 9]], dtype=np.int32)
+    result = await _manager(opd_token_selection="teacher_topk")._student_prefill(
+        sample, _Session(_response(sample.tokens), status=status), None
+    )
+    assert result is False
+    assert sample.student_at_teacher_topk_log_probs is None

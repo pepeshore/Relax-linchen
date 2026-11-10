@@ -393,22 +393,14 @@ def emit_windows(args: Any, reports: list[Any]) -> None:
             result["uses"] = uses
             if not errors:
                 observation.data("rl.train.results", result)
-                for row in uses:
-                    update_result = updates.get(row.get("update_id"), {})
-                    observation.result_detail(
-                        "rl.train.results", {**row, "update_status": update_result.get("status")}
-                    )
         elif name == "rl.advantage.compute" and not errors:
             observation.data("rl.advantage.results", uses)
-            for row in uses:
-                observation.result_detail("rl.advantage.results", row)
         elif name.endswith(".forward") and not errors:
             rows = []
             for member in sorted({identity for item in owners for identity in item.get("members", [])}):
                 kind, identity = member.split(":", 1)
                 row = {"export_id" if kind == "export" else "sample_index": identity, "status": "valid"}
                 rows.append(row)
-                observation.result_detail("rl.forward.results", row)
             observation.data("rl.forward.results", rows)
         if errors:
             observation.data("relax.observation.partial", {"errors": errors, "fragments": windows})

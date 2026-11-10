@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import time
 import uuid
@@ -428,7 +429,7 @@ class RewardBatch:
             row.update(status="error", reason=f"{type(error).__name__}: {error}")
             self.error = self.error or error
         else:
-            row.update(status="valid" if value is not None else "invalid", value=value)
+            row.update(status="valid" if value is not None else "invalid", value=copy.deepcopy(value))
             if value is None:
                 row["reason"] = "scorer returned no reward"
             if isinstance(value, dict) and getattr(self.args, "reward_key", None):
@@ -440,11 +441,7 @@ class RewardBatch:
             observation.end(error, end_time=self.end_time)
             _publish_source([sample], observation)
         else:
-            child = self.observation.result_detail(
-                "rl.reward.results", row, name="rl.reward.score", links=_sources([sample])
-            )
-            if child is not None:
-                _publish_source([sample], child)
+            _publish_source([sample], self.observation)
         self.close_if_finished()
 
     @best_effort
@@ -483,7 +480,11 @@ def _record_batched_values(batch: RewardBatch, samples: list[Any], values: Any, 
                 "relax.observation.partial", {"errors": ["scorer result count differs from input count"]}
             )
         for sample, value in zip(samples, values, strict=False):
-            if id(sample) not in batch.results:
+            previous = batch.results.get(id(sample))
+            if previous is None or previous.get("value") != value:
+                if previous is not None:
+                    route = reward_attributes(batch.args)
+                    batch.routes[id(sample)] = (route["rl.reward.name"], route["rl.reward.type"])
                 batch.record(sample, value, None)
     elif error is not None and batch.active == 1:
         for sample in samples:
@@ -531,14 +532,15 @@ def trace_batched_reward(function: Callable) -> Callable:
 
 @best_effort
 def _record_transfer_results(observation: Stage, samples: list[Any], data: dict[str, Any]) -> None:
+    data["members"] = [
+        {
+            "export_id": export_id(sample),
+            **({"sample_index": str(sample.index)} if getattr(sample, "index", None) is not None else {}),
+        }
+        for sample in samples
+    ]
     observation.data("rl.transfer.data", data)
-    for sample in samples:
-        row = {"export_id": export_id(sample), **{k: v for k, v in data.items() if k != "export_ids"}}
-        if getattr(sample, "index", None) is not None:
-            row["sample_index"] = str(sample.index)
-        child = observation.result_detail("rl.transfer.data", row, links=_sources([sample]))
-        if child is not None:
-            _publish_source([sample], child)
+    _publish_source(samples, observation)
 
 
 def trace_transfer(function: Callable) -> Callable:
@@ -588,10 +590,7 @@ def _record_filter_results(observation: Stage, samples: list[Any], result: Any) 
         for sample in samples
     ]
     observation.data("rl.filter.results", rows)
-    for sample, row in zip(samples, rows, strict=True):
-        child = observation.result_detail("rl.filter.results", row, links=_sources([sample]))
-        if child is not None:
-            _publish_source([sample], child)
+    _publish_source(samples, observation)
 
 
 def trace_filter(function: Callable) -> Callable:
@@ -634,8 +633,6 @@ def _record_forward_members(observation: Stage, data: Any) -> None:
         rows = [{key: str(value), "status": "valid"} for value in _cpu_list(values) if value >= 0]
         observation.set("rl.batch.size", len(rows))
         observation.data("rl.forward.results", rows)
-        for row in rows:
-            observation.result_detail("rl.forward.results", row)
 
 
 def trace_forward(function: Callable) -> Callable:
@@ -779,8 +776,6 @@ def _record_custom_advantage(observation: Any, group: Any, accepted: bool) -> No
     observation.set("rl.batch.id", uuid.uuid4().hex)
     observation.set("rl.batch.size", len(rows))
     observation.data("rl.advantage.results", rows)
-    for row in rows:
-        observation.result_detail("rl.advantage.results", row)
 
 
 def trace_custom_advantage(function: Callable) -> Callable:
@@ -804,39 +799,31 @@ def trace_opd_forward(role: str) -> Callable:
     def decorate(function: Callable) -> Callable:
         @wraps(function)
         async def call(owner: Any, sample: Any, *args: Any, **kwargs: Any) -> Any:
-            if not sample.response_length:
+            if not enabled(owner.args) or not sample.response_length:
                 return await function(owner, sample, *args, **kwargs)
-            attrs = {"rl.model.name": model_name(owner.args, role), "rl.backend.name": "sglang"}
+            attrs = {
+                "rl.model.name": model_name(owner.args, role),
+                "rl.backend.name": "sglang",
+                "rl.batch.id": uuid.uuid4().hex,
+                "rl.batch.size": 1,
+                **sample_attributes(sample),
+                "rl.export.id": export_id(sample),
+            }
             if role == "teacher":
                 attrs["rl.forward.output"] = (
                     "topk_distribution" if owner.topk_worker is not None else "sampled_token_logprob"
                 )
             else:
                 attrs["rl.forward.purpose"] = "distillation"
-            attrs.update({"rl.batch.id": uuid.uuid4().hex, "rl.batch.size": 1})
-            with stage(owner.args, f"rl.{role}.forward", attributes=attrs) as observation:
-                detail_attrs = {
-                    **observation.child_attributes(),
-                    **sample_attributes(sample),
-                    "rl.export.id": export_id(sample),
-                    "rl.sample.timing": "operation",
-                }
-                with stage(
-                    owner.args,
-                    f"rl.{role}.forward.sample",
-                    parent=observation,
-                    attributes=detail_attrs,
-                    links=_sources([sample]),
-                ) as detail:
-                    result = await function(owner, sample, *args, **kwargs)
-                    row = {"export_id": export_id(sample), "status": "invalid" if result is False else "valid"}
-                    detail.data("rl.forward.results", [row])
-                    observation.data("rl.forward.results", [row])
-                    if result is False:
-                        error = RuntimeError("forward returned no usable scoring result")
-                        detail.end(error)
-                        observation.end(error)
-                    return result
+            with stage(
+                owner.args, f"rl.{role}.forward", attributes=attrs, links=_sources([sample])
+            ) as observation:
+                result = await function(owner, sample, *args, **kwargs)
+                row = {"export_id": export_id(sample), "status": "invalid" if result is False else "valid"}
+                observation.data("rl.forward.results", [row])
+                if result is False:
+                    observation.end(RuntimeError("forward returned no usable scoring result"))
+                return result
 
         return call
 
@@ -868,5 +855,3 @@ def record_cpu_advantage(observation: Any, data: Any, result: Any) -> None:
     observation.set("rl.batch.id", uuid.uuid4().hex)
     observation.set("rl.batch.size", len(rows))
     observation.data("rl.advantage.results", rows)
-    for row in rows:
-        observation.result_detail("rl.advantage.results", row)

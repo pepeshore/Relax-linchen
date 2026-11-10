@@ -2,7 +2,7 @@
 
 **Status:** Development
 
-**Version:** 0.10.0
+**Version:** 0.11.0
 
 **Date:** 2026-11-10
 
@@ -78,31 +78,33 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 
 结构化内容中的 ID 为 string，计数为非负 int，结果数值为 double，布尔值为 boolean，`start_time`／`end_time` 为 Unix 秒 double。未知时间边界省略，后端原始字段保留原单位。普通 SDK 通常在 span 结束后导出；运行中展示需要同一 span 身份的状态／数据快照，终态记录去重合并，不增加业务 span 类型。
 
-## 2.1 批次与逐样本明细
+## 2.1 批次、独立样本操作与结果明细
 
-每个实际批次操作生成一个总 span，并为实际处理的每个成员生成明细 span。总 span 保存该操作的 `rl.batch.id`、实际输入数 `rl.batch.size` 和完整批次结果；明细直接保存所属成员的结果。生成批次按输入 Sample 计数，评分等下游批次按实际输入 Export 计数；不能假定两者总数相同。
+每个实际批次操作生成一个总 span，记录该操作的 `rl.batch.id`、实际输入数 `rl.batch.size` 和完整结果。只有存在真实、可独立观测起止和结果的成员操作时才创建子 span。结果数组、逐样本统计或样本参与记录本身不构成独立操作；这些明细直接保留在批次的 JSON attributes 中，不生成零时长 span 或虚构时间事件。
 
-| 批次 span                                                                             | 明细 span                     | 明细单位                                                         |
-| ------------------------------------------------------------------------------------- | ----------------------------- | ---------------------------------------------------------------- |
-| `rl.rollout.generate`                                                                 | `rl.rollout.sample`           | 一条题目的一次完整生成，包括 Agent／工具交互；不包含独立评分     |
-| `rl.reward.batch`                                                                     | `rl.reward.score`             | 一条 Export 的完整评分方案                                       |
-| `rl.reference.forward`、`rl.teacher.forward`、`rl.critic.forward`、`rl.actor.forward` | 对应名称加 `.sample`          | 一条 Export 的独立前向结果                                       |
-| `rl.advantage.compute`                                                                | `rl.advantage.compute.sample` | 一条 Export 的优势结果                                           |
-| `rl.data.filter`                                                                      | `rl.data.filter.sample`       | 一条 Export 的 keep/drop 决定                                    |
-| `rl.data.transfer`                                                                    | `rl.data.transfer.sample`     | 一条 Export 的交付结果                                           |
-| `rl.actor.train`、`rl.critic.train`                                                   | 对应名称加 `.sample`          | 一条 Export 在一次 Update 中的实际消费；多个 Update 保留多条明细 |
+| 实际操作 | 总 span | 子 span | 结果明细位置与判断 |
+| --- | --- | --- | --- |
+| 普通／Agentic 完整 rollout | `rl.rollout.generate` | `rl.rollout.sample` | 保留：每条题目有完整、独立生命周期，记录题目、response 和真实起止 |
+| 逐条调用评分器 | `rl.reward.batch` | `rl.reward.score` | 保留：每条 Export 有独立评分调用，父级保留全批结果，子级保留自身结果 |
+| 一次调用批量评分器 | `rl.reward.batch` | 无 | `rl.reward.results` 保存所有成员；不能根据返回数组补造 score span |
+| Megatron 批量前向 | `rl.reference.forward`、`rl.teacher.forward`、`rl.critic.forward`、`rl.actor.forward` | 无 | `rl.forward.results` 保存成员结果；packed tensor 执行没有单样本调用边界 |
+| OPD 单样本前向 | `rl.teacher.forward`、`rl.actor.forward` | 无 | 一次真实调用只记录一个 span，batch.size=1，直接带样本身份与结果，不重复包装相同调用 |
+| 优势计算（包含自定义组计算） | `rl.advantage.compute` | 无 | `rl.advantage.results` 保存逐成员统计；优势可依赖整个 Group，统计行不是独立计算 |
+| 过滤 | `rl.data.filter` | 无 | `rl.filter.results` 保存逐成员 keep/drop；当前组／批次决策不拆成虚构样本操作 |
+| 数据传输 | `rl.data.transfer` | 无 | `rl.transfer.data` 保存成员与实际发送／ACK；共享批次 ACK 不拆成独立交付耗时 |
+| Actor／Critic 训练 | `rl.actor.train`、`rl.critic.train` | 无 | `rl.train.results.uses` 保存样本参与记录，`updates` 保存优化器更新；训练按批次／microbatch 执行 |
 
-明细与总 span 共用 traceId，parentSpanId 指向真实总 span。不同阶段仍通过 Link 关联：例如 `rl.reward.score` 的 parent 是 `rl.reward.batch`，其 Link 指向实际消费的 `rl.rollout.sample`。不能将 rollout 当作 reward 的 parent。SDK 创建明细时显式使用真实父 Context，不手动拼接 traceId。
+生成批次按输入 Sample 计数，评分等下游批次按实际输入 Export 计数，不能假定两者总数相同。真实子操作与总 span 共用 traceId，parentSpanId 指向真实总 span。不同阶段仍通过 Link 关联：例如逐条 `rl.reward.score` 的 parent 是 `rl.reward.batch`，其 Link 指向实际消费的 `rl.rollout.sample`。批量评分没有 score 子 span 时，后续阶段 Link 到实际 `rl.reward.batch`；过滤与传输同样发布批次来源，保留逐成员业务 ID。SDK 显式使用真实父 Context，不手动拼接 traceId。
 
 **完整调用与窗口：** Sample 暂停／可续跑中断不结束 span，恢复沿用同一 sample.id、spanId、traceId 和首次 parent；后续窗口通过 Link 和 `rl.sample.memberships` 记录实际归属，不重新挂 parent。一个完整 Sample 可以晚于首次接纳窗口结束。Agentic 批次按 Shard 接纳的一整个 Group 生命周期定义：开始启动其 Sessions，直到所有已启动 Sessions 终态或启动失败清理结束；预取、暂停、恢复不新建批次。`rl.agent.run` 保持独立 trace，并 Link 到对应 sample。
 
 **时间真实性：**
 
-- `rl.sample.timing=operation`：存在可独立观测的成员调用，使用它的真实起止。普通生成和逐条评分属于此类。
-- `rl.sample.timing=result`：后端一次处理整批／packed tensor，无法取得独立成员起止时，在埋点实际确认该成员结果的时刻生成零时长明细 span。其 start=end，不表示计算耗时为零。确认可能晚于批次原生结束；不得拉长批次 span 来包含该时刻。
-- 不复制整个批次的时长到每个成员，不均分批次耗时，不因拥有结果数组就伪造独立执行。父、子或并行 span 的耗时不能相加作为阶段耗时。
+- 子 span 使用 `rl.sample.timing=operation`，起止取自真实成员调用；不复制或均分批次耗时。父、子及并行 span 的耗时不能相加作为阶段耗时。
+- 本版不生成 `rl.sample.timing=result` 的零时长结果确认 span，也不根据结果数组补造 `.sample` 子 span。汇总、异步导出或 checkpoint 完成时间不是样本计算时间；延迟导出仍保留批次原生起止。
+- 旧版 0.10.0 的 result span 可兼容读取，但查看器应与执行时间线分开，默认展示批次上的结果明细。不得修改已有原始 trace 或将重绘结果宣称为重新训练的数据。
 
-所有明细为 `INTERNAL`，遵循第 2 章的状态规则；正常零分、drop、skipped 仍为 `UNSET`。未启动的成员不伪造执行 span；失败且已经启动但没有输出的成员必须保留。
+真实子操作为 `INTERNAL`，遵循第 2 章状态规则。正常零分、drop、skipped 仍为 `UNSET`；未启动的成员不伪造执行 span，已启动后失败的操作应保留。
 
 **公共属性（补充各阶段属性表）：**
 
@@ -113,12 +115,12 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 | `rl.sample.id`          | Development | Required：rollout 明细；其他明细可取得时           | string     | 一次输入采样调用身份；同题重复采样不同，续跑保持不变       |
 | `rl.export.id`          | Development | Required：下游成员使用 Export 身份时               | string     | 该结果所属的真实 Export ID，不以样本下标冒充               |
 | `rl.sample.index`       | Development | Conditionally Required：框架只传递样本下标时       | string     | 框架实际输入样本下标，与 run/step 一起关联；不是 Export ID |
-| `rl.sample.timing`      | Development | Required：明细                                     | string     | operation 或 result，按上述时间口径解释                    |
+| `rl.sample.timing`      | Development | Required：明细                                     | string     | 仅 operation，表示真实成员调用                    |
 | `rl.sample.memberships` | Development | Conditionally Required：完整调用涉及多个窗口／Step | string     | JSON 数组，保存实际 batch_id、step_id，不覆盖历史          |
 
 异步独立前向可按实际 DP 分区调用生成独立批次，`rl.partition.dp_rank` 记录整数分区编号；每个批次只计本分区真实成员，TP/PP/CP 不重复创建同一成员。训练 RPC 内可通过已有返回路径合并各 rank 的事实。
 
-前向批次和明细的 `rl.forward.results` 为 JSON 数组，保存真实 `export_id` 或 `sample_index` 及结果状态；未独立采集的 token 概率不伪造。训练明细的 `rl.train.results.uses` 保存本条消费及已确认的 `update_status`。
+前向的 `rl.forward.results` 为 JSON 数组，保存真实 `export_id` 或 `sample_index` 及结果状态；未独立采集的 token 概率不伪造。训练的 `rl.train.results.uses` 保存每条实际消费，通过 update_id 关联同一对象内 updates 的 committed／skipped／failed 状态。传输的 `rl.transfer.data.members` 可补充逐成员 export_id、sample_index；共同发送／ACK 时间只记录在批次上。
 
 下游明细保留 run.id、可确定的 step.id/iteration.index 及该阶段必要属性。普通训练仅有 sample_indices 时使用 `rl.sample.index`，rollout／评分同时保留同一个实际 index；不能凭空生成 Export 映射。数据不存在时不生成占位结果，采集不完整需明确诊断。
 
@@ -191,7 +193,7 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 
 该 span 是一批数据评分的总览，包含实际逐条 `rl.reward.score` 子 span。输入流式到达时，批次按已接纳的 rollout 窗口／明确的评分调用集合界定，使用新的评分 batch.id；batch.size 只计实际启动评分的输入，读取已有 reward 不计入。
 
-从首个评分开始，到输入窗口封口且所有已启动评分结束。末尾无评分的生成／后处理不计入原生结束时间；一个子评分提前失败不能关闭仍运行的兄弟评分。真正的批量 scorer 使用一次批次 span，成员结果按 result 明细记录。
+从首个评分开始，到输入窗口封口且所有已启动评分结束。末尾无评分的生成／后处理不计入原生结束时间；一个子评分提前失败不能关闭仍运行的兄弟评分。真正的批量 scorer 只生成一次批次 span，成员结果直接记录在 rl.reward.results，不生成 score 子 span。
 
 **Span kind:** `INTERNAL`。**Span name:** 固定为 `rl.reward.batch`。
 
@@ -199,13 +201,13 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 
 **Requirement level:** `Required`；有实际评分时采集。
 
-属性为第 2.1 节批次公共属性和 `rl.reward.score` 中的 run、purpose、step、评分方案、模型属性。混合评分路由使用完整方案名；批次 `rl.reward.results` 保存完整逐成员结果，子 span 保存自己对应的结果，不以平均值替代明细。
+属性为第 2.1 节批次公共属性和 `rl.reward.score` 中的 run、purpose、step、评分方案、模型属性。 批次结果保存最终返回值；若批量方案在独立子调用后再聚合或变换分数，子 span 保留该次调用的原始返回值，变换后的最终值和下游来源属于批次，不能用中间分数覆盖最终结果。混合评分路由使用完整方案名；批次 `rl.reward.results` 保存完整逐成员结果，子 span 保存自己对应的结果，不以平均值替代明细。
 
 ### Span: `rl.reward.score`
 
 **Status:** Development
 
-该 span 表示对一条已有轨迹执行完整原始评分，包括规则、验证器、奖励模型或模型裁判。parent 为真实 `rl.reward.batch`；独立调用使用 operation 时间，批量 scorer 的成员结果使用 result 时间。
+该 span 表示对一条已有轨迹的一次独立评分调用，包括规则、验证器、奖励模型或模型裁判。仅针对真实独立评分调用创建，parent 为实际 `rl.reward.batch`，使用 operation 时间；批量 scorer 返回的逐成员结果保存在批次属性中。
 
 从评价逻辑开始，到分数及有效性结果可供下游使用。读取已有 reward 不代表再次评分，不生成虚假的评分耗时。
 
