@@ -82,6 +82,9 @@ class AgentBatch:
 def trace_agentic_group(function: Any) -> Any:
     @wraps(function)
     async def call(owner: Any, rollout_mode: str, group_id: str, session_specs: Any) -> Any:
+        # Ray serializes this wrapper by value as part of the actor class.
+        from relax.utils.rl_agent_trace import _AGENT_BATCH
+
         if not enabled(owner.args) or not session_specs:
             return await function(owner, rollout_mode, group_id, session_specs)
         batch = AgentBatch(owner.args, group_id, rollout_mode, {spec.session_id for spec in session_specs})

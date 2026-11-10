@@ -76,7 +76,6 @@ from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
 from relax.utils.rl_agent_trace import start_agent_trace, trace_agentic_group
-from relax.utils.rl_tracing import inference_context
 from relax.utils.types import get_spec_token_counts
 
 
@@ -2569,6 +2568,7 @@ class AgenticSessionShard:
 
         # Import in the worker so Ray does not capture the unpicklable ContextVar.
         from relax.utils.http_utils import PostObservation, post_observation
+        from relax.utils.rl_tracing import inference_context
 
         group = session.group
         runner_task = asyncio.current_task()
