@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""RL semantic conventions 0.12.0, with process-local OTLP JSON files.
+"""RL semantic conventions 0.13.0, with process-local OTLP JSON files.
 
 RL batch stages are independent roots; their member spans are explicit
 children. Business identities cross Ray boundaries in the existing args
@@ -160,7 +160,7 @@ def _runtime(args: Namespace | None) -> Any:
             ),
         )
         provider.add_span_processor(SimpleSpanProcessor(DiskExporter()))
-        tracer = provider.get_tracer("relax.rl", "0.12.0")
+        tracer = provider.get_tracer("relax.rl", "0.13.0")
         result = (provider, tracer, root)
         _RUNTIMES[key] = result
         return result
@@ -202,6 +202,7 @@ class Stage:
         self.root: Path | None = None
         self._links: set[tuple[int, int]] = set()
         self._ended = False
+        self._operation_end_time: int | None = None
         if not active or not enabled(args):
             return
         try:
@@ -211,9 +212,13 @@ class Stage:
             _, tracer, self.root = _runtime(args)
             attrs = {
                 "rl.run.id": run_id(args),
+                "rl.timing.clock": "host_wall",
+                "rl.timing.scope": "operation",
                 **(iteration_attributes(iteration) if inherit_iteration else {}),
                 **(attributes or {}),
             }
+            if start_time is None:
+                self.start_time = time.time_ns()
             self.span = tracer.start_span(
                 name,
                 context=set_span_in_context(parent.span, Context()) if parent and parent.span else Context(),
@@ -330,6 +335,12 @@ class Stage:
         except (ValueError, TypeError, AttributeError):
             logger.warning("RL OTel ignored invalid source context")
 
+    def freeze_end(self, end_time: int | None = None) -> int:
+        """Latch the operation boundary before observation-only result work."""
+        if self._operation_end_time is None:
+            self._operation_end_time = time.time_ns() if end_time is None else end_time
+        return self._operation_end_time
+
     @best_effort
     def end(self, error: BaseException | None = None, *, end_time: int | None = None) -> None:
         if self.span is None or self._ended:
@@ -339,7 +350,7 @@ class Stage:
 
             self.span.set_status(Status(StatusCode.ERROR, f"{type(error).__name__}: {str(error)[:512]}"))
         self._ended = True
-        self.span.end(end_time=end_time)
+        self.span.end(end_time=end_time if end_time is not None else self._operation_end_time)
 
 
 @contextmanager

@@ -189,6 +189,10 @@ PYTHONPATH=. python scripts/tools/collect_otlp_traces.py \
 
 结构化结果、题目和 response 直接以完整 JSON 字符串保存在 span 属性中，新 trace 不依赖 `_ref` 附件。仅真实的逐样本 rollout 和评分调用创建子 span，标记 `rl.sample.timing=operation`。批量评分、前向、优势、过滤、传输和训练将成员结果保存在批次 span 上，不生成零时长结果 span。OPD 单样本前向只保留一个真实请求 span。训练 uses 通过 update_id 关联 updates 中的更新结果。旧版 0.10 的 result span 可兼容读取，但应与执行时间线分开展示。父子 span 的耗时也不能相加。Agentic 运行还会启用已有 observation 记录，保存 Session 的请求、尝试、状态及 Export，并通过 Export ID 关联实际训练消费。无法观测的外部工具时间保持未知。这些记录包含模型输入输出，应根据训练数据设置目录权限和保留期限。
 
+通过训练 RPC 汇总的 Megatron 阶段使用 `rl.timing.scope=representative_rank`：主时间线固定来自 DP0、CP0、TP0、最后一级 PP，业务结果仍汇总所有实际参与的 rank。`rl.timing.ranks` 保存每个来源的原始起止时间及主机／进程身份，其他 rank 不再拉长主 span。advantage 排除未执行计算的 PP stage。指定来源缺失时省略该 span 并记录诊断，不临时换另一个时钟。
+
+RL 耗时统一标记 `rl.timing.clock=host_wall`，包含调用内部已有的等待，不表示 GPU kernel 时间。train 从实际训练函数入口开始，不包含此前 RPC 准备／预取、之后的 checkpoint 和 offload。结果整理与 trace 导出不会延长已完成操作；自定义批量评分的实际后处理仍计入，即使结果值未改变。可恢复 Sample 保持原起点，直到真正终态才结束。权重 span 使用 `source_sync`，表示源端从准备到交付／生效确认，包含暂停、转换和等待，不是目标端独立安装时间。采集不会新增设备同步或分布式 barrier。
+
 阶段结束后即追加写入文件。进程在阶段执行中被强制终止时，该阶段可能没有结束记录。写入失败会记日志，训练继续运行；rank 数据不完整时，通过 `relax.observation.partial` 保存诊断信息，不冒充完整训练结果。采集不会增加分布式通信，GPU 上的简要统计通过异步复制交给训练线程之外的读者处理。
 
 训练结束后，可检查文件格式、内联结果、父子关系和阶段覆盖：

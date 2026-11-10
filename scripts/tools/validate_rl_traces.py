@@ -18,6 +18,43 @@ def attributes(items: list[dict]) -> dict:
     return {item["key"]: next(iter(item["value"].values())) for item in items}
 
 
+def _validate_timing(span: dict, attrs: dict) -> None:
+    if attrs.get("rl.timing.clock") != "host_wall":
+        raise ValueError("Missing host timing semantics")
+    scope = attrs.get("rl.timing.scope")
+    if scope in ("operation", "source_sync"):
+        return
+    if scope != "representative_rank":
+        raise ValueError("Unknown timing scope")
+    rows = json.loads(attrs["rl.timing.ranks"])
+    if len(rows) != int(attrs["rl.timing.rank_count"]):
+        raise ValueError("Mismatched timing rank count")
+    selected = [row for row in rows if row["representative"]]
+    if len(selected) != 1:
+        raise ValueError("Missing unique representative rank")
+    row = selected[0]
+    identities = {tuple(sorted(item["rank"].items())) for item in rows}
+    if len(identities) != len(rows):
+        raise ValueError("Duplicate timing rank")
+    if row["rank"]["pp"] != max(item["rank"]["pp"] for item in rows):
+        raise ValueError("Representative is not the final pipeline stage")
+    if any(row["rank"][key] != 0 for key in ("dp", "cp", "tp")):
+        raise ValueError("Incorrect representative rank")
+    for key, value in row["rank"].items():
+        if int(attrs[f"rl.timing.rank.{key}"]) != value:
+            raise ValueError("Mismatched representative rank")
+    if (int(span["startTimeUnixNano"]), int(span["endTimeUnixNano"])) != (
+        int(row["start_time_unix_nano"]),
+        int(row["end_time_unix_nano"]),
+    ):
+        raise ValueError("Span does not retain representative timing")
+    for row in rows:
+        if int(row["end_time_unix_nano"]) < int(row["start_time_unix_nano"]):
+            raise ValueError("Negative rank duration")
+        if not row["host_name"] or not row["process_pid"]:
+            raise ValueError("Missing timing producer identity")
+
+
 def validate(root: Path, min_train_steps: int = 0) -> dict:
     files = sorted(root.glob("*.jsonl"))
     if not files:
@@ -41,6 +78,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                             "0.10.0",
                             "0.11.0",
                             "0.12.0",
+                            "0.13.0",
                         ):
                             raise ValueError("Unexpected instrumentation scope")
                         for span in scope["spans"]:
@@ -94,7 +132,9 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
         if version == "0.9.0":
             continue
         name = span["name"]
-        if version in ("0.11.0", "0.12.0"):
+        if version == "0.13.0":
+            _validate_timing(span, attrs)
+        if version in ("0.11.0", "0.12.0", "0.13.0"):
             if attrs.get("rl.sample.timing") == "result":
                 raise ValueError("Result rows must be stored on the batch, not emitted as spans")
             if name.endswith(".sample") and name != "rl.rollout.sample":

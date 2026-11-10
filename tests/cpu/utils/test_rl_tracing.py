@@ -34,7 +34,7 @@ def spans(root, name=None):
         for line in path.read_text().splitlines():
             for resource in json.loads(line)["resourceSpans"]:
                 for scope in resource["scopeSpans"]:
-                    assert scope["scope"] == {"name": "relax.rl", "version": "0.12.0"}
+                    assert scope["scope"] == {"name": "relax.rl", "version": "0.13.0"}
                     result.extend(scope["spans"])
     return [span for span in result if name is None or span["name"] == name]
 
@@ -1128,3 +1128,171 @@ def test_generation_context_resets_after_failure(run):
 
     asyncio.run(execute())
     assert spans(root, "rl.rollout.sample")[0]["status"]["code"] == 2
+
+
+def test_rank_timing_preserves_one_clock_and_full_batch_results(run, monkeypatch):
+    from relax.utils import rl_train_trace as train
+    from scripts.tools.validate_rl_traces import _validate_timing
+
+    args, root = run
+    names = [
+        "rl.reference.forward",
+        "rl.teacher.forward",
+        "rl.actor.forward",
+        "rl.advantage.compute",
+        "rl.actor.train",
+        "rl.critic.forward",
+        "rl.critic.train",
+    ]
+    reports = []
+    # Rank arrival order and pipeline skew cannot change the chosen producer.
+    for pp, dp, offset in [(0, 0, -900), (3, 1, 900), (3, 0, 0)]:
+        rank = {"pp": pp, "dp": dp, "cp": 0, "tp": 0}
+        windows = [
+            {
+                "name": name,
+                "sequence": 0,
+                "attributes": {},
+                "rank": rank,
+                "owner": pp == 3,
+                "start_time": 1000 + i * 100 + offset,
+                "end_time": 1050 + i * 100 + offset,
+                "host_name": "worker",
+                "process_pid": dp + pp + 1,
+                "updates": [],
+                "records": [],
+                "members": [f"sample:{dp}"],
+            }
+            for i, name in enumerate(names)
+            if name != "rl.advantage.compute" or pp == 3
+        ]
+        reports.append({"rl_trace_producer": {"owner": pp == 3, "rank": rank}, "rl_trace_windows": windows})
+    train.emit_windows(args, reports)
+    records = {s["name"]: s for s in spans(root)}
+    for i, name in enumerate(names):
+        record = records[name]
+        _validate_timing(record, attrs(record))
+        assert int(record["startTimeUnixNano"]) == 1000 + i * 100
+        assert int(record["endTimeUnixNano"]) == 1050 + i * 100
+        assert attrs(record)["rl.batch.size"] == "2"
+        assert len(artifact(record, "rl.timing.ranks")) == (2 if name == "rl.advantage.compute" else 3)
+    # A synthetic cross-rank envelope is rejected by the validator.
+    bad = dict(records[names[0]], startTimeUnixNano="100")
+    with pytest.raises(ValueError, match="retain representative timing"):
+        _validate_timing(bad, attrs(bad))
+    # Missing the designated rank must not silently switch to another clock.
+    before = len(spans(root))
+    train.emit_windows(args, reports[:2])
+    assert len(spans(root)) == before
+
+
+def test_advantage_excludes_pipeline_noop_without_changing_call(run, monkeypatch):
+    from relax.utils import rl_train_trace as train
+
+    args, _ = run
+    args.advantage_estimator = "grpo"
+    rank = {"pp": 0}
+    mpu = SimpleNamespace(
+        is_pipeline_last_stage=lambda **kw: rank["pp"] == 3,
+        get_tensor_model_parallel_rank=lambda: 0,
+        get_context_parallel_rank=lambda: 0,
+        get_data_parallel_rank=lambda **kw: 0,
+        get_pipeline_model_parallel_rank=lambda: rank["pp"],
+    )
+    monkeypatch.setitem(sys.modules, "megatron.core", SimpleNamespace(mpu=mpu))
+    calls = []
+
+    @hooks.trace_advantage
+    def compute(args, data):
+        calls.append(rank["pp"])
+        return "done" if rank["pp"] == 3 else None
+
+    @train.training_rpc
+    def execute(owner, rollout_id):
+        compute(args, {"rollout_log_probs": [1.0]})
+
+    assert execute(SimpleNamespace(args=args), 0)["rl_trace_windows"] == []
+    rank["pp"] = 3
+    assert len(execute(SimpleNamespace(args=args), 0)["rl_trace_windows"]) == 1
+    assert calls == [0, 3]
+
+
+def test_async_training_starts_at_train_call_not_rpc_entry(run, monkeypatch):
+    from relax.utils import rl_train_trace as train
+
+    args, _ = run
+    args.advantage_estimator = "grpo"
+    clock = {"now": 100}
+    monkeypatch.setattr(train.time, "time_ns", lambda: clock["now"])
+    mpu = SimpleNamespace(
+        is_pipeline_last_stage=lambda **kw: True,
+        get_tensor_model_parallel_rank=lambda: 0,
+        get_context_parallel_rank=lambda: 0,
+        get_data_parallel_rank=lambda **kw: 0,
+        get_pipeline_model_parallel_rank=lambda: 0,
+    )
+    monkeypatch.setitem(sys.modules, "megatron.core", SimpleNamespace(mpu=mpu))
+
+    @train.training_rpc
+    def train_async(owner, rollout_id):
+        clock["now"] = 500  # data preparation before entering actual train
+        with train.window(args, "actor", rollout_id):
+            clock["now"] = 600
+        clock["now"] = 900  # checkpoint/export after train
+
+    report = train_async(SimpleNamespace(args=args), 0)
+    assert report["rl_trace_windows"][0]["start_time"] == 500
+    assert report["rl_trace_windows"][0]["end_time"] == 600
+
+
+def test_filter_excludes_result_serialization_time(run, monkeypatch):
+    args, root = run
+    clock = {"now": 100}
+    monkeypatch.setattr(tracing.time, "time_ns", lambda: clock["now"])
+    original = hooks._record_filter_results
+
+    def record(*args):
+        clock["now"] = 900
+        return original(*args)
+
+    monkeypatch.setattr(hooks, "_record_filter_results", record)
+
+    @hooks.trace_filter
+    def apply(fn, args, values):
+        clock["now"] = 200
+        return SimpleNamespace(keep=True, reason=None)
+
+    apply(lambda: None, args, [sample()])
+    (record,) = spans(root)
+    assert int(record["endTimeUnixNano"]) == 200
+    assert len(artifact(record, "rl.filter.results")) == 1
+
+
+def test_custom_reward_batch_times_postprocessing_and_excludes_result_serialization(run, monkeypatch):
+    args, root = run
+    args.custom_rm_path = "custom.scorer"
+    clock = {"now": 100}
+    monkeypatch.setattr(tracing.time, "time_ns", lambda: clock["now"])
+    original = hooks._record_batched_values
+
+    def record(*args):
+        clock["now"] = 900
+        return original(*args)
+
+    monkeypatch.setattr(hooks, "_record_batched_values", record)
+
+    @hooks.trace_reward
+    async def one(args, value):
+        clock["now"] = 200
+        return 1.0
+
+    @hooks.trace_batched_reward
+    async def batch(args, values):
+        result = [await one(args, v) for v in values]
+        clock["now"] = 400  # real batch work after individual scoring
+        return result  # unchanged values still require the later boundary
+
+    assert asyncio.run(batch(args, [sample()])) == [1.0]
+    (record,) = spans(root, "rl.reward.batch")
+    assert int(record["endTimeUnixNano"]) == 400
+    assert int(spans(root, "rl.reward.score")[0]["endTimeUnixNano"]) == 200

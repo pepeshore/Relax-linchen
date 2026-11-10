@@ -2,7 +2,7 @@
 
 **Status:** Development
 
-**Version:** 0.12.0
+**Version:** 0.13.0
 
 **Date:** 2026-11-10
 
@@ -33,7 +33,27 @@ Role 表示逻辑职责，如 actor、rollout、reference；它不是所有框�
 
 ## 2 通用要求
 
-阶段 span 由掌握完整操作生命周期的一方记录一次，耗时使用原生起止时间计算，包括该职责内部的通信、等待和重试。提交成功不代表操作完成；不同 rank 的记录不能累加成一次逻辑阶段的整体耗时。未执行的阶段不生成占位 span。
+阶段 span 由掌握操作边界的一方记录一次，保留原生起止，包括该调用内部的通信、等待和重试。提交成功不代表 GPU 工作完成；未执行的阶段不生成占位 span。分布式结果可全量汇总，计时来源必须另行说明，不能将不同 rank 的最早开始与最晚结束拼成一次实际调用，也不能累加 rank 耗时。
+
+### 计时口径
+
+Relax 记录 host wall-clock 调用时间，不是 CUDA kernel 时间。异步 GPU 工作可能在 host 函数返回后继续执行；不得为 trace 新增 barrier、CUDA synchronize 或调整已有训练调度。同一 rank 的串行调用应保留实际先后顺序，不根据图形裁剪或平移 span。
+
+| Key                                         | Stability   | Requirement Level             | Value Type | Description                                                                                                                                         |
+| ------------------------------------------- | ----------- | ----------------------------- | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rl.timing.clock`                           | Development | Required                      | string     | 当前 RL 实现为 `host_wall`，不表示 GPU 时间                                                                                                         |
+| `rl.timing.scope`                           | Development | Required                      | string     | `operation`：实际调用生命周期；`representative_rank`：固定代表 rank 的调用；`source_sync`：源端观察到的权重同步边界                                 |
+| `rl.timing.rank.dp` / `.cp` / `.tp` / `.pp` | Development | Required：representative_rank | int        | 计时来源的并行 rank，不是导出协调器的 rank                                                                                                          |
+| `rl.timing.rank_count`                      | Development | Required：representative_rank | int        | 本次实际参与并上报该操作时间的 rank 数                                                                                                              |
+| `rl.timing.ranks`                           | Development | Required：representative_rank | string     | 完整 JSON 数组，每项含 rank、host_name、process_pid、start_time_unix_nano、end_time_unix_nano、representative；纳秒时间用十进制 string 避免精度丢失 |
+
+Megatron 训练 RPC 内的 reference／teacher／actor／critic forward、advantage 和 actor／critic train 使用同一个固定来源：DP0、CP0、TP0、最后一个 PP stage。主 span 的起止必须与其 `rl.timing.ranks` 中唯一 representative 项完全一致。各 DP／CP 的业务结果继续全量合并，`rl.batch.size` 仍是实际批次成员数，不缩成代表 rank 的成员数。其他 rank 的时间仅作诊断，不参与主 span 起止。缺少指定来源时省略该阶段并记录诊断，不临时改用另一个 rank；不完整业务结果沿用 `relax.observation.partial`。
+
+advantage 只采集真正执行计算的末级 PP，其他 PP 的直接返回不是计算。异步独立 forward 仍按实际 DP 分区调用记录，属于 `operation`，不能冒充全局批次耗时。无 rank 汇总的 rollout、reward、Agent、过滤、数据传输和 CPU advantage 记录各自实际生命周期。跨主机调用比较需要时钟同步；图中的重叠本身不证明 GPU 并行。
+
+操作返回或失败时先固定结束时间，再整理 observation JSON 和导出；观测结果的序列化、异步统计读取、checkpoint 或导出完成时间不得延长业务 span。批量评分若有真实的批次后处理，即使返回值未改变也必须计入；内建纯逐条 fanout 结束于最后一个真实评分调用。可恢复的 ABORTED Sample 不冻结终态时间，恢复后沿用首次起点。
+
+权重 span 的 `source_sync` 是源端同步操作观测：publish 从同步准备到已有交付确认，load 从同次同步准备到目标确认可用及恢复完成。两者可真实重叠，包含暂停、缓存清理、转换、通信及确认等待；LoRA 发布流程还可能包含恢复生成。当前没有目标侧独立安装起点，因此这些 spans 不表示纯网络传输或 GPU 安装耗时，不能把源端起点解释成目标开始安装。
 
 span 本身的成功／失败统一使用原生 Span Status，不另外定义同义 attributes。本文的 `status_code` 和 `status_message` 分别指 OTLP 的 `span.status.code` 和 `span.status.message`；SDK 通常将 message 称为 description。
 
@@ -74,7 +94,7 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 6. **SGLang 推理父子关系。** SGLang 请求入口 span 继承负责本次调用的 RL span 的 traceId，并将其作为 parent：普通生成指向 `rl.rollout.sample`，Agentic 模型请求指向 `rl.agent.run`。通过 HTTP `traceparent`／`tracestate` 传递真实 SpanContext，在进入 Ray HTTP worker 或 router 前完成注入；中间层应保留该上下文。SGLang 内部 spans 保持原有名称和父子树，不为每个内部 span 再创建 RL 包装。单个 sample／Agent 可以包含多次请求，它们分别归属于同一个 RL span；重试和恢复不把请求挂到其他样本。若启用 router 自身 tracing，允许真实的 router span 位于 RL 与 SGLang 之间，并保持可追溯的父链。
 7. **其他后端与耗时。** 其他后端（如 Megatron）仍可使用独立 trace，通过入口 Span Link 指向负责该操作的 RL span；当前未实现 Megatron 内部 trace 的自动关联。SGLang 与 RL 共享 trace 后，一条 rollout 批次 trace 可以包含多个样本及其推理细节，不再要求这些 SGLang 请求使用独立 trace。各阶段保留真实起止；父子、并行阶段及 RL／后端耗时不能相加作为 Step 总耗时。
 
-**当前实现范围（Relax RL 0.12.0）：** 内置普通 rollout、`GenerateState.post_generate` 和 Agentic SGLang adapter 注入上述 W3C 上下文。RL tracing 关闭或无有效来源 span 时不注入。现有路由 headers 保留；独立并发样本／Session 的上下文相互隔离。自定义生成若绕过这些入口、自行调用 HTTP 客户端，需使用相同的 `inference_headers` 辅助函数。
+**当前实现范围（Relax RL 0.13.0）：** 内置普通 rollout、`GenerateState.post_generate` 和 Agentic SGLang adapter 注入上述 W3C 上下文。RL tracing 关闭或无有效来源 span 时不注入。现有路由 headers 保留；独立并发样本／Session 的上下文相互隔离。自定义生成若绕过这些入口、自行调用 HTTP 客户端，需使用相同的 `inference_headers` 辅助函数。
 
 SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL 的进程内文件 exporter 自动写出。采集两端后按 `(traceId, spanId, parentSpanId)` 还原父子关系；`rl.run.id`／`rl.step.id` 等属性不会由 parent 自动复制，可沿父链定位所属 RL span。不要用时间接近或业务 ID 伪造父关系。
 
@@ -402,7 +422,7 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 
 该 span 表示对有界批次或流式输入窗口执行策略训练，包含带梯度前向、loss、反向、梯度累积和优化器更新决策。
 
-从接纳本次训练输入／窗口并开始训练，到该窗口更新流程完成，或失败／取消处理结束。流式输入等待计入端到端时间；权重发布、checkpoint 和训练后 offload 不在此边界内。
+从接纳本次训练输入／窗口并开始训练，到该窗口更新流程完成，或失败／取消处理结束。Relax 的代表 rank 从实际 train 调用入口开始，调用内流式取数等待计入 host 时间；RPC 入口、调用前准备／预取（包括 dynamic+VPP 的整桶预取）、权重发布、checkpoint 和训练后 offload 不在此边界内。
 
 **Span kind:** `INTERNAL`。
 
@@ -438,7 +458,7 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 
 该 span 表示使用 returns 等目标训练价值模型，包含价值模型的带梯度前向、loss、反向和更新决策。
 
-从接纳价值训练输入／窗口并开始训练，到本窗口价值更新流程完成，或失败／取消处理结束。独立旧 values 预测属于 critic.forward；流式输入等待计入端到端时间。
+从接纳价值训练输入／窗口并开始训练，到本窗口价值更新流程完成，或失败／取消处理结束。独立旧 values 预测属于 critic.forward；Relax 从实际 train 调用入口开始，调用内流式等待计入 host 时间，调用前数据准备与调用后 checkpoint／offload 不计入。
 
 **Span kind:** `INTERNAL`。
 
@@ -473,7 +493,7 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 
 该 span 表示将一份一致的策略快照交付给约定接收端，使其可以获取该版本。
 
-从开始序列化、发布或传输，到源端交付完成：拉取式为快照已可读取，推送式为约定目标已确认接收。此边界不包含目标激活。
+从开始序列化、发布或传输，到源端交付完成：拉取式为快照已可读取，推送式为约定目标已确认接收。此边界不包含目标激活。若适配器只能提供源端同步调用边界，必须标明 `rl.timing.scope=source_sync`，遵循第 2 章的边界说明，不能标为纯交付耗时。
 
 **Span kind:** `INTERNAL`。
 
@@ -503,7 +523,7 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 
 该 span 表示指定生成目标获取、安装并激活已发布的策略快照。
 
-从目标开始获取或安装参数，到本次声明的目标范围确认生效。单个 rank 安装完成不能代替整个目标可用的确认。
+从目标开始获取或安装参数，到本次声明的目标范围确认生效。单个 rank 安装完成不能代替整个目标可用的确认。Relax 当前仅有源端同步边界，使用 `rl.timing.scope=source_sync`；起点包含准备过程，不声称观测到目标实际安装起点。
 
 **Span kind:** `INTERNAL`。
 

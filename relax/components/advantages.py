@@ -118,6 +118,7 @@ class Advantages(Base):
                         attributes={"rl.advantage.estimator": self.config.advantage_estimator},
                     ) as observation:
                         advantages_and_returns = self.compute_advantages_and_returns(rollout_data)
+                        observation.freeze_end()
                         if enabled(self.config) and advantages_and_returns is not None:
                             record_cpu_advantage(observation, rollout_data, advantages_and_returns)
                     advantages_and_returns = TensorDict(advantages_and_returns, batch_size=[len(batch_meta.samples)])

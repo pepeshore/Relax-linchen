@@ -10,6 +10,8 @@ trace-context transport is introduced. Delayed export retains native timings.
 from __future__ import annotations
 
 import math
+import os
+import socket
 import time
 import uuid
 from collections import defaultdict
@@ -28,7 +30,6 @@ logger = get_logger(__name__)
 _WINDOWS: ContextVar[list[dict[str, Any]] | None] = ContextVar("rl_windows", default=None)
 _CURRENT: ContextVar[dict[str, Any] | None] = ContextVar("rl_train_window", default=None)
 _UPDATE: ContextVar[str | None] = ContextVar("rl_update_id", default=None)
-_STREAM_START: ContextVar[int | None] = ContextVar("rl_stream_start", default=None)
 _READER: BoundedWorker | None = None
 
 
@@ -67,7 +68,6 @@ def training_rpc(function: Callable) -> Callable:
             return function(owner, rollout_id, *args, **kwargs)
         windows: list[dict[str, Any]] = []
         token = _WINDOWS.set(windows)
-        stream_token = _STREAM_START.set(time.time_ns() if function.__name__ == "train_async" else None)
         try:
             result = function(owner, rollout_id, *args, **kwargs)
             payload = _finish_windows(windows)
@@ -79,13 +79,16 @@ def training_rpc(function: Callable) -> Callable:
                 completed = [w for w in windows if "end_time" in w and "error" not in w]
                 for item in _finish_windows(completed):
                     observation = Stage(
-                        owner.args, item["name"], attributes=item["attributes"], start_time=item["start_time"]
+                        owner.args,
+                        item["name"],
+                        attributes={**item["attributes"], **_timing_attributes(item, 1)},
+                        start_time=item["start_time"],
                     )
+                    _record_rank_times(observation, [item])
                     observation.data("relax.observation.partial", item)
                     observation.end(end_time=item["end_time"])
             raise
         finally:
-            _STREAM_START.reset(stream_token)
             _WINDOWS.reset(token)
 
     return call
@@ -148,7 +151,9 @@ def window(
         "name": name,
         "sequence": sum(w["name"] == name for w in windows),
         "attributes": attrs,
-        "start_time": (_STREAM_START.get() if role == "actor" and name.endswith(".train") else None) or time.time_ns(),
+        "start_time": time.time_ns(),
+        "host_name": socket.gethostname(),
+        "process_pid": os.getpid(),
         "updates": [],
         "futures": [],
         "owner": _owner(),
@@ -174,11 +179,18 @@ def window(
         # An exceptional RPC cannot return its facts. Retain the actual failing
         # operation locally, rather than losing the error while Ray unwinds.
         if observation["owner"] and observation["rank"]["dp"] == observation["rank"]["cp"] == 0:
-            failed = Stage(args, name, attributes=attrs, start_time=observation["start_time"])
-            failed.end(error)
+            observation["end_time"] = time.time_ns()
+            failed = Stage(
+                args,
+                name,
+                attributes={**attrs, **_timing_attributes(observation, 1)},
+                start_time=observation["start_time"],
+            )
+            _record_rank_times(failed, [observation])
+            failed.end(error, end_time=observation["end_time"])
         raise
     finally:
-        observation["end_time"] = time.time_ns()
+        observation.setdefault("end_time", time.time_ns())
         _CURRENT.reset(token)
 
 
@@ -337,6 +349,37 @@ def _read(
     return result
 
 
+def _representative(item: dict) -> bool:
+    # Keep every stage on the same producer clock. Never switch to an earlier
+    # pipeline stage just because it returns before the result-producing stage.
+    return item["owner"] and item["rank"]["dp"] == item["rank"]["cp"] == 0
+
+
+def _timing_attributes(item: dict, rank_count: int) -> dict[str, Any]:
+    return {
+        "rl.timing.scope": "representative_rank",
+        "rl.timing.rank_count": rank_count,
+        **{f"rl.timing.rank.{key}": value for key, value in item["rank"].items()},
+    }
+
+
+def _record_rank_times(observation: Stage, windows: list[dict]) -> None:
+    observation.data(
+        "rl.timing.ranks",
+        [
+            {
+                "rank": item["rank"],
+                "host_name": item.get("host_name"),
+                "process_pid": item.get("process_pid"),
+                "start_time_unix_nano": str(item["start_time"]),
+                "end_time_unix_nano": str(item["end_time"]),
+                "representative": _representative(item),
+            }
+            for item in windows
+        ],
+    )
+
+
 @best_effort
 def emit_windows(args: Any, reports: list[Any]) -> None:
     grouped: dict[tuple, list[dict]] = defaultdict(list)
@@ -346,12 +389,18 @@ def emit_windows(args: Any, reports: list[Any]) -> None:
         for item in report.get("rl_trace_windows", []):
             grouped[(item["name"], item["sequence"])].append(item)
     for (name, _), windows in grouped.items():
-        attrs = dict(windows[0]["attributes"])
+        representatives = [item for item in windows if _representative(item)]
+        if len(representatives) != 1:
+            logger.warning("RL OTel missing or ambiguous representative timing for %s; stage omitted", name)
+            continue
+        representative = representatives[0]
+        attrs = {**representative["attributes"], **_timing_attributes(representative, len(windows))}
         owners = [item for item in windows if item["owner"]]
         attrs["rl.batch.id"] = uuid.uuid4().hex
         if owners and all("members" in item for item in owners):
             attrs["rl.batch.size"] = len({identity for item in owners for identity in item["members"]})
-        observation = Stage(args, name, attributes=attrs, start_time=min(w["start_time"] for w in windows))
+        observation = Stage(args, name, attributes=attrs, start_time=representative["start_time"])
+        _record_rank_times(observation, windows)
         errors = [error for item in owners for error in item.get("capture_errors", [])]
         expected = {
             tuple(sorted(report["rl_trace_producer"]["rank"].items()))
@@ -405,4 +454,4 @@ def emit_windows(args: Any, reports: list[Any]) -> None:
         if errors:
             observation.data("relax.observation.partial", {"errors": errors, "fragments": windows})
             logger.warning("RL OTel incomplete structured data: %s", errors)
-        observation.end(end_time=max(w["end_time"] for w in windows))
+        observation.end(end_time=representative["end_time"])

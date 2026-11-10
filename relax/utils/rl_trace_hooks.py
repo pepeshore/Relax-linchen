@@ -205,7 +205,7 @@ class GenerationBatch:
                     self.versions.add(str(version))
         observation = self.sample_observations.pop(identity, None)
         if observation is not None:
-            observation.finish(sample, results, error)
+            observation.finish(sample, results, error, end_time=self.end_time)
         self.close_if_finished()
 
     @best_effort
@@ -292,6 +292,7 @@ def trace_generation(function: Callable) -> Callable:
             try:
                 with inference_context(detail.span if detail is not None else None):
                     result = await function(state, args, sample, *rest, **kwargs)
+                observation.freeze_end()
                 results = _samples(result)
                 _record_generation_version(observation, results)
                 return result
@@ -299,8 +300,9 @@ def trace_generation(function: Callable) -> Callable:
                 error = exc
                 raise
             finally:
+                end_time = observation.freeze_end()
                 if detail is not None:
-                    detail.finish(sample, results, error)
+                    detail.finish(sample, results, error, end_time=end_time)
 
     return call
 
@@ -423,8 +425,16 @@ class RewardBatch:
                 self.observation.add_link(source)
 
     @best_effort
-    def record(self, sample: Any, value: Any, error: BaseException | None, observation: Stage | None = None) -> None:
-        self.end_time = time.time_ns()
+    def record(
+        self,
+        sample: Any,
+        value: Any,
+        error: BaseException | None,
+        observation: Stage | None = None,
+        *,
+        end_time: int | None = None,
+    ) -> None:
+        self.end_time = max(self.end_time or 0, time.time_ns() if end_time is None else end_time)
         source = self.routes.get(id(sample), (reward_attributes(self.args)["rl.reward.name"], ""))[0]
         row = {
             "export_id": export_id(sample),
@@ -484,7 +494,9 @@ class RewardBatch:
 
 
 @best_effort
-def _record_batched_values(batch: RewardBatch, samples: list[Any], values: Any, error: BaseException | None) -> None:
+def _record_batched_values(
+    batch: RewardBatch, samples: list[Any], values: Any, error: BaseException | None, end_time: int
+) -> None:
     if values is not None:
         if len(values) != len(samples):
             batch.observation.data(
@@ -496,11 +508,11 @@ def _record_batched_values(batch: RewardBatch, samples: list[Any], values: Any, 
                 if previous is not None:
                     route = reward_attributes(batch.args)
                     batch.routes[id(sample)] = (route["rl.reward.name"], route["rl.reward.type"])
-                batch.record(sample, value, None)
+                batch.record(sample, value, None, end_time=end_time)
     elif error is not None and batch.active == 1:
         for sample in samples:
             if id(sample) not in batch.results:
-                batch.record(sample, None, error)
+                batch.record(sample, None, error, end_time=end_time)
 
 
 def trace_batched_reward(function: Callable) -> Callable:
@@ -529,8 +541,14 @@ def trace_batched_reward(function: Callable) -> Callable:
             error = exc
             raise
         finally:
+            end_time = time.time_ns()
+            custom = getattr(args, "custom_rm_path", None) and not kwargs.get("ignore_custom", False)
+            # Built-in fanout ends with its last child, not after child export.
+            # Custom scorers may do real batch work after those child calls.
+            if custom or not batch.results:
+                batch.end_time = max(batch.end_time or 0, end_time)
             _REWARD_BATCH.reset(token)
-            _record_batched_values(batch, samples, values, error)
+            _record_batched_values(batch, samples, values, error, end_time)
             batch.active -= 1
             if own:
                 batch.close(None, error)
@@ -577,6 +595,7 @@ def trace_transfer(function: Callable) -> Callable:
                 data["receive_ack_time"] = time.time()
                 return result
             finally:
+                observation.freeze_end()
                 _record_transfer_results(observation, samples, data)
 
     return call
@@ -622,6 +641,7 @@ def trace_filter(function: Callable) -> Callable:
             links=_sources(samples),
         ) as observation:
             result = function(fn, *args, **kwargs)
+            observation.freeze_end()
             _record_filter_results(observation, samples, result)
             return result
 
@@ -687,6 +707,7 @@ def trace_forward(function: Callable) -> Callable:
             result = function(
                 owner, data_iterator, num_microbatches, store_prefix=store_prefix, collect_topk=collect_topk
             )
+            observation.freeze_end()
             if active:
                 _record_forward_members(observation, data)
             return result
@@ -697,11 +718,17 @@ def trace_forward(function: Callable) -> Callable:
 def trace_advantage(function: Callable) -> Callable:
     @wraps(function)
     def call(args: Any, rollout_data: Any, **kwargs: Any) -> Any:
+        from megatron.core import mpu
+
         from relax.utils.rl_tracing import iteration_attributes
         from relax.utils.rl_train_trace import window
 
         iteration = iteration_attributes().get("rl.iteration.index")
-        if all(rollout_data.get(key) is None for key in ("log_probs", "rollout_log_probs", "values")):
+        # Match compute_advantages_and_returns: other PP stages return without
+        # computing, even when their input contains rollout_log_probs.
+        if not mpu.is_pipeline_last_stage() or all(
+            rollout_data.get(key) is None for key in ("log_probs", "rollout_log_probs", "values")
+        ):
             return function(args, rollout_data, **kwargs)
         with window(args, "advantage", iteration, estimator=args.advantage_estimator):
             result = function(args, rollout_data, **kwargs)
@@ -766,6 +793,7 @@ def trace_agentic_transfer(function: Callable) -> Callable:
                 data["receive_ack_time"] = time.time()
                 return result
             finally:
+                observation.freeze_end()
                 _record_transfer_results(observation, samples, data)
 
     return call
@@ -800,6 +828,7 @@ def trace_custom_advantage(function: Callable) -> Callable:
             attributes={"rl.advantage.estimator": callable_name(owner.custom_advantage_func)},
         ) as observation:
             result = await function(owner, group)
+            observation.freeze_end()
             _record_custom_advantage(observation, group, result)
             return result
 
@@ -828,6 +857,7 @@ def trace_opd_forward(role: str) -> Callable:
                 attrs["rl.forward.purpose"] = "distillation"
             with stage(owner.args, f"rl.{role}.forward", attributes=attrs, links=_sources([sample])) as observation:
                 result = await function(owner, sample, *args, **kwargs)
+                observation.freeze_end()
                 row = {"export_id": export_id(sample), "status": "invalid" if result is False else "valid"}
                 observation.data("rl.forward.results", [row])
                 if result is False:

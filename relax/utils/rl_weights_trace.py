@@ -29,6 +29,8 @@ def trace_weight_call(function: Callable) -> Callable:
             stages = owner._rl_weight_stages
             if stages is not None:
                 publication, activation = stages
+                end_time = publication.freeze_end()
+                activation.freeze_end(end_time)
                 publication.end(error)
                 activation.end(error)
             owner._rl_weight_stages = previous
@@ -52,6 +54,7 @@ def begin_weights(owner: Any) -> None:
     targets = [engine._actor_id.hex() for engine in engines]
     attrs = {
         "rl.model.name": model_name(owner.args),
+        "rl.timing.scope": "source_sync",
         "rl.model.version": str(owner.weight_version),
         "rl.weight.transfer.id": uuid4().hex,
     }

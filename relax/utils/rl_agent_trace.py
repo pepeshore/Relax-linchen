@@ -59,16 +59,25 @@ class AgentBatch:
         )
 
     @best_effort
-    def finish(self, identity: str, steps: set[int], error: BaseException | None, version: str | None = None) -> None:
+    def finish(
+        self,
+        identity: str,
+        steps: set[int],
+        error: BaseException | None,
+        version: str | None = None,
+        *,
+        end_time: int | None = None,
+    ) -> None:
         self.finished.add(identity)
         self.versions[identity] = version
         self.steps.update(steps)
         self.error = self.error or error
         if self.finished >= self.expected:
-            self.close()
+            self.close(end_time=end_time)
 
     @best_effort
-    def close(self, error: BaseException | None = None) -> None:
+    def close(self, error: BaseException | None = None, *, end_time: int | None = None) -> None:
+        self.span.freeze_end(end_time)
         versions = set(self.versions.values())
         if len(self.versions) == len(self.expected) and len(versions) == 1 and None not in versions:
             self.span.set("rl.model.version", next(iter(versions)))
@@ -253,6 +262,8 @@ class AgentTrace:
 
     @best_effort
     def finish(self, error: BaseException | None = None) -> None:
+        end_time = self.span.freeze_end()
+        self.sample.freeze_end(end_time)
         try:
             self._finish_data(error)
             nodes = {node["hash"]: node for node in self.states}
@@ -288,7 +299,7 @@ class AgentTrace:
         finally:
             self.span.end(error)
             self.sample.end(error)
-            self.batch.finish(self.session_id, self.steps, error, self.version)
+            self.batch.finish(self.session_id, self.steps, error, self.version, end_time=end_time)
 
 
 @best_effort

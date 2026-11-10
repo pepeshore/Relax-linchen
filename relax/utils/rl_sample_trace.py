@@ -55,9 +55,16 @@ class SampleTrace:
             self.memberships.append(membership)
 
     @best_effort
-    def finish(self, source: Any, results: list[Any], error: BaseException | None) -> None:
+    def finish(
+        self, source: Any, results: list[Any], error: BaseException | None, *, end_time: int | None = None
+    ) -> None:
         from relax.utils.rl_trace_hooks import _publish_source, export_id
 
+        continuing = error is None and any(
+            getattr(getattr(s, "status", None), "name", None) == "ABORTED" for s in results
+        )
+        if not continuing:
+            self.span.freeze_end(end_time)
         for result in results:
             if not isinstance(result.metadata, dict):
                 result.metadata = {}
@@ -79,7 +86,7 @@ class SampleTrace:
         known = histories and all(history and all(v not in (None, "") for v in history) for history in histories)
         self.version = next(iter(versions)) if known and len(versions) == 1 else None
         # ABORTED can be carried to a later window even with partial_rollout=False.
-        if error is None and any(getattr(getattr(s, "status", None), "name", None) == "ABORTED" for s in results):
+        if continuing:
             return
         self.span.set("rl.model.version", self.version)
         self.span.data("rl.sample.memberships", self.memberships)
@@ -110,6 +117,7 @@ def discard_samples(args: Any, samples: list[Any] | None = None) -> None:
     identities = None if samples is None else {sample_attributes(s).get("rl.sample.id") for s in samples}
     for key, observation in list(_LIVE.items()):
         if key[0] == run_id(args) and (identities is None or key[1] in identities):
+            observation.span.freeze_end()
             observation.span.set("rl.sample.cancelled", True)
             observation.span.set("rl.model.version", observation.version)
             observation.span.data("rl.sample.memberships", observation.memberships)
