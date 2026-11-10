@@ -815,9 +815,7 @@ def trace_opd_forward(role: str) -> Callable:
                 )
             else:
                 attrs["rl.forward.purpose"] = "distillation"
-            with stage(
-                owner.args, f"rl.{role}.forward", attributes=attrs, links=_sources([sample])
-            ) as observation:
+            with stage(owner.args, f"rl.{role}.forward", attributes=attrs, links=_sources([sample])) as observation:
                 result = await function(owner, sample, *args, **kwargs)
                 row = {"export_id": export_id(sample), "status": "invalid" if result is False else "valid"}
                 observation.data("rl.forward.results", [row])

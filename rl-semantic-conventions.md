@@ -53,18 +53,18 @@ span 名称固定，不拼接 Run、Step、rank、模型名或请求内容。角
 
 属性按事实所属的阶段记录，不向后续 span 复制整套上下文：
 
-| 属性                             | 记录位置                                                 | 口径                                                                                   |
-| -------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `rl.batch.id`、`rl.batch.size`   | 所有批次操作 span                                        | 各阶段记录自身实际输入集合身份与成员数；明细只记录所属 batch.id，不重复记录 batch.size |
-| `rl.purpose`                     | `rl.rollout.generate`、`rl.reward.score`、`rl.agent.run` | 区分训练采样与评估；训练及训练准备阶段的用途已由职责确定，权重操作可能同时服务多个用途 |
-| `rl.algorithm.name`              | `rl.actor.train`                                         | 记录本轮策略训练算法；优势阶段单独记录实际 estimator，Critic 不重复复制策略算法名      |
-| 评分、优势、过滤、传输和训练结果 | 各自执行该操作的 span                                    | 保留逐 Export／Update 结果，后续按对象 ID 关联，不复制到 Agent span                    |
+| 属性                             | 记录位置                                                                                         | 口径                                                                                               |
+| -------------------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
+| `rl.batch.id`、`rl.batch.size`   | 所有批次操作 span                                                                                | 各阶段记录自身实际输入集合身份与成员数；真实子操作 span 只记录所属 batch.id，不重复记录 batch.size |
+| `rl.purpose`                     | `rl.rollout.generate`、`rl.rollout.sample`、`rl.reward.batch`、`rl.reward.score`、`rl.agent.run` | 区分训练采样与评估；训练及训练准备阶段的用途已由职责确定，权重操作可能同时服务多个用途             |
+| `rl.algorithm.name`              | `rl.actor.train`                                                                                 | 记录本轮策略训练算法；优势阶段单独记录实际 estimator，Critic 不重复复制策略算法名                  |
+| 评分、优势、过滤、传输和训练结果 | 各自执行该操作的 span                                                                            | 保留逐 Export／Update 结果，后续按对象 ID 关联，不复制到 Agent span                                |
 
 生成批次以输入任务为成员，训练批次以实际接纳的训练样本为成员，不能直接沿用生成批次的 ID 或数量。Actor 和 Critic 分别记录自身实际接纳的批次；仅在样本身份和成员集合完全一致时才可使用相同批次 ID。批次规模描述本阶段工作量，不能将各阶段的 size 相加作为全局样本总数。
 
 Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件记录；模型、后端和版本描述本阶段实际执行对象，也可能因阶段不同而不同。各 span 的属性表列出其完整属性要求；未列出的其他阶段属性不复制，parent 或 Link 不会自动继承属性。轨迹流转使用逐 Export ID 关联。
 
-**Trace 与关联规则：** 同一 iteration 的核心阶段在条件允许时复用 traceId，但不强制共用 trace；不同阶段之间不建立父子关系；同一阶段的批次与明细按第 2.1 节建立父子关系。通过业务 ID 关联查询，通过 Span Link 表达实际依赖。
+**Trace 与关联规则：** 同一 iteration 的核心阶段在条件允许时复用 traceId，但不强制共用 trace；不同阶段之间不建立父子关系；同一阶段的批次与真实独立成员操作按第 2.1 节建立父子关系，结果数组中的记录不构成子 span。通过业务 ID 关联查询，通过 Span Link 表达实际依赖。
 
 1. **Trace 复用。** 第 3 章同一 iteration 内的核心阶段，已有合适的共同上游 Context 时应复用同一个 traceId，各次操作使用不同的 spanId，作为该共同上游下的同级 span，阶段之间不互为父子。没有这样的 Context 时，各批次阶段可以创建独立 trace 的根 span；本规范不为复用 traceId 新增统一的 Run／Step 父 span。按照 [OTel Span Creation](https://opentelemetry.io/docs/specs/otel/trace/api/#span-creation)，同一 trace 中的 spans 应属于同一棵调用树，不能将多个无 parent 的根 span 手动设置为相同 traceId。第 4 章的 Agent 调用仍保持独立 trace；同一次 Agent 调用的暂停恢复沿用原 span 和 traceId。
 2. **业务聚合。** 无论是否复用 traceId，都通过 `rl.run.id` 聚合运行，通过 `(rl.run.id, rl.step.id)` 关联查询同一 Step 的各阶段和轨迹；查询必须支持一个 Step 对应多条 trace，不能依赖 traceId 完成整个 Step 的聚合。明确唯一 Step 归属时必须填写 `rl.step.id`；未知、未分配或跨 Step 时省略单值，按已有的真实业务归属明细关联，不能任选一个 Step。相同 Run／Step 只表示业务归属，不自动构成依赖关系。
@@ -74,7 +74,11 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 6. **后端 trace 隔离与关联。** 上述封装表示业务归属，不建立 RL 与后端 span 的父子关系。后端 trace 必须独立于对应 RL trace，不继承 RL span 的 traceId，也不以 RL span 为 parent。后端 trace 的根 span 或对应调用的子树入口 span，通过 Span Link 指向负责该次操作的 RL span 的真实 SpanContext；传入的 RL Context 仅作为 Link 来源。SGLang、Megatron 内部已有的 span 名称、语义和真实父子关系继续沿用，同一后端子树中的后代通过入口 Link 追溯 RL 归属，无需逐个复制相同 Link。一个 RL span 可以关联多个后端 trace；共享后端工作涉及多个 RL 调用时，关联实际相关的 RL spans，不任选一个归属。
 7. **规模与耗时。** 不将不同请求、rank 或更新已有的后端 traces 强行合并到一个 RL trace；通过上述隔离避免一次迭代的后端细节集中到同一条 trace。该规则控制单条 trace 的规模，不减少后端实际产生的 span 总量。各阶段按自己的真实起止时间结束；RL 阶段与后端操作，以及嵌套或并行阶段之间的耗时重叠，不得重复相加作为 Step 总耗时。
 
-结构化数据直接保存为 span 的 string 类型 JSON 属性，包括题目、response、评分、优势、过滤、传输及训练结果。0.10.0 新采集不再输出对应的 `_ref`；完整内容随 OTLP JSONL 保存，不依赖附件或旧详情接口。禁止按长度截断，也不使用随机采样结果冒充全量数据。读取工具可以兼容旧版 `_ref`，但不能将旧引用当作新数据已内联的证据。
+**当前实现范围（Relax RL 0.11.0）：** 上述后端隔离与 Link 规则定义接入后端 tracing 时的要求，不表示当前已经完成该集成。当前 RL 埋点没有向 SGLang 生成请求注入 RL SpanContext，也没有建立 SGLang／Megatron 内部 trace 到 RL span 的自动 Link。仅开启 SGLang tracing 不会自动获得这些关联，也不会将后端 spans 写入 RL 的本地 JSONL 文件。后端仍需单独配置采集和导出。
+
+接入时应在真实请求边界传递负责该调用的 RL SpanContext，并确保经过 router／代理后仍可取得；后端将该上下文用于 Span Link，保留自身独立 trace。普通生成关联 `rl.rollout.sample`，Agent 内模型调用关联 `rl.agent.run`。仅把 RL 上下文放进标准 `traceparent` 并让后端直接作为 parent，会形成共享 trace 的父子关系，不符合本规范的后端隔离要求。`rl.run.id`、`rl.step.id`、样本／请求 ID 用于业务查询，不能代替真实 SpanContext。
+
+结构化数据直接保存为 span 的 string 类型 JSON 属性，包括题目、response、评分、优势、过滤、传输及训练结果。自 0.10.0 起，新采集不再输出对应的 `_ref`；完整内容随 OTLP JSONL 保存，不依赖附件或旧详情接口。禁止按长度截断，也不使用随机采样结果冒充全量数据。读取工具可以兼容旧版 `_ref`，但不能将旧引用当作新数据已内联的证据。
 
 结构化内容中的 ID 为 string，计数为非负 int，结果数值为 double，布尔值为 boolean，`start_time`／`end_time` 为 Unix 秒 double。未知时间边界省略，后端原始字段保留原单位。普通 SDK 通常在 span 结束后导出；运行中展示需要同一 span 身份的状态／数据快照，终态记录去重合并，不增加业务 span 类型。
 
@@ -82,17 +86,17 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 
 每个实际批次操作生成一个总 span，记录该操作的 `rl.batch.id`、实际输入数 `rl.batch.size` 和完整结果。只有存在真实、可独立观测起止和结果的成员操作时才创建子 span。结果数组、逐样本统计或样本参与记录本身不构成独立操作；这些明细直接保留在批次的 JSON attributes 中，不生成零时长 span 或虚构时间事件。
 
-| 实际操作 | 总 span | 子 span | 结果明细位置与判断 |
-| --- | --- | --- | --- |
-| 普通／Agentic 完整 rollout | `rl.rollout.generate` | `rl.rollout.sample` | 保留：每条题目有完整、独立生命周期，记录题目、response 和真实起止 |
-| 逐条调用评分器 | `rl.reward.batch` | `rl.reward.score` | 保留：每条 Export 有独立评分调用，父级保留全批结果，子级保留自身结果 |
-| 一次调用批量评分器 | `rl.reward.batch` | 无 | `rl.reward.results` 保存所有成员；不能根据返回数组补造 score span |
-| Megatron 批量前向 | `rl.reference.forward`、`rl.teacher.forward`、`rl.critic.forward`、`rl.actor.forward` | 无 | `rl.forward.results` 保存成员结果；packed tensor 执行没有单样本调用边界 |
-| OPD 单样本前向 | `rl.teacher.forward`、`rl.actor.forward` | 无 | 一次真实调用只记录一个 span，batch.size=1，直接带样本身份与结果，不重复包装相同调用 |
-| 优势计算（包含自定义组计算） | `rl.advantage.compute` | 无 | `rl.advantage.results` 保存逐成员统计；优势可依赖整个 Group，统计行不是独立计算 |
-| 过滤 | `rl.data.filter` | 无 | `rl.filter.results` 保存逐成员 keep/drop；当前组／批次决策不拆成虚构样本操作 |
-| 数据传输 | `rl.data.transfer` | 无 | `rl.transfer.data` 保存成员与实际发送／ACK；共享批次 ACK 不拆成独立交付耗时 |
-| Actor／Critic 训练 | `rl.actor.train`、`rl.critic.train` | 无 | `rl.train.results.uses` 保存样本参与记录，`updates` 保存优化器更新；训练按批次／microbatch 执行 |
+| 实际操作                     | 总 span                                                                               | 子 span             | 结果明细位置与判断                                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------- | ------------------- | ----------------------------------------------------------------------------------------------- |
+| 普通／Agentic 完整 rollout   | `rl.rollout.generate`                                                                 | `rl.rollout.sample` | 保留：每条题目有完整、独立生命周期，记录题目、response 和真实起止                               |
+| 逐条调用评分器               | `rl.reward.batch`                                                                     | `rl.reward.score`   | 保留：每条 Export 有独立评分调用，父级保留全批结果，子级保留自身结果                            |
+| 一次调用批量评分器           | `rl.reward.batch`                                                                     | 无                  | `rl.reward.results` 保存所有成员；不能根据返回数组补造 score span                               |
+| Megatron 批量前向            | `rl.reference.forward`、`rl.teacher.forward`、`rl.critic.forward`、`rl.actor.forward` | 无                  | `rl.forward.results` 保存成员结果；packed tensor 执行没有单样本调用边界                         |
+| OPD 单样本前向               | `rl.teacher.forward`、`rl.actor.forward`                                              | 无                  | 一次真实调用只记录一个 span，batch.size=1，直接带样本身份与结果，不重复包装相同调用             |
+| 优势计算（包含自定义组计算） | `rl.advantage.compute`                                                                | 无                  | `rl.advantage.results` 保存逐成员统计；优势可依赖整个 Group，统计行不是独立计算                 |
+| 过滤                         | `rl.data.filter`                                                                      | 无                  | `rl.filter.results` 保存逐成员 keep/drop；当前组／批次决策不拆成虚构样本操作                    |
+| 数据传输                     | `rl.data.transfer`                                                                    | 无                  | `rl.transfer.data` 保存成员与实际发送／ACK；共享批次 ACK 不拆成独立交付耗时                     |
+| Actor／Critic 训练           | `rl.actor.train`、`rl.critic.train`                                                   | 无                  | `rl.train.results.uses` 保存样本参与记录，`updates` 保存优化器更新；训练按批次／microbatch 执行 |
 
 生成批次按输入 Sample 计数，评分等下游批次按实际输入 Export 计数，不能假定两者总数相同。真实子操作与总 span 共用 traceId，parentSpanId 指向真实总 span。不同阶段仍通过 Link 关联：例如逐条 `rl.reward.score` 的 parent 是 `rl.reward.batch`，其 Link 指向实际消费的 `rl.rollout.sample`。批量评分没有 score 子 span 时，后续阶段 Link 到实际 `rl.reward.batch`；过滤与传输同样发布批次来源，保留逐成员业务 ID。SDK 显式使用真实父 Context，不手动拼接 traceId。
 
@@ -110,19 +114,19 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 
 | Key                     | Stability   | Requirement Level                                  | Value Type | Description                                                |
 | ----------------------- | ----------- | -------------------------------------------------- | ---------- | ---------------------------------------------------------- |
-| `rl.batch.id`           | Development | Required：批次及其明细                             | string     | 当前阶段的实际输入集合身份；明细填真实 parent 的批次身份   |
-| `rl.batch.size`         | Development | Required：批次输入确定时                           | int        | 实际输入成员数，不按 rank 重复，不记在明细上               |
-| `rl.sample.id`          | Development | Required：rollout 明细；其他明细可取得时           | string     | 一次输入采样调用身份；同题重复采样不同，续跑保持不变       |
+| `rl.batch.id`           | Development | Required：批次 span 及真实子操作 span              | string     | 当前阶段的实际输入集合身份；子操作填真实 parent 的批次身份 |
+| `rl.batch.size`         | Development | Required：批次输入确定时                           | int        | 实际输入成员数，不按 rank 重复，不记在子操作 span 上       |
+| `rl.sample.id`          | Development | Required：rollout.sample；其他子操作可取得时       | string     | 一次输入采样调用身份；同题重复采样不同，续跑保持不变       |
 | `rl.export.id`          | Development | Required：下游成员使用 Export 身份时               | string     | 该结果所属的真实 Export ID，不以样本下标冒充               |
 | `rl.sample.index`       | Development | Conditionally Required：框架只传递样本下标时       | string     | 框架实际输入样本下标，与 run/step 一起关联；不是 Export ID |
-| `rl.sample.timing`      | Development | Required：明细                                     | string     | 仅 operation，表示真实成员调用                    |
+| `rl.sample.timing`      | Development | Required：真实子操作 span                          | string     | 仅 operation，表示真实成员调用                             |
 | `rl.sample.memberships` | Development | Conditionally Required：完整调用涉及多个窗口／Step | string     | JSON 数组，保存实际 batch_id、step_id，不覆盖历史          |
 
 异步独立前向可按实际 DP 分区调用生成独立批次，`rl.partition.dp_rank` 记录整数分区编号；每个批次只计本分区真实成员，TP/PP/CP 不重复创建同一成员。训练 RPC 内可通过已有返回路径合并各 rank 的事实。
 
 前向的 `rl.forward.results` 为 JSON 数组，保存真实 `export_id` 或 `sample_index` 及结果状态；未独立采集的 token 概率不伪造。训练的 `rl.train.results.uses` 保存每条实际消费，通过 update_id 关联同一对象内 updates 的 committed／skipped／failed 状态。传输的 `rl.transfer.data.members` 可补充逐成员 export_id、sample_index；共同发送／ACK 时间只记录在批次上。
 
-下游明细保留 run.id、可确定的 step.id/iteration.index 及该阶段必要属性。普通训练仅有 sample_indices 时使用 `rl.sample.index`，rollout／评分同时保留同一个实际 index；不能凭空生成 Export 映射。数据不存在时不生成占位结果，采集不完整需明确诊断。
+下游批次及真实子操作 span 保留 `rl.run.id`、可确定的 `rl.step.id`／`rl.iteration.index` 及该阶段必要属性。JSON 结果记录通过所在 span 取得运行上下文，成员使用真实 `export_id` 或 `sample_index` 关联。普通训练仅有 sample_indices 时，span 使用 `rl.sample.index`，结果记录使用 `sample_index`；rollout／评分同时保留同一个实际 index，不能凭空生成 Export 映射。数据不存在时不生成占位结果，采集不完整需明确诊断。
 
 ## 3 核心阶段 span
 
@@ -225,7 +229,7 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 | -------------------- | ----------- | -------------------------------------------------- | ---------- | ------------------------------------------------------------------ | ----------------------------------------------------------------------------- |
 | `rl.run.id`          | Development | Required                                           | string     | 本次实际运行的唯一身份。                                           | `run-a7`                                                                      |
 | `rl.purpose`         | Development | Required                                           | string     | 操作用途：training 或 evaluation。                                 | `training`                                                                    |
-| `rl.reward.name`     | Development | Required                                           | string     | 完整评分方案的稳定名称。                                           | `math_verifier`                                                               |
+| `rl.reward.name`     | Development | Required                                           | string     | 本次独立评分调用的方案／评分器名称。                               | `math_verifier`                                                               |
 | `rl.reward.type`     | Development | Required                                           | string     | rule、verifier、model、judge、environment 或 hybrid。              | `verifier`                                                                    |
 | `rl.step.id`         | Development | Conditionally Required：明确唯一所属 Step          | string     | Run 内的 Step 身份；跨 Step 时不任选一个。                         | `learner:80`                                                                  |
 | `rl.iteration.index` | Development | Conditionally Required：明确唯一外层轮次           | int        | 原框架的外层 RL 执行轮次，不是优化器更新次数。                     | `80`                                                                          |
@@ -234,7 +238,7 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 | `rl.model.version`   | Development | Conditionally Required：使用唯一已知参数快照       | string     | 实际使用／交付的参数版本，不填期望版本；混合版本在轨迹中逐段记录。 | `snapshot-48`                                                                 |
 | `rl.reward.results`  | Development | Required：对应结果可取得时                         | string     | 逐 Export 的评分结果。\[1\] 值为完整 JSON 字符串。                 | `[{"export_id":"export-1","source":"verifier","status":"valid","value":2.0}]` |
 
-**\[1\] `rl.reward.results`:** 每项包含 export_id、source、status（valid／invalid／error）、标量或复合 value；复合值明确标量选择口径，失败／无效时记录 reason。不能只保存批次平均值。零分、负分或答案错误可以是成功评分；多个子评分组成方案时，核心 span 表示完整方案。
+**\[1\] `rl.reward.results`:** 每项包含 export_id、source、status（valid／invalid／error）、标量或复合 value；复合值明确标量选择口径，失败／无效时记录 reason。不能只保存批次平均值。零分、负分或答案错误可以是成功评分；多个独立评分调用组成方案时，`rl.reward.batch` 表示完整批次，`rl.reward.score` 只表示本次实际调用；聚合或变换后的最终值放在 batch 上。
 
 ### Span: `rl.reference.forward`
 
@@ -243,6 +247,8 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 该 span 表示参考策略对已有 token 执行无梯度前向，提供 reference logprob，用于 KL 等约束。
 
 从开始独立参考前向，到参考概率输出可用。临时关闭 adapter 或切换参考权重不改变此逻辑职责。
+
+按实际批次／DP 分区调用记录一个 span，成员结果保存在 `rl.forward.results`，不生成 `rl.reference.forward.sample`。
 
 **Span kind:** `INTERNAL`。
 
@@ -254,14 +260,15 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 
 **Attributes:**
 
-| Key                  | Stability   | Requirement Level                              | Value Type | Description                                                        | Example Values |
-| -------------------- | ----------- | ---------------------------------------------- | ---------- | ------------------------------------------------------------------ | -------------- |
-| `rl.run.id`          | Development | Required                                       | string     | 本次实际运行的唯一身份。                                           | `run-a7`       |
-| `rl.model.name`      | Development | Required                                       | string     | 当前操作使用的模型名称，不用算法名称代替。                         | `reference-7b` |
-| `rl.step.id`         | Development | Conditionally Required：明确唯一所属 Step      | string     | Run 内的 Step 身份；跨 Step 时不任选一个。                         | `learner:80`   |
-| `rl.iteration.index` | Development | Conditionally Required：明确唯一外层轮次       | int        | 原框架的外层 RL 执行轮次，不是优化器更新次数。                     | `80`           |
-| `rl.backend.name`    | Development | Conditionally Required：模型执行后端已知且唯一 | string     | 实际模型执行后端；Ray 不属于模型执行后端。                         | `megatron`     |
-| `rl.model.version`   | Development | Conditionally Required：使用唯一已知参数快照   | string     | 实际使用／交付的参数版本，不填期望版本；混合版本在轨迹中逐段记录。 | `snapshot-48`  |
+| Key                  | Stability   | Requirement Level                              | Value Type | Description                                                                    | Example Values                             |
+| -------------------- | ----------- | ---------------------------------------------- | ---------- | ------------------------------------------------------------------------------ | ------------------------------------------ |
+| `rl.run.id`          | Development | Required                                       | string     | 本次实际运行的唯一身份。                                                       | `run-a7`                                   |
+| `rl.model.name`      | Development | Required                                       | string     | 当前操作使用的模型名称，不用算法名称代替。                                     | `reference-7b`                             |
+| `rl.step.id`         | Development | Conditionally Required：明确唯一所属 Step      | string     | Run 内的 Step 身份；跨 Step 时不任选一个。                                     | `learner:80`                               |
+| `rl.iteration.index` | Development | Conditionally Required：明确唯一外层轮次       | int        | 原框架的外层 RL 执行轮次，不是优化器更新次数。                                 | `80`                                       |
+| `rl.backend.name`    | Development | Conditionally Required：模型执行后端已知且唯一 | string     | 实际模型执行后端；Ray 不属于模型执行后端。                                     | `megatron`                                 |
+| `rl.model.version`   | Development | Conditionally Required：使用唯一已知参数快照   | string     | 实际使用／交付的参数版本，不填期望版本；混合版本在轨迹中逐段记录。             | `snapshot-48`                              |
+| `rl.forward.results` | Development | Required：对应结果可取得时                     | string     | 完整 JSON 数组；保存真实 export_id 或 sample_index 及结果状态，详见第 2.1 节。 | `[{"sample_index":"17","status":"valid"}]` |
 
 ### Span: `rl.teacher.forward`
 
@@ -270,6 +277,8 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 该 span 表示教师对已有学生轨迹执行评分前向，提供在线蒸馏的概率目标。
 
 从开始教师评分前向，到所需概率目标可用。教师另行生成答案时属于生成调用，不能记成固定轨迹 forward。
+
+按实际批次／DP 分区调用记录一个 span，成员结果保存在 `rl.forward.results`，不生成 `rl.teacher.forward.sample`。 OPD 单样本前向同样只记录一个真实调用 span，`rl.batch.size=1`。
 
 **Span kind:** `INTERNAL`。
 
@@ -281,15 +290,16 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 
 **Attributes:**
 
-| Key                  | Stability   | Requirement Level                              | Value Type | Description                                                                 | Example Values      |
-| -------------------- | ----------- | ---------------------------------------------- | ---------- | --------------------------------------------------------------------------- | ------------------- |
-| `rl.run.id`          | Development | Required                                       | string     | 本次实际运行的唯一身份。                                                    | `run-a7`            |
-| `rl.model.name`      | Development | Required                                       | string     | 当前操作使用的模型名称，不用算法名称代替。                                  | `teacher-32b`       |
-| `rl.forward.output`  | Development | Required                                       | string     | 教师目标类型：sampled_token_logprob、topk_distribution、full_distribution。 | `topk_distribution` |
-| `rl.step.id`         | Development | Conditionally Required：明确唯一所属 Step      | string     | Run 内的 Step 身份；跨 Step 时不任选一个。                                  | `learner:80`        |
-| `rl.iteration.index` | Development | Conditionally Required：明确唯一外层轮次       | int        | 原框架的外层 RL 执行轮次，不是优化器更新次数。                              | `80`                |
-| `rl.backend.name`    | Development | Conditionally Required：模型执行后端已知且唯一 | string     | 实际模型执行后端；Ray 不属于模型执行后端。                                  | `megatron`          |
-| `rl.model.version`   | Development | Conditionally Required：使用唯一已知参数快照   | string     | 实际使用／交付的参数版本，不填期望版本；混合版本在轨迹中逐段记录。          | `snapshot-48`       |
+| Key                  | Stability   | Requirement Level                              | Value Type | Description                                                                    | Example Values                             |
+| -------------------- | ----------- | ---------------------------------------------- | ---------- | ------------------------------------------------------------------------------ | ------------------------------------------ |
+| `rl.run.id`          | Development | Required                                       | string     | 本次实际运行的唯一身份。                                                       | `run-a7`                                   |
+| `rl.model.name`      | Development | Required                                       | string     | 当前操作使用的模型名称，不用算法名称代替。                                     | `teacher-32b`                              |
+| `rl.forward.output`  | Development | Required                                       | string     | 教师目标类型：sampled_token_logprob、topk_distribution、full_distribution。    | `topk_distribution`                        |
+| `rl.step.id`         | Development | Conditionally Required：明确唯一所属 Step      | string     | Run 内的 Step 身份；跨 Step 时不任选一个。                                     | `learner:80`                               |
+| `rl.iteration.index` | Development | Conditionally Required：明确唯一外层轮次       | int        | 原框架的外层 RL 执行轮次，不是优化器更新次数。                                 | `80`                                       |
+| `rl.backend.name`    | Development | Conditionally Required：模型执行后端已知且唯一 | string     | 实际模型执行后端；Ray 不属于模型执行后端。                                     | `megatron`                                 |
+| `rl.model.version`   | Development | Conditionally Required：使用唯一已知参数快照   | string     | 实际使用／交付的参数版本，不填期望版本；混合版本在轨迹中逐段记录。             | `snapshot-48`                              |
+| `rl.forward.results` | Development | Required：对应结果可取得时                     | string     | 完整 JSON 数组；保存真实 export_id 或 sample_index 及结果状态，详见第 2.1 节。 | `[{"sample_index":"17","status":"valid"}]` |
 
 教师概率目标与 reference 约束、原始 reward 是不同职责，不能因接口复用而混同。
 
@@ -301,6 +311,8 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 
 从开始独立价值预测，到 values 可用。价值模型训练内部的带梯度前向属于 critic.train。
 
+按实际批次／DP 分区调用记录一个 span，成员结果保存在 `rl.forward.results`，不生成 `rl.critic.forward.sample`。
+
 **Span kind:** `INTERNAL`。
 
 **Span name:** 固定为 `rl.critic.forward`。
@@ -311,14 +323,15 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 
 **Attributes:**
 
-| Key                  | Stability   | Requirement Level                              | Value Type | Description                                                        | Example Values |
-| -------------------- | ----------- | ---------------------------------------------- | ---------- | ------------------------------------------------------------------ | -------------- |
-| `rl.run.id`          | Development | Required                                       | string     | 本次实际运行的唯一身份。                                           | `run-a7`       |
-| `rl.model.name`      | Development | Required                                       | string     | 当前操作使用的模型名称，不用算法名称代替。                         | `critic-7b`    |
-| `rl.step.id`         | Development | Conditionally Required：明确唯一所属 Step      | string     | Run 内的 Step 身份；跨 Step 时不任选一个。                         | `learner:80`   |
-| `rl.iteration.index` | Development | Conditionally Required：明确唯一外层轮次       | int        | 原框架的外层 RL 执行轮次，不是优化器更新次数。                     | `80`           |
-| `rl.backend.name`    | Development | Conditionally Required：模型执行后端已知且唯一 | string     | 实际模型执行后端；Ray 不属于模型执行后端。                         | `megatron`     |
-| `rl.model.version`   | Development | Conditionally Required：使用唯一已知参数快照   | string     | 实际使用／交付的参数版本，不填期望版本；混合版本在轨迹中逐段记录。 | `snapshot-48`  |
+| Key                  | Stability   | Requirement Level                              | Value Type | Description                                                                    | Example Values                             |
+| -------------------- | ----------- | ---------------------------------------------- | ---------- | ------------------------------------------------------------------------------ | ------------------------------------------ |
+| `rl.run.id`          | Development | Required                                       | string     | 本次实际运行的唯一身份。                                                       | `run-a7`                                   |
+| `rl.model.name`      | Development | Required                                       | string     | 当前操作使用的模型名称，不用算法名称代替。                                     | `critic-7b`                                |
+| `rl.step.id`         | Development | Conditionally Required：明确唯一所属 Step      | string     | Run 内的 Step 身份；跨 Step 时不任选一个。                                     | `learner:80`                               |
+| `rl.iteration.index` | Development | Conditionally Required：明确唯一外层轮次       | int        | 原框架的外层 RL 执行轮次，不是优化器更新次数。                                 | `80`                                       |
+| `rl.backend.name`    | Development | Conditionally Required：模型执行后端已知且唯一 | string     | 实际模型执行后端；Ray 不属于模型执行后端。                                     | `megatron`                                 |
+| `rl.model.version`   | Development | Conditionally Required：使用唯一已知参数快照   | string     | 实际使用／交付的参数版本，不填期望版本；混合版本在轨迹中逐段记录。             | `snapshot-48`                              |
+| `rl.forward.results` | Development | Required：对应结果可取得时                     | string     | 完整 JSON 数组；保存真实 export_id 或 sample_index 及结果状态，详见第 2.1 节。 | `[{"sample_index":"17","status":"valid"}]` |
 
 算法未使用 Critic 时不生成此 span。
 
@@ -348,7 +361,7 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 | `rl.iteration.index`     | Development | Conditionally Required：明确唯一外层轮次  | int        | 原框架的外层 RL 执行轮次，不是优化器更新次数。     | `80`                                                      |
 | `rl.advantage.results`   | Development | Required：对应结果可取得时                | string     | 逐 Export 的优势摘要。\[1\] 值为完整 JSON 字符串。 | `[{"export_id":"export-1","mean":0.0,"token_count":158}]` |
 
-**\[1\] `rl.advantage.results`:** 每项包含 export_id、mean、token_count。均值按该阶段有效位置计算，无有效位置时省略 mean；需要展示原始分项时保留 values 及其粒度。实际训练 mask 发生变化时，训练结果使用最终 mask 对应的摘要。
+**\[1\] `rl.advantage.results`:** 每项包含真实 export_id 或 sample_index，以及可取得的 mean、token_count。均值按该阶段有效位置计算，无有效位置时省略 mean；需要展示原始分项时保留 values 及其粒度。实际训练 mask 发生变化时，训练结果使用最终 mask 对应的摘要。这些统计是批次结果记录，不生成 `rl.advantage.compute.sample`。
 
 ### Span: `rl.actor.forward`
 
@@ -357,6 +370,8 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 该 span 表示策略对已有轨迹独立执行无梯度前向，准备固定概率基准或学生蒸馏概率。
 
 从开始独立策略评分，到所需概率输出可用。训练内部带梯度前向不属于此操作；直接复用 rollout logprob 时不创建此 span。
+
+按实际批次／DP 分区调用记录一个 span，成员结果保存在 `rl.forward.results`，不生成 `rl.actor.forward.sample`。 OPD 单样本前向同样只记录一个真实调用 span，`rl.batch.size=1`。
 
 **Span kind:** `INTERNAL`。
 
@@ -368,15 +383,16 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 
 **Attributes:**
 
-| Key                  | Stability   | Requirement Level                              | Value Type | Description                                                        | Example Values |
-| -------------------- | ----------- | ---------------------------------------------- | ---------- | ------------------------------------------------------------------ | -------------- |
-| `rl.run.id`          | Development | Required                                       | string     | 本次实际运行的唯一身份。                                           | `run-a7`       |
-| `rl.model.name`      | Development | Required                                       | string     | 当前操作使用的模型名称，不用算法名称代替。                         | `policy-7b`    |
-| `rl.forward.purpose` | Development | Required                                       | string     | 独立策略评分的用途：old_policy 或 distillation。                   | `old_policy`   |
-| `rl.step.id`         | Development | Conditionally Required：明确唯一所属 Step      | string     | Run 内的 Step 身份；跨 Step 时不任选一个。                         | `learner:80`   |
-| `rl.iteration.index` | Development | Conditionally Required：明确唯一外层轮次       | int        | 原框架的外层 RL 执行轮次，不是优化器更新次数。                     | `80`           |
-| `rl.backend.name`    | Development | Conditionally Required：模型执行后端已知且唯一 | string     | 实际模型执行后端；Ray 不属于模型执行后端。                         | `megatron`     |
-| `rl.model.version`   | Development | Conditionally Required：使用唯一已知参数快照   | string     | 实际使用／交付的参数版本，不填期望版本；混合版本在轨迹中逐段记录。 | `snapshot-48`  |
+| Key                  | Stability   | Requirement Level                              | Value Type | Description                                                                    | Example Values                             |
+| -------------------- | ----------- | ---------------------------------------------- | ---------- | ------------------------------------------------------------------------------ | ------------------------------------------ |
+| `rl.run.id`          | Development | Required                                       | string     | 本次实际运行的唯一身份。                                                       | `run-a7`                                   |
+| `rl.model.name`      | Development | Required                                       | string     | 当前操作使用的模型名称，不用算法名称代替。                                     | `policy-7b`                                |
+| `rl.forward.purpose` | Development | Required                                       | string     | 独立策略评分的用途：old_policy 或 distillation。                               | `old_policy`                               |
+| `rl.step.id`         | Development | Conditionally Required：明确唯一所属 Step      | string     | Run 内的 Step 身份；跨 Step 时不任选一个。                                     | `learner:80`                               |
+| `rl.iteration.index` | Development | Conditionally Required：明确唯一外层轮次       | int        | 原框架的外层 RL 执行轮次，不是优化器更新次数。                                 | `80`                                       |
+| `rl.backend.name`    | Development | Conditionally Required：模型执行后端已知且唯一 | string     | 实际模型执行后端；Ray 不属于模型执行后端。                                     | `megatron`                                 |
+| `rl.model.version`   | Development | Conditionally Required：使用唯一已知参数快照   | string     | 实际使用／交付的参数版本，不填期望版本；混合版本在轨迹中逐段记录。             | `snapshot-48`                              |
+| `rl.forward.results` | Development | Required：对应结果可取得时                     | string     | 完整 JSON 数组；保存真实 export_id 或 sample_index 及结果状态，详见第 2.1 节。 | `[{"sample_index":"17","status":"valid"}]` |
 
 ### Span: `rl.actor.train`
 
@@ -410,7 +426,7 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 | `rl.model.version.after`  | Development | Conditionally Required：结束时一致版本可确认   | string     | 实际结束版本；全部更新跳过时可与 before 相同，失败后不确定则省略。         | `snapshot-49`                                                                                                                                             |
 | `rl.train.results`        | Development | Required：对应结果可取得时                     | string     | 逐 Update 结果及逐 Export 的实际训练消费关系。\[1\] 值为完整 JSON 字符串。 | `{"updates":[{"update_id":"update-1","status":"committed"}],"uses":[{"export_id":"export-1","update_id":"update-1","used":true,"effective_tokens":158}]}` |
 
-**\[1\] `rl.train.results`:** 包含 updates 和 uses 两个列表。updates 保存 update_id、已确认的 status（committed／skipped／failed）、reason，以及可获得的后端 span_context、source_name、start_time、end_time。uses 保存每个 `(export_id, update_id)` 的 used、最终 effective_tokens 和可取得的 advantage_mean，保留多 epoch 的多次消费关系。
+**\[1\] `rl.train.results`:** 包含 updates 和 uses 两个列表。updates 保存 update_id、已确认的 status（committed／skipped／failed）、reason，以及可获得的后端 span_context、source_name、start_time、end_time。uses 保存每个成员与 update_id 的实际消费关系，成员使用真实 export_id 或 sample_index 标识，并记录 used、最终 effective_tokens 和可取得的 advantage_mean，保留多 epoch 的多次消费关系。uses 和 updates 都是 JSON 结果记录，不生成逐样本 train span；共享更新结果不代表每个样本有独立的训练耗时。
 
 更新是否提交取自真实决策，不能由训练函数正常返回推断。used=true、有效 token 大于 0、参数更新已提交是不同事实。时间只引用已有后端记录，不新增 optimizer span，也不能把 train_batch 整段冒充纯 optimizer 耗时。
 
@@ -445,7 +461,7 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 | `rl.model.version.after`  | Development | Conditionally Required：结束时一致版本可确认   | string     | 实际结束版本；全部更新跳过时可与 before 相同，失败后不确定则省略。         | `snapshot-49`                                                                                                                                             |
 | `rl.train.results`        | Development | Required：对应结果可取得时                     | string     | 逐 Update 结果及逐 Export 的实际训练消费关系。\[1\] 值为完整 JSON 字符串。 | `{"updates":[{"update_id":"update-1","status":"committed"}],"uses":[{"export_id":"export-1","update_id":"update-1","used":true,"effective_tokens":158}]}` |
 
-**\[1\] `rl.train.results`:** 包含 updates 和 uses 两个列表。updates 保存 update_id、已确认的 status（committed／skipped／failed）、reason，以及可获得的后端 span_context、source_name、start_time、end_time。uses 保存每个 `(export_id, update_id)` 的 used、最终 effective_tokens 和可取得的 advantage_mean，保留多 epoch 的多次消费关系。
+**\[1\] `rl.train.results`:** 包含 updates 和 uses 两个列表。updates 保存 update_id、已确认的 status（committed／skipped／failed）、reason，以及可获得的后端 span_context、source_name、start_time、end_time。uses 保存每个成员与 update_id 的实际消费关系，成员使用真实 export_id 或 sample_index 标识，并记录 used、最终 effective_tokens 和可取得的 advantage_mean，保留多 epoch 的多次消费关系。uses 和 updates 都是 JSON 结果记录，不生成逐样本 train span；共享更新结果不代表每个样本有独立的训练耗时。
 
 更新是否提交取自真实决策，不能由训练函数正常返回推断。used=true、有效 token 大于 0、参数更新已提交是不同事实。时间只引用已有后端记录，不新增 optimizer span，也不能把 train_batch 整段冒充纯 optimizer 耗时。
 
@@ -537,7 +553,7 @@ CPU/GPU 驻留恢复但参数版本未变化，不属于新版本加载。
 | `rl.group.id`        | Development | Conditionally Required：对单个 Group 判定 | string     | 本次被过滤的 Group 身份。                                | `group-159`                                    |
 | `rl.filter.results`  | Development | Required：对应结果可取得时                | string     | 每个输入 Export 的过滤结果。\[1\] 值为完整 JSON 字符串。 | `[{"export_id":"export-1","decision":"keep"}]` |
 
-**\[1\] `rl.filter.results`:** 每项包含 export_id、decision（keep／drop）；drop 时包含 reason。整组过滤也保留每个成员身份，不能只记录组级数量。
+**\[1\] `rl.filter.results`:** 每项包含真实 export_id 或 sample_index、decision（keep／drop）；drop 时包含 reason。整组过滤也保留每个成员身份，不能只记录组级数量。这些决定保存在批次属性中，不生成 `rl.data.filter.sample`。
 
 ### Span: `rl.data.transfer`
 
@@ -566,7 +582,7 @@ CPU/GPU 驻留恢复但参数版本未变化，不属于新版本加载。
 | `rl.transfer.target.step_id` | Development | Conditionally Required：目标 Step 已知    | string     | 实际交付目标 Step，可以与轨迹生成 Step 不同。        | `learner:80`                  |
 | `rl.transfer.data`           | Development | Required：对应结果可取得时                | string     | 批次成员及已知传输边界。\[1\] 值为完整 JSON 字符串。 | `{"export_ids":["export-1"]}` |
 
-**\[1\] `rl.transfer.data`:** 保存 export_ids，以及已知的入 buffer、入队、发送开始和接收确认时间。单个成员的边界不同时保留其 Export ID。结束边界缺失时保持缺失，不能根据后续训练成功反推传输完成。
+**\[1\] `rl.transfer.data`:** 保存 export_ids，以及已知的入 buffer、入队、发送开始和接收确认时间；members 可保存各成员的真实 export_id、sample_index。共享发送／ACK 边界只记录在批次上，不为每个成员复制时间或生成 `rl.data.transfer.sample`。如已有真实成员边界，以成员身份标明其归属。结束边界缺失时保持缺失，不能根据后续训练成功反推传输完成。
 
 ## 4 Agent 调用 span
 
