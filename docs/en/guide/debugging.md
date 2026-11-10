@@ -169,16 +169,16 @@ Training launched through `relax.entrypoints.train` records RL stages to disk by
 
 Set `RELAX_OTEL_DIR` before submission to choose another output root, or `RELAX_OTEL_ENABLED=0` to disable RL traces. `OTEL_SDK_DISABLED=true` also disables them. Use a shared, persistent filesystem when you want to read all workers' output from one machine; on node-local disks, collect files from each worker separately. No collector endpoint is required.
 
-Stages use independent traces. Join them using `rl.run.id` and `rl.step.id`; `rl.iteration.index` preserves the framework's zero-based rollout counter. Available direct dependencies use span Links. This instrumentation does not replace backend tracer providers or add general cross-process trace-context propagation.
+Batch stages use independent traces. Join stages using `rl.run.id` and `rl.step.id`; `rl.iteration.index` preserves the framework's zero-based rollout counter. Each batch has its own `rl.batch.id` and actual input count. Member spans share the batch trace and name their parent explicitly: `rl.rollout.sample` records a complete input rollout, and `rl.reward.score` belongs to `rl.reward.batch`. Dependencies between different stages use Links. Agent calls retain independent traces and Link to their sample.
 
-Structured results are saved in full JSON artifacts beneath the run directory. Attributes ending in `_ref` contain absolute `file:` URIs to these files. Keep the artifacts with the JSONL files; copying them to another path requires resolving the original URIs. Agentic runs also enable the existing observation records, retain Session requests, attempts, states and exports, and associate training consumption with Export IDs. Missing external tool timings are left unknown. These records include model inputs and outputs, so choose output permissions and retention appropriate to the training data.
+Structured results, sample inputs and responses are stored directly as complete JSON strings in span attributes. New traces do not require `_ref` attachments. Sample execution spans use `rl.sample.timing=operation`; shared batch work with no separately observable sample duration uses `result` spans at the time each result is confirmed. These have zero duration and do not measure sample compute time. Do not add parent and child durations. Agentic runs also enable the existing observation records, retain Session requests, attempts, states and exports, and associate training consumption with Export IDs. Missing external tool timings are left unknown. These records include model inputs and outputs, so choose output permissions and retention appropriate to the training data.
 
-A completed stage is appended when it ends. A process killed during an active stage can leave that stage absent. An observation write failure is logged without failing training; incomplete rank summaries use `relax.observation.partial_ref` instead of claiming complete training results. Trace collection does not add distributed collectives; compact GPU summaries are copied asynchronously and read off the training thread.
+A completed stage is appended when it ends. A process killed during an active stage can leave that stage absent. An observation write failure is logged without failing training; incomplete rank summaries use `relax.observation.partial` instead of claiming complete training results. Trace collection does not add distributed collectives; compact GPU summaries are copied asynchronously and read off the training thread.
 
-To check a completed run's file format, references and stage coverage, run:
+To check a completed run's file format, inline results, parent relationships and stage coverage, run:
 
 ```bash
 python scripts/tools/validate_rl_traces.py /path/to/otel-traces/RUN_ID --min-train-steps 2
 ```
 
-The check fails on failed spans, incomplete rank summaries, unreadable artifacts or insufficient training steps. It summarizes recorded stages and optimizer decisions; it does not assert that algorithms or paths absent from the run were exercised.
+The check fails on failed spans, incomplete rank summaries, invalid results, missing member parents or insufficient training steps. It summarizes recorded stages and optimizer decisions; it does not assert that algorithms or paths absent from the run were exercised.

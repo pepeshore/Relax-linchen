@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Validate local RL OTLP JSONL and referenced artifacts without an SDK."""
+"""Validate local RL OTLP JSONL, inline results and batch/member
+relationships."""
 
 from __future__ import annotations
 
@@ -22,30 +23,32 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
     if not files:
         raise ValueError(f"No trace files in {root}")
     counts, statuses, updates = Counter(), Counter(), Counter()
-    runs, identities, steps, references = set(), set(), set(), set()
+    runs, steps, references = set(), set(), set()
+    records = {}
+    inline_values = 0
     for path in files:
         for line_number, line in enumerate(path.read_text().splitlines(), 1):
             try:
-                payload = json.loads(line)
-                for resource in payload["resourceSpans"]:
+                for resource in json.loads(line)["resourceSpans"]:
                     resource_attrs = attributes(resource["resource"]["attributes"])
                     for key in ("service.name", "service.instance.id", "host.name", "process.pid"):
                         if key not in resource_attrs:
                             raise ValueError(f"Missing Resource {key}")
                     for scope in resource["scopeSpans"]:
-                        if scope["scope"] != {"name": "relax.rl", "version": "0.9.0"}:
+                        version = scope["scope"].get("version")
+                        if scope["scope"].get("name") != "relax.rl" or version not in ("0.9.0", "0.10.0"):
                             raise ValueError("Unexpected instrumentation scope")
                         for span in scope["spans"]:
                             for key, length in (("traceId", 32), ("spanId", 16)):
                                 if not re.fullmatch(f"[0-9a-f]{{{length}}}", span[key]):
                                     raise ValueError(f"Invalid OTLP {key}")
                             identity = (span["traceId"], span["spanId"])
-                            if identity in identities:
+                            if identity in records:
                                 raise ValueError("Duplicate exported span")
-                            identities.add(identity)
                             if int(span["endTimeUnixNano"]) < int(span["startTimeUnixNano"]):
                                 raise ValueError("Negative stage duration")
                             attrs = attributes(span["attributes"])
+                            records[identity] = (span, attrs, version)
                             runs.add(attrs["rl.run.id"])
                             counts[span["name"]] += 1
                             statuses[str(span.get("status", {}).get("code", 0))] += 1
@@ -54,20 +57,56 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                                 for key in ("rl.batch.id", "rl.batch.size", "rl.model.name", "rl.backend.name"):
                                     if key not in attrs:
                                         raise ValueError(f"Missing train attribute {key}")
-                            for key, uri in attrs.items():
-                                if not key.endswith("_ref"):
+                            for key, value in attrs.items():
+                                if key.endswith("_ref"):
+                                    if version == "0.10.0":
+                                        raise ValueError(f"New results must be inline: {key}")
+                                    parsed = urlparse(value)
+                                    if parsed.scheme != "file" or not Path(unquote(parsed.path)).is_absolute():
+                                        raise ValueError(f"Invalid artifact URI {value}")
+                                    content = json.loads(Path(unquote(parsed.path)).read_text())
+                                    references.add(value)
+                                    key = key[:-4]
+                                elif key.endswith((".results", ".data")) or key in (
+                                    "relax.observation.partial",
+                                    "rl.sample.input",
+                                    "rl.sample.response",
+                                    "rl.sample.memberships",
+                                ):
+                                    content = json.loads(value)
+                                    inline_values += 1
+                                else:
                                     continue
-                                parsed = urlparse(uri)
-                                if parsed.scheme != "file" or not Path(unquote(parsed.path)).is_absolute():
-                                    raise ValueError(f"Invalid artifact URI {uri}")
-                                content = json.loads(Path(unquote(parsed.path)).read_text())
-                                references.add(uri)
-                                if key == "relax.observation.partial_ref":
+                                if key == "relax.observation.partial":
                                     raise ValueError("Incomplete rank observations")
-                                if key == "rl.train.results_ref":
+                                if key == "rl.train.results" and span["name"].endswith(".train"):
                                     updates.update(row["status"] for row in content["updates"])
             except (KeyError, ValueError, OSError, TypeError) as error:
                 raise ValueError(f"{path}:{line_number}: {error}") from error
+    children = Counter()
+    timing = Counter()
+    for (trace_id, _), (span, attrs, version) in records.items():
+        if version != "0.10.0":
+            continue
+        name = span["name"]
+        parent_name = {"rl.rollout.sample": "rl.rollout.generate", "rl.reward.score": "rl.reward.batch"}.get(name)
+        if parent_name is None and name.endswith(".sample"):
+            parent_name = name[:-7]
+        if parent_name is not None:
+            parent = records.get((trace_id, span.get("parentSpanId")))
+            if parent is None or parent[0]["name"] != parent_name:
+                raise ValueError(f"Missing or incorrect parent for {name}")
+            if attrs.get("rl.batch.id") != parent[1].get("rl.batch.id"):
+                raise ValueError(f"Mismatched batch identity for {name}")
+            kind = attrs.get("rl.sample.timing")
+            if kind not in ("operation", "result"):
+                raise ValueError(f"Missing member timing semantics for {name}")
+            if kind == "result" and span["startTimeUnixNano"] != span["endTimeUnixNano"]:
+                raise ValueError(f"Fabricated member duration for {name}")
+            if "rl.batch.size" in attrs:
+                raise ValueError("Batch size duplicated on a member")
+            timing[kind] += 1
+            children[parent_name] += 1
     if len(runs) != 1 or len(steps) < min_train_steps:
         raise ValueError(f"Expected one run and >= {min_train_steps} train steps; got {runs}, {steps}")
     if statuses.get("2"):
@@ -80,6 +119,9 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
         "train_steps": sorted(steps),
         "update_statuses": dict(updates),
         "artifacts": len(references),
+        "inline_values": inline_values,
+        "children_by_stage": dict(sorted(children.items())),
+        "member_timing": dict(timing),
     }
 
 

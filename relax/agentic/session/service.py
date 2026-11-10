@@ -75,7 +75,7 @@ from relax.utils.agentic_obs.records import utc_now
 from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
-from relax.utils.rl_agent_trace import start_agent_trace
+from relax.utils.rl_agent_trace import start_agent_trace, trace_agentic_group
 from relax.utils.types import get_spec_token_counts
 
 
@@ -1588,6 +1588,7 @@ class AgenticSessionShard:
 
         self._notify_state_change()
 
+    @trace_agentic_group
     async def start_group(
         self,
         rollout_mode: str,

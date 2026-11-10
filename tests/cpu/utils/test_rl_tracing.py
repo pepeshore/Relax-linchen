@@ -9,9 +9,7 @@ import sys
 from argparse import Namespace
 from contextlib import nullcontext
 from functools import partial
-from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import unquote, urlparse
 
 import pytest
 
@@ -30,15 +28,15 @@ def run(tmp_path, monkeypatch):
     return args, tmp_path / args.rl_trace_run_id
 
 
-def spans(root):
+def spans(root, name=None):
     result = []
     for path in root.glob("*.jsonl"):
         for line in path.read_text().splitlines():
             for resource in json.loads(line)["resourceSpans"]:
                 for scope in resource["scopeSpans"]:
-                    assert scope["scope"] == {"name": "relax.rl", "version": "0.9.0"}
+                    assert scope["scope"] == {"name": "relax.rl", "version": "0.10.0"}
                     result.extend(scope["spans"])
-    return result
+    return [span for span in result if name is None or span["name"] == name]
 
 
 def attrs(span):
@@ -46,17 +44,18 @@ def attrs(span):
 
 
 def artifact(span, key):
-    uri = attrs(span)[key + "_ref"]
-    assert urlparse(uri).scheme == "file"
-    return json.loads(Path(unquote(urlparse(uri).path)).read_text())
+    assert key + "_ref" not in attrs(span)
+    return json.loads(attrs(span)[key])
 
 
 def sample():
     return SimpleNamespace(metadata={}, sample_export_id=-1)
 
 
-def test_otlp_roots_links_resources_and_full_artifact(run):
+def test_otlp_roots_links_resources_and_full_inline_data(run, monkeypatch):
     args, root = run
+    monkeypatch.setenv("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", "32")
+    monkeypatch.setenv("OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT", "32")
     with tracing.stage(args, "rl.rollout.generate", iteration=0) as generation:
         with tracing.stage(
             args, "rl.reward.score", iteration=0, links=[generation.context(), generation.context()]
@@ -76,6 +75,7 @@ def test_otlp_roots_links_resources_and_full_artifact(run):
     reward = next(s for s in records if s["name"] == "rl.reward.score")
     assert len(reward["links"]) == 1
     assert artifact(reward, "rl.reward.results") == {"content": "全量" * 100000}
+    assert not (root / "artifacts").exists()
 
 
 def test_error_preserves_exception_and_marks_span(run):
@@ -148,7 +148,8 @@ def test_generation_finishes_before_reward(run):
         return await reward(args, value)
 
     asyncio.run(execute())
-    generation, reward_span = spans(root)
+    (generation,) = spans(root, "rl.rollout.sample")
+    (reward_span,) = spans(root, "rl.reward.score")
     assert int(generation["endTimeUnixNano"]) <= int(reward_span["startTimeUnixNano"])
     assert reward_span["links"][0]["spanId"] == generation["spanId"]
 
@@ -185,7 +186,7 @@ def test_generation_batch_records_128_inputs_without_waiting_for_rewards(run):
                 value = sample()
                 tasks.append(hooks.track_generation_task(asyncio.create_task(pipeline(value)), [value]))
         await all_generated.wait()
-        (generation,) = spans(root)
+        (generation,) = spans(root, "rl.rollout.generate")
         assert generation["name"] == "rl.rollout.generate"
         assert attrs(generation)["rl.batch.size"] == "128"
         assert attrs(generation)["rl.model.version"] == "snapshot-1"
@@ -196,10 +197,18 @@ def test_generation_batch_records_128_inputs_without_waiting_for_rewards(run):
 
     generation = asyncio.run(execute())
     records = spans(root)
-    assert len(records) == 129
+    assert len(records) == 258
     assert all(s["name"] != "rl.agent.run" for s in records)
     rewards = [s for s in records if s["name"] == "rl.reward.score"]
-    assert all(s["links"][0]["spanId"] == generation["spanId"] for s in rewards)
+    samples = spans(root, "rl.rollout.sample")
+    assert len(samples) == 128
+    assert all(s["parentSpanId"] == generation["spanId"] and s["traceId"] == generation["traceId"] for s in samples)
+    (reward_batch,) = spans(root, "rl.reward.batch")
+    assert attrs(reward_batch)["rl.batch.size"] == "128"
+    assert all(
+        s["parentSpanId"] == reward_batch["spanId"] and s["traceId"] == reward_batch["traceId"] for s in rewards
+    )
+    assert {s["links"][0]["spanId"] for s in rewards} == {s["spanId"] for s in samples}
     # Streaming scoring can begin before the entire generation batch closes.
     assert int(rewards[0]["startTimeUnixNano"]) < int(generation["endTimeUnixNano"])
 
@@ -246,13 +255,13 @@ def test_generation_batch_failure_keeps_running_siblings_and_native_end(run, fai
             await task
         if children:
             await started.wait()
-            assert not spans(root), "A failed group must not end a still-generating sibling"
+            assert not spans(root, "rl.rollout.generate"), "A failed group must not end a still-generating sibling"
             release.set()
             await asyncio.gather(*children, return_exceptions=True)
         await asyncio.sleep(0)
 
     asyncio.run(execute())
-    (record,) = spans(root)
+    (record,) = spans(root, "rl.rollout.generate")
     assert attrs(record)["rl.batch.size"] == "2"
     assert record.get("status", {}).get("code", 0) == (0 if failure == "during_reward" else 2)
 
@@ -294,7 +303,7 @@ def test_generation_batches_keep_topups_eval_and_cached_members_distinct(run):
         await asyncio.gather(*tasks)
 
     asyncio.run(execute())
-    records = spans(root)
+    records = spans(root, "rl.rollout.generate")
     assert len(records) == 3
     assert len({attrs(s)["rl.batch.id"] for s in records}) == 3
     assert {(attrs(s)["rl.purpose"], attrs(s)["rl.batch.size"]) for s in records} == {
@@ -306,7 +315,7 @@ def test_generation_batches_keep_topups_eval_and_cached_members_distinct(run):
 
 
 @pytest.mark.parametrize("mixed", [False, True])
-def test_batched_reward_suppresses_fanout_spans_and_preserves_sources(run, mixed):
+def test_batched_reward_parents_fanout_spans_and_preserves_sources(run, mixed):
     args, root = run
     values = [sample(), sample()]
 
@@ -324,8 +333,8 @@ def test_batched_reward_suppresses_fanout_spans_and_preserves_sources(run, mixed
         hooks._publish_source(values, generation)
     assert asyncio.run(batch(args, values)) == [0.0, 1.0]
     records = spans(root)
-    assert len(records) == 2
-    scored = next(s for s in records if s["name"] == "rl.reward.score")
+    assert len(records) == 4
+    scored = next(s for s in records if s["name"] == "rl.reward.batch")
     assert len(scored["links"]) == 1
     assert attrs(scored)["rl.reward.name"] == ("router" if mixed else "math")
     results = artifact(scored, "rl.reward.results")
@@ -334,7 +343,7 @@ def test_batched_reward_suppresses_fanout_spans_and_preserves_sources(run, mixed
     assert len({r["export_id"] for r in results}) == 2
     # Context reset: a later standalone score still emits its own span.
     assert asyncio.run(reward(args, sample())) == 1.0
-    assert len(spans(root)) == 3
+    assert len(spans(root)) == 6
 
 
 def test_batched_reward_preserves_success_and_running_sibling_after_failure(run):
@@ -363,12 +372,14 @@ def test_batched_reward_preserves_success_and_running_sibling_after_failure(run)
         with pytest.raises(ValueError) as error:
             await batch(args, values)
         assert error.value is original
-        assert not spans(root), "Do not publish incomplete results while a real scoring child is running"
+        assert not spans(root, "rl.reward.batch"), (
+            "Do not publish incomplete results while a real scoring child is running"
+        )
         release.set()
         await asyncio.gather(*children, return_exceptions=True)
 
     asyncio.run(execute())
-    (record,) = spans(root)
+    (record,) = spans(root, "rl.reward.batch")
     assert record["status"]["code"] == 2
     results = artifact(record, "rl.reward.results")
     assert [item["status"] for item in results] == ["valid", "error", "valid"]
@@ -401,28 +412,13 @@ def test_eval_generation_is_exported_while_rewards_are_pending(run):
 
         evaluation = asyncio.create_task(evaluate(args))
         await generated.wait()
-        (record,) = spans(root)
+        (record,) = spans(root, "rl.rollout.generate")
         assert attrs(record)["rl.purpose"] == "evaluation"
         assert not evaluation.done()
         release.set()
         await evaluation
 
     asyncio.run(execute())
-
-
-def test_agentic_generation_includes_lease_before_collection(run):
-    args, root = run
-    admitted_at = 1794182400000000000
-    stream = SimpleNamespace(trace_admitted_at=admitted_at, trace_iterations={0}, session_results=[object()])
-
-    @hooks.trace_agentic_generation
-    async def collect(owner, stream):
-        return SimpleNamespace(samples=[])
-
-    asyncio.run(collect(SimpleNamespace(args=args, rollout_mode="train"), stream))
-    (record,) = spans(root)
-    assert int(record["startTimeUnixNano"]) == admitted_at
-    assert attrs(record)["rl.rollout.mode"] == "agentic"
 
 
 def test_sglang_submission_emits_one_generation_batch_with_streaming_rewards(run, monkeypatch):
@@ -466,7 +462,7 @@ def test_sglang_submission_emits_one_generation_batch_with_streaming_rewards(run
         monkeypatch.setattr(rollout.opd, "is_opd_enabled", lambda *a, **kw: False)
         state.submit_generate_tasks([[Sample() for _ in range(8)] for _ in range(16)])
         await generated.wait()
-        (record,) = spans(root)
+        (record,) = spans(root, "rl.rollout.generate")
         assert attrs(record)["rl.batch.size"] == "128"
         assert record["name"] == "rl.rollout.generate"
         release.set()
@@ -476,7 +472,7 @@ def test_sglang_submission_emits_one_generation_batch_with_streaming_rewards(run
     assert len([s for s in spans(root) if s["name"] == "rl.rollout.generate"]) == 1
 
 
-def test_real_batched_reward_entrypoint_keeps_one_span(run, monkeypatch):
+def test_real_batched_reward_entrypoint_has_one_parent(run, monkeypatch):
     pytest.importorskip("ray")
     from relax.engine import rewards
 
@@ -488,8 +484,8 @@ def test_real_batched_reward_entrypoint_keeps_one_span(run, monkeypatch):
 
     monkeypatch.setattr(rewards, "_get_reward_executor", lambda args: SimpleNamespace(execute=execute))
     assert asyncio.run(rewards.batched_async_rm(args, [sample(), sample()])) == [1.0, 1.0]
-    (record,) = spans(root)
-    assert record["name"] == "rl.reward.score"
+    (record,) = spans(root, "rl.reward.batch")
+    assert record["name"] == "rl.reward.batch"
     assert len(artifact(record, "rl.reward.results")) == 2
 
 
@@ -507,7 +503,7 @@ def test_filter_callable_and_normal_drop(run):
     values = [sample(), sample()]
     assert not call(Filter(), values).keep
     assert not call(partial(lambda args, values: Filter()(values)), args, values).keep
-    for record in spans(root):
+    for record in spans(root, "rl.data.filter"):
         assert record.get("status", {}).get("code", 0) == 0
         results = artifact(record, "rl.filter.results")
         assert len({r["export_id"] for r in results}) == 2
@@ -523,7 +519,7 @@ def test_transfer_backfill_keeps_source_iteration_and_real_ack(run):
 
     with tracing.iteration_context(4):
         assert asyncio.run(transfer(args, [[sample()]], 0, 3, None)) == "ack"
-    record = spans(root)[0]
+    record = spans(root, "rl.data.transfer")[0]
     assert attrs(record)["rl.step.id"] == "iteration:4"
     assert attrs(record)["rl.transfer.target.step_id"] == "iteration:3"
     assert artifact(record, "rl.transfer.data")["receive_ack_time"] > 0
@@ -538,7 +534,7 @@ def test_failed_transfer_does_not_invent_ack(run):
 
     with pytest.raises(TimeoutError):
         asyncio.run(transfer(args, [[sample()]], 0, 1, None))
-    assert "receive_ack_time" not in artifact(spans(root)[0], "rl.transfer.data")
+    assert "receive_ack_time" not in artifact(spans(root, "rl.data.transfer")[0], "rl.transfer.data")
 
 
 def test_storage_failure_does_not_break_business(run, monkeypatch):
@@ -642,9 +638,12 @@ def test_agent_trace_preserves_branches_attempts_and_cross_step_identity(run):
     assert {item["export_id"] for item in data["exports"]} == {"11", "12"}
 
 
+@pytest.mark.parametrize("identity_kind", ["export", "index"])
 @pytest.mark.parametrize("masked_value", [4.0, float("nan")])
 @pytest.mark.parametrize("full_advantage", [False, True])
-def test_training_rpc_combines_cp_facts_without_duplicate_stage(run, monkeypatch, masked_value, full_advantage):
+def test_training_rpc_combines_cp_facts_without_duplicate_stage(
+    run, monkeypatch, masked_value, full_advantage, identity_kind
+):
     import time
 
     import torch
@@ -653,7 +652,9 @@ def test_training_rpc_combines_cp_facts_without_duplicate_stage(run, monkeypatch
 
     args, root = run
     args.advantage_estimator = "grpo"
-    args.use_agentic_rollout = True
+    args.use_agentic_rollout = identity_kind == "export"
+    identity_field = "sample_export_ids" if identity_kind == "export" else "sample_indices"
+    result_key = "export_id" if identity_kind == "export" else "sample_index"
     args.qkv_format = "thd"
     args.agentic_obs_train_generation_id = "generation"
     cp = {"rank": 0}
@@ -677,7 +678,7 @@ def test_training_rpc_combines_cp_facts_without_duplicate_stage(run, monkeypatch
     @train.training_rpc
     def execute(owner, rollout_id):
         data = {
-            "sample_export_ids": [23],
+            identity_field: [23],
             "total_lengths": [6],
             "response_lengths": [4],
             "loss_masks": [torch.ones(4)],
@@ -692,7 +693,7 @@ def test_training_rpc_combines_cp_facts_without_duplicate_stage(run, monkeypatch
                 train.prepare_batch(data)
                 # Device tensors cannot be read on the host; use the CPU snapshot
                 # retained before the existing batch-to-device conversion.
-                data["sample_export_ids"] = torch.tensor([23], device="meta")
+                data[identity_field] = torch.tensor([23], device="meta")
                 train.capture(args, data, masks=[torch.tensor([1.0, 0.0, 1.0, 0.0])])
                 train.optimizer_result(False, "zero_effective_tokens")
         time.sleep(0.01)  # checkpoint/offload outside the observed window
@@ -704,8 +705,9 @@ def test_training_rpc_combines_cp_facts_without_duplicate_stage(run, monkeypatch
         reports.append(execute(SimpleNamespace(args=args), 0))
     before_export = time.time_ns()
     train.emit_windows(args, reports)
-    record = spans(root)[0]
-    assert len(spans(root)) == 1
+    record = spans(root, "rl.actor.train")[0]
+    assert len(spans(root, "rl.actor.train")) == 1
+    assert len(spans(root, "rl.actor.train.sample")) == 1
     assert attrs(record)["rl.batch.size"] == "1"
     assert int(record["endTimeUnixNano"]) < before_export
     result = artifact(record, "rl.train.results")
@@ -714,7 +716,7 @@ def test_training_rpc_combines_cp_facts_without_duplicate_stage(run, monkeypatch
     ]
     assert result["uses"] == [
         {
-            "export_id": "23",
+            result_key: "23",
             "effective_tokens": 2,
             "update_id": "generation:actor:0:0",
             "used": True,
@@ -748,6 +750,7 @@ def test_incomplete_rank_results_are_not_published_as_complete(run):
     ]
     emit_windows(args, reports)
     record = spans(root)[0]
+    assert "rl.train.results" not in attrs(record)
     assert "rl.train.results_ref" not in attrs(record)
     assert "missing observation owner" in artifact(record, "relax.observation.partial")["errors"]
     assert record.get("status", {}).get("code", 0) == 0
@@ -806,3 +809,157 @@ def test_generation_reports_only_confirmed_unique_weight_version(run, versions, 
 
     assert asyncio.run(execute()) is value
     assert attrs(spans(root)[0]).get("rl.model.version") == expected
+
+
+def test_complete_sample_continues_across_windows_and_keeps_input(run):
+    import copy
+
+    args, root = run
+    value = sample()
+    value.prompt = [{"role": "user", "content": "题目" * 10000}]
+    value.response = "partial"
+    value.status = SimpleNamespace(name="ABORTED")
+
+    @hooks.trace_generation
+    async def generate(state, args, value):
+        return value
+
+    async def window(value, iteration):
+        with tracing.iteration_context(iteration), hooks.generation_batch(args):
+            task = hooks.track_generation_task(asyncio.create_task(generate(None, args, value)), [value])
+        await task
+
+    asyncio.run(window(value, 0))
+    assert not spans(root, "rl.rollout.sample")
+    (first,) = spans(root, "rl.rollout.generate")
+    resumed = copy.deepcopy(value)  # A queue may deserialize into a different Python object.
+    resumed.status = SimpleNamespace(name="PENDING")
+
+    @hooks.trace_generation
+    async def finish(state, args, value):
+        value.response = "完整答案" * 10000
+        value.status = SimpleNamespace(name="COMPLETED")
+        return value
+
+    async def second():
+        with tracing.iteration_context(1), hooks.generation_batch(args):
+            task = hooks.track_generation_task(asyncio.create_task(finish(None, args, resumed)), [resumed])
+        await task
+
+    asyncio.run(second())
+    (detail,) = spans(root, "rl.rollout.sample")
+    assert detail["parentSpanId"] == first["spanId"]
+    assert detail["traceId"] == first["traceId"]
+    assert "rl.step.id" not in attrs(detail)
+    assert len(artifact(detail, "rl.sample.memberships")) == 2
+    assert artifact(detail, "rl.sample.input") == value.prompt
+    assert artifact(detail, "rl.sample.response")[0]["text"] == resumed.response
+    assert len(detail["links"]) == 1
+
+
+def test_custom_batch_reward_has_zero_duration_result_children(run):
+    args, root = run
+    values = [sample(), sample()]
+
+    @hooks.trace_batched_reward
+    async def reward(args, values):
+        return [0.0, 1.0]
+
+    assert asyncio.run(reward(args, values)) == [0.0, 1.0]
+    (batch,) = spans(root, "rl.reward.batch")
+    details = spans(root, "rl.reward.score")
+    assert len(details) == 2
+    assert attrs(batch)["rl.batch.size"] == "2"
+    for detail in details:
+        assert detail["parentSpanId"] == batch["spanId"] and detail["traceId"] == batch["traceId"]
+        assert attrs(detail)["rl.sample.timing"] == "result"
+        assert detail["startTimeUnixNano"] == detail["endTimeUnixNano"]
+
+
+@pytest.mark.parametrize("startup_failure", [False, True])
+def test_agent_group_owns_samples_and_keeps_agents_independent(run, startup_failure):
+    from relax.utils.rl_agent_trace import AgentTrace, trace_agentic_group
+
+    args, root = run
+    args.agent_command = "agent.py"
+    traces = []
+    original = RuntimeError("launcher failed")
+
+    @trace_agentic_group
+    async def start(owner, mode, group_id, specs):
+        for index, spec in enumerate(specs):
+            if startup_failure and index == 1:
+                traces[0].finish(original)  # start_group awaits existing cleanup before propagating.
+                raise original
+            session = SimpleNamespace(
+                session_id=spec.session_id,
+                observation=SimpleNamespace(calls={}),
+                session_sampling_params={},
+                forest=None,
+                group=SimpleNamespace(
+                    rollout_mode=mode, group_id=group_id, result_cells={s.session_id: None for s in specs}
+                ),
+            )
+            traces.append(
+                AgentTrace(
+                    args, session, SimpleNamespace(input_payload={"messages": [{"role": "user", "content": "task"}]})
+                )
+            )
+
+    specs = [SimpleNamespace(session_id="s1"), SimpleNamespace(session_id="s2")]
+    if startup_failure:
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(start(SimpleNamespace(args=args), "train", "g", specs))
+        assert caught.value is original
+    else:
+        asyncio.run(start(SimpleNamespace(args=args), "train", "g", specs))
+        traces[0].assign(0)
+        traces[0].assign(1)
+        traces[0].finish()
+        assert not spans(root, "rl.rollout.generate")
+        traces[1].assign(1)
+        traces[1].finish()
+        traces[1].finish()  # Idempotent terminal notification.
+    (batch,) = spans(root, "rl.rollout.generate")
+    details = spans(root, "rl.rollout.sample")
+    agents = spans(root, "rl.agent.run")
+    assert len(details) == len(agents) == (1 if startup_failure else 2)
+    assert attrs(batch)["rl.batch.size"] == "2"
+    assert batch.get("status", {}).get("code", 0) == (2 if startup_failure else 0)
+    assert all(d["parentSpanId"] == batch["spanId"] and d["traceId"] == batch["traceId"] for d in details)
+    assert all(a["traceId"] != batch["traceId"] and not a.get("parentSpanId") for a in agents)
+    assert {a["links"][0]["spanId"] for a in agents} == {d["spanId"] for d in details}
+
+
+def test_bad_custom_scorer_shape_does_not_replace_business_return(run):
+    args, root = run
+    value = [1.0]
+
+    @hooks.trace_batched_reward
+    async def score(args, samples):
+        return value
+
+    assert asyncio.run(score(args, [sample(), sample()])) is value
+    (batch,) = spans(root, "rl.reward.batch")
+    assert "relax.observation.partial" in attrs(batch)
+
+
+def test_discarded_partial_sample_preserves_known_response(run):
+    from relax.utils.rl_sample_trace import discard_samples
+
+    args, root = run
+    value = sample()
+    value.prompt, value.response = "question", "unfinished answer"
+    value.status = SimpleNamespace(name="ABORTED")
+
+    @hooks.trace_generation
+    async def generate(state, args, value):
+        return value
+
+    asyncio.run(generate(None, args, value))
+    assert not spans(root, "rl.rollout.sample")
+    discard_samples(args, [value])
+    (detail,) = spans(root, "rl.rollout.sample")
+    assert attrs(detail)["rl.sample.cancelled"] is True
+    assert artifact(detail, "rl.sample.response")[0]["text"] == value.response
+    assert artifact(detail, "rl.sample.response")[0]["status"] == "aborted"

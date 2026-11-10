@@ -1743,8 +1743,6 @@ def _session_observation_fixture(tmp_path):
 
 @pytest.mark.parametrize("outcome", ["completed", "failed", "pause_resume"])
 def test_session_lifecycle_exports_one_otel_agent_span(tmp_path, rollout_module, monkeypatch, outcome):
-    from urllib.parse import unquote, urlparse
-
     from relax.agentic.runner import AgentExecutionError
     from relax.utils.rl_tracing import initialize_run
 
@@ -1797,8 +1795,8 @@ def test_session_lifecycle_exports_one_otel_agent_span(tmp_path, rollout_module,
             for resource in payload["resourceSpans"]:
                 for scope in resource["scopeSpans"]:
                     records.extend(scope["spans"])
-    (record,) = records
-    assert record["name"] == "rl.agent.run"
+    (record,) = [span for span in records if span["name"] == "rl.agent.run"]
+    assert {span["name"] for span in records} == {"rl.agent.run", "rl.rollout.sample", "rl.rollout.generate"}
     attributes = {item["key"]: next(iter(item["value"].values())) for item in record["attributes"]}
     assert attributes["rl.session.id"] == "s"
     assert attributes["rl.session.export_count"] == ("0" if outcome == "failed" else "1")
@@ -1807,8 +1805,8 @@ def test_session_lifecycle_exports_one_otel_agent_span(tmp_path, rollout_module,
         assert "rl.step.id" not in attributes
     else:
         assert attributes["rl.step.id"] == "iteration:0"
-    path = Path(unquote(urlparse(attributes["rl.trajectory.data_ref"]).path))
-    data = json.loads(path.read_text())
+    assert "rl.trajectory.data_ref" not in attributes
+    data = json.loads(attributes["rl.trajectory.data"])
     assert data["execution"]["result"] == ("failed" if outcome == "failed" else "completed")
 
 
@@ -2602,3 +2600,83 @@ def test_backend_timing_omits_missing_invalid_and_unrelated_fields():
         },
     )
     assert attempt["backend_timing"] == {"queue_time": 0.0, "forward_entry_time": 10.0}
+
+
+@pytest.mark.parametrize("startup_failure", [False, True])
+def test_real_shard_group_exports_batch_and_sample_spans(tmp_path, rollout_module, monkeypatch, startup_failure):
+    from relax.agentic.pipeline import SessionSpec
+    from relax.utils.rl_tracing import initialize_run
+
+    monkeypatch.setenv("RELAX_OTEL_DIR", str(tmp_path / "otel"))
+    monkeypatch.setenv("RELAX_OTEL_ENABLED", "1")
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+    monkeypatch.delenv("RELAX_OTEL_RUN_ID", raising=False)
+
+    async def scenario():
+        shard, _ = _session_observation_fixture(tmp_path)
+        shard._groups.clear()
+        shard._session_records.clear()
+        shard.args.agent_command = "test-agent"
+        shard.args.use_agentic_rollout = True
+        initialize_run(shard.args)
+        shard._state_revision = 0
+        finish = asyncio.Event()
+        launched = []
+
+        async def wait():
+            await finish.wait()
+
+        def start(payload):
+            if startup_failure and launched:
+                raise RuntimeError("second launcher failed")
+            process = SimpleNamespace(
+                wait=wait,
+                configure_observability=lambda path: None,
+                terminate_and_join=AsyncMock(),
+                set_timeout_active=AsyncMock(),
+                output=SimpleNamespace(reward=1.0, metadata={}, records=()),
+            )
+            launched.append(process)
+            return process
+
+        shard._agent_launcher = SimpleNamespace(start_agent=start)
+        count = 3 if startup_failure else 2
+        specs = tuple(
+            SessionSpec(session_id=f"s{i}", input_payload={"messages": [{"role": "user", "content": "hi"}]})
+            for i in range(count)
+        )
+        if startup_failure:
+            with pytest.raises(RuntimeError, match="second launcher failed"):
+                await shard.start_group("train", "g", specs)
+            assert not shard._groups and not shard._session_records
+        else:
+            await shard.start_group("train", "g", specs)
+            sessions = list(shard._session_records.values())
+            watchers = [session.resources.watcher_task for session in sessions]
+            for session in sessions:
+                session.forest, _ = _two_turn_forest()
+                session.observation.rl_trace.assign(0)
+            finish.set()
+            await asyncio.wait_for(asyncio.gather(*watchers), timeout=5)
+            assert not shard._session_records
+        for process in launched:
+            process.terminate_and_join.assert_awaited_once()
+        await shard._trajectory_recorder.aclose()
+
+    asyncio.run(scenario())
+    records = [
+        span
+        for path in (tmp_path / "otel").rglob("*.jsonl")
+        for payload in _read_jsonl(path)
+        for resource in payload["resourceSpans"]
+        for scope in resource["scopeSpans"]
+        for span in scope["spans"]
+    ]
+    (batch,) = [span for span in records if span["name"] == "rl.rollout.generate"]
+    samples = [span for span in records if span["name"] == "rl.rollout.sample"]
+    agents = [span for span in records if span["name"] == "rl.agent.run"]
+    assert len(samples) == len(agents) == 2
+    assert all(s["parentSpanId"] == batch["spanId"] and s["traceId"] == batch["traceId"] for s in samples)
+    assert {a["links"][0]["spanId"] for a in agents} == {s["spanId"] for s in samples}
+    assert all(a["traceId"] != batch["traceId"] for a in agents)
+    assert batch.get("status", {}).get("code", 0) == (2 if startup_failure else 0)

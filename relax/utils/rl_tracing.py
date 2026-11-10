@@ -1,10 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""RL semantic conventions 0.9.0, with process-local OTLP JSON files.
+"""RL semantic conventions 0.10.0, with process-local OTLP JSON files.
 
-RL stages are independent roots. Business identities cross Ray boundaries in
-the existing args Namespace; SDK objects never do. No global tracer provider is
-replaced, so backend instrumentation keeps its own trace topology.
+RL batch stages are independent roots; their member spans are explicit
+children. Business identities cross Ray boundaries in the existing args
+Namespace; SDK objects never do. No global tracer provider is replaced, so
+backend instrumentation keeps its own trace topology.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import json
 import os
 import socket
 import threading
+import time
 import uuid
 from argparse import Namespace
 from contextlib import contextmanager
@@ -148,10 +150,16 @@ def _runtime(args: Namespace | None) -> Any:
             ),
             sampler=ALWAYS_ON,
             # Structured JSON and many real dependencies must not be truncated.
-            span_limits=SpanLimits(max_attributes=128, max_attribute_length=None, max_links=100000),
+            span_limits=SpanLimits(
+                max_attributes=128,
+                max_span_attributes=128,
+                max_attribute_length=SpanLimits.UNSET,
+                max_span_attribute_length=SpanLimits.UNSET,
+                max_links=100000,
+            ),
         )
         provider.add_span_processor(SimpleSpanProcessor(DiskExporter()))
-        tracer = provider.get_tracer("relax.rl", "0.9.0")
+        tracer = provider.get_tracer("relax.rl", "0.10.0")
         result = (provider, tracer, root)
         _RUNTIMES[key] = result
         return result
@@ -171,7 +179,7 @@ def _hex_trace_ids(value: Any) -> None:
 
 
 class Stage:
-    """A live root span plus JSON artifacts owned by this instrumentation."""
+    """A live RL operation with inline JSON and explicit member children."""
 
     def __init__(
         self,
@@ -184,7 +192,11 @@ class Stage:
         start_time: int | None = None,
         active: bool = True,
         inherit_iteration: bool = True,
+        parent: Stage | None = None,
     ) -> None:
+        self.args = args
+        self.name = name
+        self.start_time = start_time if start_time is not None else time.time_ns()
         self.span: Any = None
         self.root: Path | None = None
         self._links: set[tuple[int, int]] = set()
@@ -193,6 +205,7 @@ class Stage:
             return
         try:
             from opentelemetry.context import Context
+            from opentelemetry.trace import set_span_in_context
 
             _, tracer, self.root = _runtime(args)
             attrs = {
@@ -202,9 +215,9 @@ class Stage:
             }
             self.span = tracer.start_span(
                 name,
-                context=Context(),
+                context=set_span_in_context(parent.span, Context()) if parent and parent.span else Context(),
                 attributes={k: v for k, v in attrs.items() if v is not None},
-                start_time=start_time,
+                start_time=self.start_time,
             )
             for link in links or []:
                 self.add_link(link)
@@ -217,21 +230,75 @@ class Stage:
             self.span.set_attribute(key, value)
 
     def data(self, key: str, value: Any) -> None:
-        """Persist full structured content before publishing an absolute
-        URI."""
+        """Store full structured content directly in the exported span."""
         if self.span is None or self._ended:
             return
         try:
-            directory = self.root / "artifacts"
-            directory.mkdir(exist_ok=True)
-            path = directory / f"{self.span.get_span_context().span_id:016x}-{key}.json"
-            encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-            temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-            temporary.write_text(encoded, encoding="utf-8")
-            temporary.replace(path)
-            self.set(key + "_ref", path.resolve().as_uri())
+            self.set(key, json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
         except Exception:
             logger.exception("RL OTel structured data write failed: %s", key)
+
+    def child_attributes(self) -> dict[str, Any]:
+        if self.span is None:
+            return {}
+        return {
+            key: value
+            for key, value in self.span.attributes.items()
+            if key
+            in (
+                "rl.run.id",
+                "rl.batch.id",
+                "rl.step.id",
+                "rl.iteration.index",
+                "rl.purpose",
+                "rl.model.name",
+                "rl.backend.name",
+                "rl.model.version",
+                "rl.rollout.mode",
+                "rl.reward.name",
+                "rl.reward.type",
+                "rl.filter.name",
+                "rl.advantage.estimator",
+                "rl.forward.purpose",
+                "rl.forward.output",
+                "rl.algorithm.name",
+                "rl.transfer.target",
+                "rl.transfer.target.step_id",
+            )
+        }
+
+    @best_effort
+    def result_detail(
+        self, key: str, row: dict[str, Any], *, name: str | None = None, links: list[dict] | None = None
+    ) -> Stage | None:
+        """A result confirmation point, never a fabricated execution
+        duration."""
+        if self.span is None or self._ended:
+            return None
+        timestamp = time.time_ns()
+        attrs = {**self.child_attributes(), "rl.sample.timing": "result"}
+        for source, target in (
+            ("export_id", "rl.export.id"),
+            ("sample_index", "rl.sample.index"),
+            ("sample_id", "rl.sample.id"),
+            ("update_id", "rl.update.id"),
+        ):
+            if source in row:
+                attrs[target] = str(row[source])
+        child = Stage(
+            self.args,
+            name or self.name + ".sample",
+            parent=self,
+            attributes=attrs,
+            inherit_iteration=False,
+            start_time=timestamp,
+            links=links,
+        )
+        value = {"uses": [row]} if key == "rl.train.results" else [row]
+        child.data(key, value)
+        error = RuntimeError(row.get("reason", "member operation failed")) if row.get("status") == "error" else None
+        child.end(error, end_time=timestamp)
+        return child
 
     @best_effort
     def context(self) -> dict[str, Any] | None:

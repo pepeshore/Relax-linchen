@@ -91,8 +91,8 @@ from relax.utils.opd.opd_utils import (
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from relax.utils.replay import capture_hooks
 from relax.utils.rl_trace_hooks import trace_forward, trace_iteration
-from relax.utils.rl_tracing import model_name, stage
-from relax.utils.rl_train_trace import training_rpc
+from relax.utils.rl_tracing import enabled, model_name
+from relax.utils.rl_train_trace import training_rpc, window
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
@@ -2000,11 +2000,13 @@ class MegatronTrainRayActor(TrainRayActor):
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
-        with stage(
+        with window(
             self.args,
-            "rl.critic.forward",
+            "critic",
+            rollout_id,
+            name="rl.critic.forward",
+            data=rollout_data,
             attributes={"rl.model.name": model_name(self.args, "critic"), "rl.backend.name": "megatron"},
-            active=is_megatron_main_rank(),
         ):
             rollout_data.update(
                 forward_only(
@@ -2325,6 +2327,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for compute_ref_log_prob.")
         data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
+        if enabled(self.args):
+            data_fields.append(
+                "sample_export_ids" if getattr(self.args, "use_agentic_rollout", False) else "sample_indices"
+            )
         if self.args.multimodal_keys is not None:
             data_fields.append("multimodal_train_inputs")
 
@@ -2370,6 +2376,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 os.environ["ROUTING_REPLAY_STAGE"] = "record"
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for compute_actor_log_prob.")
         data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
+        if enabled(self.args):
+            data_fields.append(
+                "sample_export_ids" if getattr(self.args, "use_agentic_rollout", False) else "sample_indices"
+            )
         if self.args.multimodal_keys is not None:
             data_fields.append("multimodal_train_inputs")
 

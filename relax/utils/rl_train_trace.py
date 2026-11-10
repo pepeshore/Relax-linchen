@@ -120,26 +120,35 @@ def mark_incomplete(reason: str) -> None:
 
 
 @contextmanager
-def window(args: Any, role: str, rollout_id: int, *, data: Any = None, estimator: str | None = None) -> Iterator[None]:
+def window(
+    args: Any,
+    role: str,
+    rollout_id: int,
+    *,
+    data: Any = None,
+    estimator: str | None = None,
+    name: str | None = None,
+    attributes: dict | None = None,
+) -> Iterator[None]:
     windows = _WINDOWS.get()
     if windows is None or not enabled(args):
         yield
         return
     from megatron.core import mpu
 
-    name = "rl.advantage.compute" if role == "advantage" else f"rl.{role}.train"
-    attrs = iteration_attributes(rollout_id)
+    name = name or ("rl.advantage.compute" if role == "advantage" else f"rl.{role}.train")
+    attrs = {**iteration_attributes(rollout_id), **(attributes or {})}
     if role == "advantage":
         attrs["rl.advantage.estimator"] = estimator
     else:
         attrs.update({"rl.model.name": model_name(args, role), "rl.backend.name": "megatron"})
-        if role == "actor":
+        if role == "actor" and name.endswith(".train"):
             attrs["rl.algorithm.name"] = getattr(args, "algorithm", None) or args.advantage_estimator
     observation = {
         "name": name,
         "sequence": sum(w["name"] == name for w in windows),
         "attributes": attrs,
-        "start_time": (_STREAM_START.get() if role == "actor" else None) or time.time_ns(),
+        "start_time": (_STREAM_START.get() if role == "actor" and name.endswith(".train") else None) or time.time_ns(),
         "updates": [],
         "futures": [],
         "owner": _owner(),
@@ -229,6 +238,8 @@ def capture(args: Any, batch: Any, masks: Any = None, *, local_gate: Any = None)
             current.setdefault("members", []).extend(
                 f"{prefix}:{value}" for value in _cpu_list(member_ids) if value >= 0
             )
+        identity_key = "export_id" if ids is not None else "sample_index"
+        ids = member_ids
         if ids is None:
             return
         import torch
@@ -290,7 +301,7 @@ def capture(args: Any, batch: Any, masks: Any = None, *, local_gate: Any = None)
 
         def read_snapshot() -> None:
             try:
-                future.set_result(_read(source, values, event, selected, update_id))
+                future.set_result(_read(source, values, event, selected, update_id, identity_key))
             except Exception as error:
                 future.set_exception(error)
 
@@ -303,7 +314,9 @@ def capture(args: Any, batch: Any, masks: Any = None, *, local_gate: Any = None)
         logger.warning("RL OTel sample capture failed: %s", error)
 
 
-def _read(source: Any, values: Any, event: Any, identities: list, update_id: str | None) -> list[dict[str, Any]]:
+def _read(
+    source: Any, values: Any, event: Any, identities: list, update_id: str | None, identity_key: str = "export_id"
+) -> list[dict[str, Any]]:
     if event is not None:
         event.synchronize()
     del source
@@ -312,7 +325,7 @@ def _read(source: Any, values: Any, event: Any, identities: list, update_id: str
         if not math.isfinite(numerator):
             known, numerator = False, 0.0
         row = {
-            "export_id": identity,
+            identity_key: identity,
             "effective_tokens": int(count),
             "advantage_numerator": numerator,
             "advantage_denominator": denominator,
@@ -335,10 +348,9 @@ def emit_windows(args: Any, reports: list[Any]) -> None:
     for (name, _), windows in grouped.items():
         attrs = dict(windows[0]["attributes"])
         owners = [item for item in windows if item["owner"]]
-        if name.endswith(".train"):
-            attrs["rl.batch.id"] = uuid.uuid4().hex
-            if owners and all("members" in item for item in owners):
-                attrs["rl.batch.size"] = len({identity for item in owners for identity in item["members"]})
+        attrs["rl.batch.id"] = uuid.uuid4().hex
+        if owners and all("members" in item for item in owners):
+            attrs["rl.batch.size"] = len({identity for item in owners for identity in item["members"]})
         observation = Stage(args, name, attributes=attrs, start_time=min(w["start_time"] for w in windows))
         errors = [error for item in owners for error in item.get("capture_errors", [])]
         expected = {
@@ -356,11 +368,12 @@ def emit_windows(args: Any, reports: list[Any]) -> None:
         records: dict[tuple, list[dict]] = defaultdict(list)
         for item in owners:
             for row in item.get("records", []):
-                records[(row["export_id"], row.get("update_id"))].append(row)
+                identity_key = "export_id" if "export_id" in row else "sample_index"
+                records[(identity_key, row[identity_key], row.get("update_id"))].append(row)
         uses = []
-        for (identity, update_id), rows in records.items():
+        for (identity_key, identity, update_id), rows in records.items():
             count = sum(row["effective_tokens"] for row in rows)
-            value = {"export_id": identity, "effective_tokens" if update_id else "token_count": count}
+            value = {identity_key: identity, "effective_tokens" if update_id else "token_count": count}
             if update_id is not None:
                 value.update(update_id=update_id, used=True)
             denominator = sum(row["advantage_denominator"] for row in rows)
@@ -377,12 +390,26 @@ def emit_windows(args: Any, reports: list[Any]) -> None:
                     if previous != row:
                         errors.append(f"Conflicting update results: {row['update_id']}")
             result = {"updates": list(updates.values())}
-            if getattr(args, "use_agentic_rollout", False):
-                result["uses"] = uses
+            result["uses"] = uses
             if not errors:
                 observation.data("rl.train.results", result)
-        elif getattr(args, "use_agentic_rollout", False) and not errors:
+                for row in uses:
+                    update_result = updates.get(row.get("update_id"), {})
+                    observation.result_detail(
+                        "rl.train.results", {**row, "update_status": update_result.get("status")}
+                    )
+        elif name == "rl.advantage.compute" and not errors:
             observation.data("rl.advantage.results", uses)
+            for row in uses:
+                observation.result_detail("rl.advantage.results", row)
+        elif name.endswith(".forward") and not errors:
+            rows = []
+            for member in sorted({identity for item in owners for identity in item.get("members", [])}):
+                kind, identity = member.split(":", 1)
+                row = {"export_id" if kind == "export" else "sample_index": identity, "status": "valid"}
+                rows.append(row)
+                observation.result_detail("rl.forward.results", row)
+            observation.data("rl.forward.results", rows)
         if errors:
             observation.data("relax.observation.partial", {"errors": errors, "fragments": windows})
             logger.warning("RL OTel incomplete structured data: %s", errors)

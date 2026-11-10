@@ -41,7 +41,6 @@ from relax.utils.agentic_obs.records import utc_now
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
-from relax.utils.rl_trace_hooks import trace_agentic_generation
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.score_centering import (
     configure_score_centering_request,
@@ -1245,7 +1244,6 @@ class RuntimeDomain:
             if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
                 raise outcome
 
-    @trace_agentic_generation
     async def collect_group(self, stream: RuntimeGroupStream) -> Optional[GroupExport]:
         """Gather original Session exports into one complete Group export.
 

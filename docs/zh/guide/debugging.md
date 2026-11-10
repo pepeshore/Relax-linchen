@@ -169,16 +169,16 @@ batch 相关参数（`--global-batch-size`、`--n-samples-per-prompt`、并行�
 
 提交任务前设置 `RELAX_OTEL_DIR` 可更改输出根目录，设置 `RELAX_OTEL_ENABLED=0` 可关闭 RL trace，`OTEL_SDK_DISABLED=true` 也会关闭采集。若需要在一台机器上读取所有 worker 的数据，请使用共享持久化目录；使用节点本地磁盘时，需要分别收集各 worker 的文件。采集不依赖 Collector 地址。
 
-各阶段使用独立 trace，通过 `rl.run.id` 和 `rl.step.id` 关联；`rl.iteration.index` 保留框架从 0 开始的 rollout 轮次。能够直接确认的依赖使用 span Links。埋点不替换后端已有的 tracer provider，也不额外建立通用的跨进程 trace 上下文传递。
+各批次阶段使用独立 trace，通过 `rl.run.id` 和 `rl.step.id` 关联；`rl.iteration.index` 保留从 0 开始的 rollout 轮次。每个批次记录自身 `rl.batch.id` 和实际输入数，明细 span 与批次共用 trace 并指定真实 parent：`rl.rollout.sample` 记录一条输入的完整 rollout，`rl.reward.score` 归属于 `rl.reward.batch`。不同阶段的依赖使用 Links。Agent 调用保持独立 trace，并 Link 到对应样本。
 
-结构化结果完整保存在运行目录下的 JSON 附件中，名称以 `_ref` 结尾的属性保存对应的绝对 `file:` URI。请同时保留 JSONL 和附件；迁移目录后，读取工具需要解析原 URI 对应的新位置。Agentic 运行还会启用已有 observation 记录，保存 Session 的请求、尝试、状态及 Export，并通过 Export ID 关联实际训练消费。无法观测的外部工具时间保持未知。这些记录包含模型输入输出，应根据训练数据设置目录权限和保留期限。
+结构化结果、题目和 response 直接以完整 JSON 字符串保存在 span 属性中，新 trace 不依赖 `_ref` 附件。可独立计时的样本调用标记 `rl.sample.timing=operation`；共享批次计算无法取得单条耗时时，在实际确认结果的时刻生成 `result` 明细 span。这类 span 的时长为零，不能解释为样本计算耗时。父子 span 的耗时也不能相加。Agentic 运行还会启用已有 observation 记录，保存 Session 的请求、尝试、状态及 Export，并通过 Export ID 关联实际训练消费。无法观测的外部工具时间保持未知。这些记录包含模型输入输出，应根据训练数据设置目录权限和保留期限。
 
-阶段结束后即追加写入文件。进程在阶段执行中被强制终止时，该阶段可能没有结束记录。写入失败会记日志，训练继续运行；rank 数据不完整时，通过 `relax.observation.partial_ref` 保存诊断信息，不冒充完整训练结果。采集不会增加分布式通信，GPU 上的简要统计通过异步复制交给训练线程之外的读者处理。
+阶段结束后即追加写入文件。进程在阶段执行中被强制终止时，该阶段可能没有结束记录。写入失败会记日志，训练继续运行；rank 数据不完整时，通过 `relax.observation.partial` 保存诊断信息，不冒充完整训练结果。采集不会增加分布式通信，GPU 上的简要统计通过异步复制交给训练线程之外的读者处理。
 
-训练结束后，可检查文件格式、附件和阶段覆盖：
+训练结束后，可检查文件格式、内联结果、父子关系和阶段覆盖：
 
 ```bash
 python scripts/tools/validate_rl_traces.py /path/to/otel-traces/RUN_ID --min-train-steps 2
 ```
 
-如果存在失败 span、rank 数据不完整、附件不可读或训练轮次不足，检查会失败。工具汇总实际记录的阶段和优化器决策，不代表本次未运行的算法或路径也得到验证。
+如果存在失败 span、rank 数据不完整、结果格式错误、明细缺少父 span 或训练轮次不足，检查会失败。工具汇总实际记录的阶段和优化器决策，不代表本次未运行的算法或路径也得到验证。

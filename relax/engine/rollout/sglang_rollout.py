@@ -904,6 +904,11 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
 
         if not args.partial_rollout:
+            from relax.utils.rl_sample_trace import discard_samples
+
+            for task in done:
+                if not task.cancelled() and task.exception() is None:
+                    discard_samples(args, task.result())
             continue
 
         # for partial rollout, collect the partial samples into the data buffer

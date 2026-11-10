@@ -1047,6 +1047,8 @@ class RolloutManager(ReloadableMixin):
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
+        from relax.utils.rl_sample_trace import discard_samples
+
         try:
             # Signal every monitor before bounded joins so a stalled health
             # RPC cannot consume the driver's entire shutdown budget.
@@ -1059,6 +1061,7 @@ class RolloutManager(ReloadableMixin):
                 monitor.stop(timeout=max(0.0, deadline - time.monotonic()))
             self._shutdown_all_engines()
         finally:
+            discard_samples(self.args)
             try:
                 # Deregister the worker's Mooncake segment before a fast restart.
                 if getattr(self, "data_system_client", None) is not None:
