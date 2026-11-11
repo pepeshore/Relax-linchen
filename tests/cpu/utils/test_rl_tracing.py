@@ -34,7 +34,7 @@ def spans(root, name=None):
         for line in path.read_text().splitlines():
             for resource in json.loads(line)["resourceSpans"]:
                 for scope in resource["scopeSpans"]:
-                    assert scope["scope"] == {"name": "relax.rl", "version": "0.18.0"}
+                    assert scope["scope"] == {"name": "relax.rl", "version": "0.19.0"}
                     result.extend(scope["spans"])
     return [span for span in result if name is None or span["name"] == name]
 

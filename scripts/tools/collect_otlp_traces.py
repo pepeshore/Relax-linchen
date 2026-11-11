@@ -37,6 +37,15 @@ def serve(listen: str, output: Path, ready_file: Path | None = None) -> None:
         def Export(self, request: Any, context: Any) -> Any:
             try:
                 payload = MessageToDict(request, use_integers_for_enums=True)
+                # Existing SGLang images predate the Relax image's SDK processor.
+                # Its instrumentation scope also identifies health checks and token spans.
+                for resource in payload.get("resourceSpans", []):
+                    for scope in resource.get("scopeSpans", []):
+                        if scope.get("scope", {}).get("name") == "sglang server":
+                            for span in scope.get("spans", []):
+                                attrs = span.setdefault("attributes", [])
+                                if not any(attr["key"] == "rl.producer.role" for attr in attrs):
+                                    attrs.append({"key": "rl.producer.role", "value": {"stringValue": "sglang"}})
                 _hex_trace_ids(payload)
                 line = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
                 with lock, output.open("a", encoding="utf-8") as stream:

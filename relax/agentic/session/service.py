@@ -76,6 +76,7 @@ from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
 from relax.utils.rl_agent_trace import start_agent_trace, trace_agentic_group
+from relax.utils.rl_tracing import set_process_role
 from relax.utils.types import get_spec_token_counts
 
 
@@ -1499,6 +1500,7 @@ class AgenticSessionShard:
         args: Namespace,
         admission_coordinator: Any,
     ) -> None:
+        set_process_role("agentic_session_shard")
         self.args = args
         self._groups: Dict[str, ResidentGroup] = {}
         # OpenAI ingress index. ResidentGroup.sessions owns each Session's

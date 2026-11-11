@@ -61,6 +61,7 @@ def test_otlp_receiver_preserves_parent_identity_and_acknowledges_disk_write(tmp
         assert record["traceId"] == span.trace_id.hex()
         assert record["spanId"] == span.span_id.hex()
         assert record["parentSpanId"] == span.parent_span_id.hex()
+        assert {"key": "rl.producer.role", "value": {"stringValue": "sglang"}} in record["attributes"]
     finally:
         process.terminate()
         process.wait(timeout=15)

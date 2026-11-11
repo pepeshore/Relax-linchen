@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""RL semantic conventions 0.18.0, with process-local OTLP JSON files.
+"""RL semantic conventions 0.19.0, with process-local OTLP JSON files.
 
 A framework rollout owns its samples and the scoring, filtering, queue writes,
 custom advantages and OPD forwards it initiates. Links identify input sources.
@@ -41,6 +41,22 @@ _INFERENCE_PARENT: ContextVar[tuple[Stage | None, dict[str, str] | None]] = Cont
 )
 _ROLLOUT_CALL: ContextVar[RolloutCall | None] = ContextVar("rl_rollout_call", default=None)
 _ENV_NAMES = ("RELAX_OTEL_ENABLED", "RELAX_OTEL_DIR", "RELAX_OTEL_RUN_ID", "OTEL_SDK_DISABLED")
+
+
+# Ray workers keep their role across threads and asyncio tasks. A fork must
+# register its own producer rather than inheriting the parent process's identity.
+_PROCESS_ROLE: tuple[int, str] | None = None
+
+
+def set_process_role(role: str) -> None:
+    global _PROCESS_ROLE
+    _PROCESS_ROLE = (os.getpid(), role)
+
+
+def process_role() -> str:
+    if _PROCESS_ROLE is not None and _PROCESS_ROLE[0] == os.getpid():
+        return _PROCESS_ROLE[1]
+    return "framework"
 
 
 def enabled(args: Namespace | None = None) -> bool:
@@ -165,7 +181,7 @@ def _runtime(args: Namespace | None) -> Any:
             ),
         )
         provider.add_span_processor(SimpleSpanProcessor(DiskExporter()))
-        tracer = provider.get_tracer("relax.rl", "0.18.0")
+        tracer = provider.get_tracer("relax.rl", "0.19.0")
         result = (provider, tracer, root)
         _RUNTIMES[key] = result
         return result
@@ -200,6 +216,7 @@ class Stage:
         inherit_iteration: bool = True,
         parent: Stage | None = None,
         parent_headers: dict[str, str] | None = None,
+        producer_role: str | None = None,
     ) -> None:
         self.args = args
         self.name = name
@@ -222,6 +239,7 @@ class Stage:
                 "rl.timing.scope": "operation",
                 **(iteration_attributes(iteration) if inherit_iteration else {}),
                 **(attributes or {}),
+                "rl.producer.role": producer_role or process_role(),
             }
             if start_time is None:
                 self.start_time = time.time_ns()

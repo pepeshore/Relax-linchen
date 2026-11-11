@@ -42,7 +42,7 @@ def agent_span(name: str, attributes: dict[str, str], *, entry: bool = False, cl
 
     kind = trace.SpanKind.CLIENT if client else trace.SpanKind.INTERNAL
     with trace.get_tracer("relax.example.agent").start_as_current_span(
-        name, context=parent, kind=kind, attributes=attributes
+        name, context=parent, kind=kind, attributes={**attributes, "rl.producer.role": "agent"}
     ):
         yield True
 

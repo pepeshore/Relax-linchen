@@ -2,7 +2,7 @@
 
 **Status:** Development
 
-**Version:** 0.18.0
+**Version:** 0.19.0
 
 **Date:** 2026-11-10
 
@@ -76,6 +76,7 @@ span 名称固定，不拼接 Run、Step、rank、模型名或请求内容。角
 | 属性                             | 记录位置                                                                                                                                | 口径                                                                                               |
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | `rl.batch.id`、`rl.batch.size`   | 所有批次操作 span                                                                                                                       | 各阶段记录自身实际输入集合身份与成员数；真实子操作 span 只记录所属 batch.id，不重复记录 batch.size |
+| `rl.producer.role`               | Development                                                                                                                             | Required                                                                                           |
 | `rl.execution.side`              | 本次 rollout 拥有的评分批次、动态过滤、队列写入、自定义 advantage、OPD 前向；训练侧的前向、优势及训练请求、rank 入口和各 rank 训练 span | string：`rollout` 或 `training`，表示实际执行侧。独立调用且执行侧未知时省略。                      |
 | `rl.purpose`                     | rollout、样本、Agent、评分及已确定归属的 rollout 子阶段                                                                                 | `training` 或 `evaluation`，描述采样用途                                                           |
 | `rl.algorithm.name`              | `rl.actor.train`                                                                                                                        | 记录本轮策略训练算法；优势阶段单独记录实际 estimator，Critic 不重复复制策略算法名                  |
@@ -95,7 +96,7 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 6. **SGLang 推理父子关系。** SGLang 请求入口 span 继承负责本次调用的 RL span 的 traceId，并将其作为 parent：普通生成指向 `rl.rollout.sample`，Agentic 模型请求使用第 2 章下述回调规则。通过 HTTP `traceparent`／`tracestate` 传递真实 SpanContext，在进入 Ray HTTP worker 或 router 前完成注入；中间层应保留该上下文。SGLang 内部 spans 保持原有名称和父子树，不为每个内部 span 再创建 RL 包装。单个 sample／Agent 可以包含多次请求，它们可以经不同的 Agent 应用 span 归属于同一个 RL span；重试和恢复不把请求挂到其他样本。若启用 router 自身 tracing，允许真实的 router span 位于 RL 与 SGLang 之间，并保持可追溯的父链。
 7. **其他后端与耗时。** 其他后端（如 Megatron）仍可使用独立 trace，通过入口 Span Link 指向负责该操作的 RL span；Relax 的 Megatron 训练 RPC 通过 W3C 上下文关联各 rank 和本地阶段；外部 Megatron profiler 事件仍按其自身采集边界解释。SGLang 与 RL 共享 trace 后，一条 rollout 批次 trace 可以包含多个样本及其推理细节，不再要求这些 SGLang 请求使用独立 trace。各阶段保留真实起止；父子、并行阶段及 RL／后端耗时不能相加作为 Step 总耗时。
 
-**当前实现范围（Relax RL 0.18.0）：** 内置普通 rollout、`GenerateState.post_generate` 和 Agentic SGLang adapter 注入上述 W3C 上下文。RL tracing 关闭或无有效来源 span 时不注入。现有路由 headers 保留；独立并发样本／Session 的上下文相互隔离。自定义生成若绕过这些入口、自行调用 HTTP 客户端，需使用相同的 `inference_headers` 辅助函数。
+**当前实现范围（Relax RL 0.19.0）：** 内置普通 rollout、`GenerateState.post_generate` 和 Agentic SGLang adapter 注入上述 W3C 上下文。RL tracing 关闭或无有效来源 span 时不注入。现有路由 headers 保留；独立并发样本／Session 的上下文相互隔离。自定义生成若绕过这些入口、自行调用 HTTP 客户端，需使用相同的 `inference_headers` 辅助函数。
 
 SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL 的进程内文件 exporter 自动写出。采集两端后按 `(traceId, spanId, parentSpanId)` 还原父子关系；`rl.run.id`／`rl.step.id` 等属性不会由 parent 自动复制，可沿父链定位所属 RL span。不要用时间接近或业务 ID 伪造父关系。
 
@@ -169,6 +170,23 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 Agentic 常驻任务在操作开始时固定 parent 和 Step。上一轮启动并跨轮完成的操作保留原归属。恢复后新启动的操作归当时的 rollout。在两轮之间独立开始、没有活动调用的操作省略 parent 和未知 Step。写队列回填旧分区时，`rl.step.id` 属于发起本次写入的 rollout，`rl.transfer.target.step_id` 表示实际写入的目标。rollout 函数返回后调用的样本过滤回调不在该调用范围内。
 
 训练侧 Megatron 的前向和优势计算、独立 Advantages 服务均标为 `training`，保留各自的调用边界与原生计时。例如，训练侧的 `rl.actor.forward` 可以是 `old_policy` 或 `distillation`；rollout 侧的 OPD student prefill 使用 `distillation`。按 `rl.execution.side` 区分谁执行，按 `rl.forward.purpose` 区分计算用途。一次训练采样中的 rollout 子操作可以同时具有 `rl.execution.side=rollout` 和 `rl.purpose=training`。
+
+### 问答：如何判断 span 由哪个角色创建？
+
+从 0.19 起读取 span 的 `rl.producer.role`。同一 trace 中，各进程写自己的角色。主机、PID 和 `rl.rank.global` 可进一步定位实例。
+
+| 角色值                            | 创建方与示例                                                                                                                                       |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rollout_manager`                 | RolloutManager 发起整轮生成，在本进程执行的普通采样、评分、过滤和传输也使用此值。                                                                  |
+| `agentic_session_shard`           | Session Shard 创建的 Agentic 样本和 `rl.agent.run`，以及独立调用 shard 时创建的批次。                                                              |
+| `agent`                           | 示例 agent 进程创建 `agent.invoke`、`llm.call` 和实际工具调用的 `tool.call`。自定义 agent 在自己的 SDK 中填写。                                    |
+| `sglang`                          | SGLang 创建的请求和内部推理 span，包括健康检查。Relax 的 SGLang 镜像在 SDK 写入；旧镜像使用仓库附带的 OTLP 接收器时按 `sglang server` scope 补充。 |
+| `actor_service`、`critic_service` | 发起分布式训练请求的服务，记录 `train_step`。                                                                                                      |
+| `<role>_rank`                     | 训练 worker 注册时的实际角色，如 `actor_rank`、`critic_rank`、`actor_fwd_rank`。Actor rank 运行 reference forward 也保留 `actor_rank`。            |
+| `advantages_service`              | 独立 Advantages 服务执行的优势计算。                                                                                                               |
+| `framework`                       | 调用通用 Stage API 且未注册角色的框架进程。                                                                                                        |
+
+例如 rank 0 观察到 rollout 权重加载确认时，`rl.rollout.load_weights` 的 `rl.producer.role=actor_rank`，`rl.backend.name=sglang` 描述加载目标。Traceparent 只传播调用上下文。
 
 ### 问答：一个训练请求如何对应多个 Megatron 进程？
 

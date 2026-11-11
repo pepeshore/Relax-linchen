@@ -86,6 +86,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                             "0.16.0",
                             "0.17.0",
                             "0.18.0",
+                            "0.19.0",
                         ):
                             raise ValueError("Unexpected instrumentation scope")
                         for span in scope["spans"]:
@@ -98,6 +99,8 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                             if int(span["endTimeUnixNano"]) < int(span["startTimeUnixNano"]):
                                 raise ValueError("Negative stage duration")
                             attrs = attributes(span["attributes"])
+                            if version == "0.19.0" and not attrs.get("rl.producer.role"):
+                                raise ValueError("Missing rl.producer.role")
                             processes[identity] = (resource_attrs["host.name"], resource_attrs["process.pid"])
                             records[identity] = (span, attrs, version)
                             runs.add(attrs["rl.run.id"])
@@ -107,7 +110,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                                 steps.add(attrs["rl.step.id"])
                                 for key in ("rl.batch.id", "rl.batch.size", "rl.model.name", "rl.backend.name"):
                                     if (
-                                        version == "0.18.0"
+                                        version in ("0.18.0", "0.19.0")
                                         and key == "rl.batch.size"
                                         and attrs.get("rl.timing.scope") == "rank_local"
                                     ):
@@ -143,7 +146,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
     prompts_by_sample = {
         (attrs["rl.run.id"], attrs["rl.sample.id"]): attrs["rl.prompt.id"]
         for span, attrs, version in records.values()
-        if version in ("0.16.0", "0.17.0", "0.18.0")
+        if version in ("0.16.0", "0.17.0", "0.18.0", "0.19.0")
         and span["name"] == "rl.rollout.sample"
         and "rl.prompt.id" in attrs
     }
@@ -153,7 +156,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
         if version == "0.9.0":
             continue
         name = span["name"]
-        if version == "0.18.0":
+        if version in ("0.18.0", "0.19.0"):
             scope = attrs.get("rl.timing.scope")
             if scope == "representative_rank" or "rl.timing.ranks" in attrs:
                 raise ValueError("New training spans must be emitted by individual ranks")
@@ -189,7 +192,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
             elif name in ("rl.actor.publish_weights", "rl.rollout.load_weights") and span.get("parentSpanId"):
                 if parent is None or parent[0]["name"] != "rl.weight.sync":
                     raise ValueError("Incorrect weight sync parent")
-        if version in ("0.16.0", "0.17.0", "0.18.0") and name in ("rl.reward.score", "rl.reward.batch"):
+        if version in ("0.16.0", "0.17.0", "0.18.0", "0.19.0") and name in ("rl.reward.score", "rl.reward.batch"):
             expected = prompts_by_sample.get((attrs["rl.run.id"], attrs.get("rl.sample.id")))
             prompt = attrs.get("rl.prompt.id")
             if name == "rl.reward.score" and expected is not None and prompt != expected:
@@ -198,14 +201,14 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                 expected = prompts_by_sample.get((attrs["rl.run.id"], row.get("sample_id")), prompt)
                 if expected is not None and row.get("prompt_id") != expected:
                     raise ValueError("Reward result prompt_id differs from its source")
-        if version in ("0.13.0", "0.14.0", "0.15.0", "0.16.0", "0.17.0", "0.18.0"):
+        if version in ("0.13.0", "0.14.0", "0.15.0", "0.16.0", "0.17.0", "0.18.0", "0.19.0"):
             _validate_timing(span, attrs)
-        if version in ("0.11.0", "0.12.0", "0.13.0", "0.14.0", "0.15.0", "0.16.0", "0.17.0", "0.18.0"):
+        if version in ("0.11.0", "0.12.0", "0.13.0", "0.14.0", "0.15.0", "0.16.0", "0.17.0", "0.18.0", "0.19.0"):
             if attrs.get("rl.sample.timing") == "result":
                 raise ValueError("Result rows must be stored on the batch, not emitted as spans")
             if name.endswith(".sample") and name != "rl.rollout.sample":
                 raise ValueError(f"Redundant member span in {version}: {name}")
-        if version in ("0.17.0", "0.18.0") and name in (
+        if version in ("0.17.0", "0.18.0", "0.19.0") and name in (
             "rl.data.filter",
             "rl.data.transfer",
             "rl.actor.train",
@@ -235,7 +238,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                     raise ValueError(f"Missing rollout execution side for {name}")
         if (
             name == "rl.reward.batch"
-            and version in ("0.15.0", "0.16.0", "0.17.0", "0.18.0")
+            and version in ("0.15.0", "0.16.0", "0.17.0", "0.18.0", "0.19.0")
             and span.get("parentSpanId")
         ):
             parent = records.get((trace_id, span["parentSpanId"]))
@@ -243,7 +246,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                 raise ValueError("A rollout-owned reward batch must be a direct child of rl.rollout.generate")
             if attrs["rl.batch.id"] == parent[1]["rl.batch.id"]:
                 raise ValueError("A scoring batch must have its own batch identity")
-        if name == "rl.agent.run" and version in ("0.14.0", "0.15.0", "0.16.0", "0.17.0", "0.18.0"):
+        if name == "rl.agent.run" and version in ("0.14.0", "0.15.0", "0.16.0", "0.17.0", "0.18.0", "0.19.0"):
             parent = records.get((trace_id, span.get("parentSpanId")))
             if parent is None or parent[0]["name"] != "rl.rollout.sample":
                 raise ValueError("Agent run must be a child of its sample")
@@ -268,7 +271,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
             timing[kind] += 1
             children[parent_name] += 1
     for key, (span, attrs, version) in records.items():
-        if version == "0.18.0" and span["name"] in ("rl.actor.train_step", "rl.critic.train_step"):
+        if version in ("0.18.0", "0.19.0") and span["name"] in ("rl.actor.train_step", "rl.critic.train_step"):
             if rank_children.get(key, set()) != set(range(int(attrs["rl.rank.world_size"]))):
                 raise ValueError("Training dispatch is missing rank spans")
     if len(runs) != 1 or len(steps) < min_train_steps:

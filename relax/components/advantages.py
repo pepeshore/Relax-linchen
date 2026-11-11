@@ -114,6 +114,7 @@ class Advantages(Base):
                     with stage(
                         self.config,
                         "rl.advantage.compute",
+                        producer_role="advantages_service",
                         iteration=step,
                         attributes={
                             "rl.advantage.estimator": self.config.advantage_estimator,

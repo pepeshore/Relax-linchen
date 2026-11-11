@@ -55,6 +55,7 @@ from relax.utils.metrics.rollout_metrics import (
 )
 from relax.utils.misc import load_function
 from relax.utils.reload_utils import ReloadableMixin
+from relax.utils.rl_tracing import set_process_role
 from relax.utils.s3_model_loader import (
     build_runai_streamer_env_for_load,
     prepare_model_maybe_update_args,
@@ -907,6 +908,7 @@ class RolloutManager(ReloadableMixin):
     _WEIGHT_SYNC_MAX_INIT_ATTEMPTS = Envs.RELAX_WEIGHT_SYNC_MAX_INIT_ATTEMPTS
 
     def __init__(self, args, pg, data_source=None):
+        set_process_role("rollout_manager")
         self.pg = pg
         self.args = args
         self._engine_actor_states = _get_engine_actor_states()

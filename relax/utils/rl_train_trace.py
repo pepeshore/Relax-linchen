@@ -79,6 +79,7 @@ def dispatch_training(group: Any, method: str, rollout_id: int) -> list:
     parent = Stage(
         group.args,
         f"rl.{group.role}.train_step",
+        producer_role=f"{group.role}_service",
         iteration=rollout_id,
         attributes={
             "rl.execution.side": "training",

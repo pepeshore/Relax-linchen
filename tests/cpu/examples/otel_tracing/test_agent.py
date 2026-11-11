@@ -80,6 +80,7 @@ async def test_two_turn_agent_preserves_reasoning_and_uses_real_reward(tmp_path,
     assert not output.with_suffix(".json.tmp").exists()
     spans = exported.get_finished_spans()
     if traced:
+        assert all(span.attributes["rl.producer.role"] == "agent" for span in spans if span.name != "Req")
         assert [span.name for span in spans] == ["Req", "llm.call", "Req", "llm.call", "agent.invoke"]
         first_req, first_llm, second_req, second_llm, invocation = spans
         assert invocation.parent.span_id == int(run_id, 16)

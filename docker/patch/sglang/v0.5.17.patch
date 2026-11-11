@@ -3664,3 +3664,28 @@ diff --git a/python/sglang/srt/models/qwen3_omni_moe.py b/python/sglang/srt/mode
 
 
  class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
+diff --git a/python/sglang/srt/observability/trace.py b/python/sglang/srt/observability/trace.py
+index 51fd513c5fc9f6c987f39fb56c5f60bc81f4cad3..b518de47c35c7d50ea253cdad6223f0fb36a601f 100644
+--- a/python/sglang/srt/observability/trace.py
++++ b/python/sglang/srt/observability/trace.py
+@@ -50,7 +50,7 @@
+         OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+     )
+     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+-    from opentelemetry.sdk.trace import TracerProvider, id_generator
++    from opentelemetry.sdk.trace import SpanProcessor, TracerProvider, id_generator
+     from opentelemetry.sdk.trace.export import BatchSpanProcessor
+     from opentelemetry.trace import Status, StatusCode
+     from opentelemetry.trace.propagation.tracecontext import (
+@@ -211,6 +211,11 @@
+             schedule_delay_millis=schedule_delay_millis,
+             max_export_batch_size=max_export_batch_size,
+         )
++        class RelaxProducerRoleProcessor(SpanProcessor):
++            def on_start(self, span, parent_context=None):
++                span.set_attribute("rl.producer.role", "sglang")
++
++        tracer_provider.add_span_processor(RelaxProducerRoleProcessor())
+         tracer_provider.add_span_processor(processor)
+         trace.set_tracer_provider(tracer_provider)
+     except Exception as e:

@@ -195,6 +195,8 @@ PYTHONPATH=. python scripts/tools/collect_otlp_traces.py \
 
 结构化结果、题目和 response 直接以完整 JSON 字符串保存在 span 属性中，新 trace 不依赖 `_ref` 附件。真实的逐样本 rollout 和评分调用创建成员 span，标记 `rl.sample.timing=operation`。批量评分、前向、优势、过滤、传输和训练将成员结果保存在批次 span 上，不生成零时长结果 span。OPD 单样本前向只保留一个真实请求 span。训练 uses 通过 update_id 关联 updates 中的更新结果。旧版 0.10 的 result span 可兼容读取，但应与执行时间线分开展示。父子 span 的耗时也不能相加。Agentic 运行还会启用已有 observation 记录，保存 Session 的请求、尝试、状态及 Export，并通过 Export ID 关联实际训练消费。无法观测的外部工具时间保持未知。这些记录包含模型输入输出，应根据训练数据设置目录权限和保留期限。
 
+使用 span 属性 `rl.producer.role` 查找记录操作的进程角色。一次 Agentic 调用依次经过 `rollout_manager`、`agentic_session_shard`、`agent` 和 `sglang`。训练由 `actor_service` 分发给 `actor_rank`；权重交付与加载确认都由发送端 rank 记录。旧 SGLang 镜像通过仓库附带的 OTLP 接收器补充此属性。
+
 展开 `rl.actor.train_step` 或 `rl.critic.train_step`，每个收到 RPC 的 worker 都有一个直接子节点 `train_rank`。总 span 记录分发到完成的耗时。各 worker 在本进程记录实际执行的前向、优势、训练及同步阶段，本地计算标为 `rl.timing.scope=rank_local`。用 `rl.rank.global` 选择 rank，用 Resource 的主机和 PID 定位进程。成员数和 CP 计算结果按本地分片解释。权重发布和加载在 rank 0 的 `rl.weight.sync` 下，继续保留交付 Link。0.17 及以前的历史 trace 可以按原有代表 rank 口径查看。
 
 RL 耗时统一标记 `rl.timing.clock=host_wall`，包含调用内部已有的等待，不表示 GPU kernel 时间。train 从实际训练函数入口开始，不包含此前 RPC 准备／预取、之后的 checkpoint 和 offload。结果整理与 trace 导出不会延长已完成操作；自定义批量评分的实际后处理仍计入，即使结果值未改变。可恢复 Sample 保持原起点，直到真正终态才结束。权重 span 使用 `source_sync`，表示源端从准备到交付／生效确认，包含暂停、转换和等待，不是目标端独立安装时间。采集不会新增设备同步或分布式 barrier。

@@ -11,7 +11,7 @@ import pytest
 
 from relax.utils import rl_train_trace as train
 from relax.utils.rl_trace_hooks import trace_forward, trace_iteration
-from relax.utils.rl_tracing import initialize_run
+from relax.utils.rl_tracing import initialize_run, set_process_role
 from scripts.tools.validate_rl_traces import attributes, validate
 
 
@@ -20,6 +20,7 @@ class _CPUWorker:
         self._rank, self._world_size = rank, 2
         self.args = config
         self.role = "actor"
+        set_process_role("actor_rank")
 
     @train.training_rpc
     @trace_iteration
@@ -107,6 +108,10 @@ def test_ray_dispatch_exports_one_child_per_worker_process(tmp_path, monkeypatch
                 assert time.monotonic() < deadline, "The dispatch completion span did not reach disk"
                 time.sleep(0.02)
             (parent,) = parents
+            assert attributes(parent["attributes"])["rl.producer.role"] == "actor_service"
+            assert {attributes(s["attributes"])["rl.producer.role"] for s, _ in rows if s is not parent} == {
+                "actor_rank"
+            }
             workers = {s["spanId"]: (s, r) for s, r in rows if s["name"] == "rl.actor.train_rank"}
             assert len(workers) == 2
             assert {int(attributes(s["attributes"])["rl.rank.global"]) for s, _ in workers.values()} == {0, 1}
