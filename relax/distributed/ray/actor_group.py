@@ -11,6 +11,7 @@ from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.utils.agentic_obs.config import train_generation_args
 from relax.utils.env import Envs
+from relax.utils.rl_train_trace import dispatch_training
 from relax.utils.utils import get_ray_accelerator_kwargs
 
 
@@ -241,7 +242,7 @@ class RayTrainGroup:
 
     def async_train(self, rollout_id):
         """Do one rollout training."""
-        return [actor.train.remote(rollout_id) for actor in self._actor_handlers]
+        return dispatch_training(self, "train", rollout_id)
 
     def async_compute_ref_log_prob(self, rollout_id):
         """Compute reference log prob for routing replay."""
@@ -253,11 +254,11 @@ class RayTrainGroup:
 
     def train_fully_async(self, rollout_id):
         """Do one rollout training without ref log prob computation."""
-        return [actor.train_async.remote(rollout_id) for actor in self._actor_handlers]
+        return dispatch_training(self, "train_async", rollout_id)
 
     def train_hybrid(self, rollout_id):
         """Hybrid mode: actor handles ref/actor_fwd/adv internally."""
-        return [actor.train_hybrid.remote(rollout_id) for actor in self._actor_handlers]
+        return dispatch_training(self, "train_hybrid", rollout_id)
 
     def save_model(self, rollout_id, force_sync=False):
         """Save actor model."""

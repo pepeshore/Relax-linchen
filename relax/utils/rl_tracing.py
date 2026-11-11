@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""RL semantic conventions 0.17.0, with process-local OTLP JSON files.
+"""RL semantic conventions 0.18.0, with process-local OTLP JSON files.
 
 A framework rollout owns its samples and the scoring, filtering, queue writes,
 custom advantages and OPD forwards it initiates. Links identify input sources.
@@ -165,7 +165,7 @@ def _runtime(args: Namespace | None) -> Any:
             ),
         )
         provider.add_span_processor(SimpleSpanProcessor(DiskExporter()))
-        tracer = provider.get_tracer("relax.rl", "0.17.0")
+        tracer = provider.get_tracer("relax.rl", "0.18.0")
         result = (provider, tracer, root)
         _RUNTIMES[key] = result
         return result

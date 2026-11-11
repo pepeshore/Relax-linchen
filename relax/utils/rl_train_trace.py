@@ -1,33 +1,41 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Collect rank facts through the existing training RPC return path.
+"""Trace a distributed training request at dispatch and at each worker RPC.
 
-Only the coordinator emits a logical stage. GPU summaries are copied on the
-producer stream and read by a background thread; no additional collective or
-trace-context transport is introduced. Delayed export retains native timings.
+Rank-local stages retain their native timing. Accelerator results are copied on
+the producer stream and read after the operation.
 """
 
 from __future__ import annotations
 
 import math
-import os
-import socket
+import threading
 import time
 import uuid
 from collections import defaultdict
-from concurrent.futures import Future
+from concurrent.futures import CancelledError, Future
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable, Iterator
 
 from relax.utils.agentic_obs.writers import BoundedWorker, best_effort
 from relax.utils.logging_utils import get_logger
-from relax.utils.rl_tracing import Stage, enabled, iteration_attributes, model_name
+from relax.utils.rl_tracing import Stage, enabled, iteration_attributes, model_name, stage
 
 
 logger = get_logger(__name__)
-_WINDOWS: ContextVar[list[dict[str, Any]] | None] = ContextVar("rl_windows", default=None)
+
+
+@dataclass
+class _RankRequest:
+    span: Stage
+    global_rank: int
+    pending: list[tuple[Stage, dict, BaseException | None]] = field(default_factory=list)
+
+
+_REQUEST: ContextVar[_RankRequest | None] = ContextVar("rl_rank_request", default=None)
 _CURRENT: ContextVar[dict[str, Any] | None] = ContextVar("rl_train_window", default=None)
 _UPDATE: ContextVar[str | None] = ContextVar("rl_update_id", default=None)
 _READER: BoundedWorker | None = None
@@ -61,58 +69,95 @@ def _cpu_list(value: Any) -> list:
     return result
 
 
+def dispatch_training(group: Any, method: str, rollout_id: int) -> list:
+    """Fan out one request, preserving the existing nonblocking ObjectRef
+    API."""
+    workers = group._actor_handlers
+    if getattr(group.args, "train_backend", "megatron") != "megatron" or not enabled(group.args):
+        return [getattr(worker, method).remote(rollout_id) for worker in workers]
+
+    parent = Stage(
+        group.args,
+        f"rl.{group.role}.train_step",
+        iteration=rollout_id,
+        attributes={
+            "rl.execution.side": "training",
+            "rl.backend.name": "megatron",
+            "rl.rank.world_size": len(workers),
+        },
+    )
+    headers = parent.headers()
+    kwargs = {"trace_headers": headers} if headers else {}
+    try:
+        refs = [getattr(worker, method).remote(rollout_id, **kwargs) for worker in workers]
+    except BaseException as error:
+        parent.end(error)
+        raise
+
+    # RayTrainGroup also has fire-and-forget callers. Observe acknowledgements
+    # without blocking them, reading training results or changing the returned refs.
+    remaining = len(refs)
+    failure = None
+    lock = threading.Lock()
+
+    def acknowledge(future: Future) -> None:
+        nonlocal remaining, failure
+        error = CancelledError() if future.cancelled() else future.exception()
+        with lock:
+            if error is not None and failure is None:
+                failure = error
+            remaining -= 1
+            if remaining == 0:
+                parent.end(failure)
+
+    try:
+        if not refs:
+            parent.end()
+        for ref in refs:
+            ref.future().add_done_callback(acknowledge)
+    except Exception as error:
+        logger.warning("RL OTel could not observe training acknowledgements: %s", error)
+        parent.end(error)
+    return refs
+
+
+def current_rank_span() -> Stage | None:
+    request = _REQUEST.get()
+    return request.span if request is not None else None
+
+
 def training_rpc(function: Callable) -> Callable:
     @wraps(function)
-    def call(owner: Any, rollout_id: int, *args: Any, **kwargs: Any) -> Any:
-        if not enabled(owner.args):
+    def call(owner: Any, rollout_id: int, *args: Any, trace_headers: dict | None = None, **kwargs: Any) -> Any:
+        if not trace_headers or not enabled(owner.args):
             return function(owner, rollout_id, *args, **kwargs)
-        windows: list[dict[str, Any]] = []
-        token = _WINDOWS.set(windows)
-        try:
-            result = function(owner, rollout_id, *args, **kwargs)
-            payload = _finish_windows(windows)
-            return {"rl_trace_windows": payload, "rl_trace_producer": _producer(windows)} if result is None else result
-        except BaseException:
-            # Preserve completed training when a later checkpoint/eval fails.
-            producer = _producer(windows)
-            if producer and producer["owner"] and producer["rank"]["dp"] == producer["rank"]["cp"] == 0:
-                completed = [w for w in windows if "end_time" in w and "error" not in w]
-                for item in _finish_windows(completed):
-                    observation = Stage(
-                        owner.args,
-                        item["name"],
-                        attributes={**item["attributes"], **_training_stage_attributes(item, 1)},
-                        start_time=item["start_time"],
-                    )
-                    _record_rank_times(observation, [item])
-                    observation.data("relax.observation.partial", item)
-                    observation.end(end_time=item["end_time"])
-            raise
-        finally:
-            _WINDOWS.reset(token)
+
+        attrs = {
+            "rl.execution.side": "training",
+            "rl.backend.name": "megatron",
+            "rl.timing.scope": "rank_local",
+            "rl.rank.global": owner._rank,
+            "rl.rank.world_size": owner._world_size,
+        }
+        with stage(
+            owner.args,
+            f"rl.{owner.role}.train_rank",
+            iteration=rollout_id,
+            attributes=attrs,
+            parent_headers=trace_headers,
+        ) as rank:
+            request = _RankRequest(rank, owner._rank)
+            token = _REQUEST.set(request)
+            try:
+                return function(owner, rollout_id, *args, **kwargs)
+            finally:
+                rank.freeze_end()
+                _REQUEST.reset(token)
+                deadline = time.monotonic() + 5.0
+                for operation, local, failure in request.pending:
+                    _finish_local(operation, local, deadline, failure)
 
     return call
-
-
-def _producer(windows: list[dict[str, Any]]) -> dict[str, Any]:
-    # Colocate sleep can destroy NCCL groups before the RPC returns. Preserve
-    # the ranks captured inside the operation while those groups were live.
-    if windows:
-        return {"owner": windows[0]["owner"], "rank": windows[0]["rank"]}
-    return {"owner": False, "rank": {}}
-
-
-def _finish_windows(windows: list[dict]) -> list[dict]:
-    deadline = time.monotonic() + 5.0
-    for item in windows:
-        records = []
-        for future in item.pop("futures", []):
-            try:
-                records.extend(future.result(timeout=max(0.0, deadline - time.monotonic())))
-            except Exception as error:
-                item.setdefault("capture_errors", []).append(f"{type(error).__name__}: {error}")
-        item["records"] = records
-    return windows
 
 
 @best_effort
@@ -133,65 +178,63 @@ def window(
     name: str | None = None,
     attributes: dict | None = None,
 ) -> Iterator[None]:
-    windows = _WINDOWS.get()
-    if windows is None or not enabled(args):
+    request = _REQUEST.get()
+    if request is None:
         yield
         return
     from megatron.core import mpu
 
     name = name or ("rl.advantage.compute" if role == "advantage" else f"rl.{role}.train")
-    attrs = {**iteration_attributes(rollout_id), **(attributes or {})}
+    coordinates = {
+        "rl.timing.rank.dp": mpu.get_data_parallel_rank(with_context_parallel=False),
+        "rl.timing.rank.cp": mpu.get_context_parallel_rank(),
+        "rl.timing.rank.tp": mpu.get_tensor_model_parallel_rank(),
+        "rl.timing.rank.pp": mpu.get_pipeline_model_parallel_rank(),
+    }
+    for key, value in coordinates.items():
+        request.span.set(key, value)
+    attrs = {
+        **iteration_attributes(rollout_id),
+        **(attributes or {}),
+        **coordinates,
+        "rl.timing.scope": "rank_local",
+        "rl.execution.side": "training",
+        "rl.backend.name": "megatron",
+        "rl.batch.id": uuid.uuid4().hex,
+        "rl.rank.global": request.global_rank,
+    }
     if role == "advantage":
         attrs["rl.advantage.estimator"] = estimator
     else:
-        attrs.update({"rl.model.name": model_name(args, role), "rl.backend.name": "megatron"})
+        attrs["rl.model.name"] = model_name(args, role)
         if role == "actor" and name.endswith(".train"):
             attrs["rl.algorithm.name"] = getattr(args, "algorithm", None) or args.advantage_estimator
-    observation = {
-        "name": name,
-        "sequence": sum(w["name"] == name for w in windows),
-        "attributes": attrs,
-        "start_time": time.time_ns(),
-        "host_name": socket.gethostname(),
-        "process_pid": os.getpid(),
-        "updates": [],
-        "futures": [],
-        "owner": _owner(),
-        "rank": {
-            "dp": mpu.get_data_parallel_rank(with_context_parallel=False),
-            "cp": mpu.get_context_parallel_rank(),
-            "tp": mpu.get_tensor_model_parallel_rank(),
-            "pp": mpu.get_pipeline_model_parallel_rank(),
-        },
-    }
-    if data is not None and _owner():
-        ids = data.get("sample_export_ids")
-        if ids is not None:
-            observation["members"] = [f"export:{value}" for value in _cpu_list(ids) if value >= 0]
-        elif data.get("sample_indices") is not None:
-            observation["members"] = [f"sample:{value}" for value in _cpu_list(data["sample_indices"]) if value >= 0]
-    windows.append(observation)
-    token = _CURRENT.set(observation)
+    local = {"name": name, "updates": [], "futures": [], "owner": _owner()}
+    if data is not None and local["owner"]:
+        _collect_members(data, local)
+    operation = Stage(args, name, parent=request.span, attributes=attrs)
+    token = _CURRENT.set(local)
+    failure = None
     try:
         yield
     except BaseException as error:
-        observation["error"] = f"{type(error).__name__}: {error}"
-        # An exceptional RPC cannot return its facts. Retain the actual failing
-        # operation locally, rather than losing the error while Ray unwinds.
-        if observation["owner"] and observation["rank"]["dp"] == observation["rank"]["cp"] == 0:
-            observation["end_time"] = time.time_ns()
-            failed = Stage(
-                args,
-                name,
-                attributes={**attrs, **_training_stage_attributes(observation, 1)},
-                start_time=observation["start_time"],
-            )
-            _record_rank_times(failed, [observation])
-            failed.end(error, end_time=observation["end_time"])
+        failure = error
         raise
     finally:
-        observation.setdefault("end_time", time.time_ns())
+        operation.freeze_end()
         _CURRENT.reset(token)
+        if local["futures"]:
+            request.pending.append((operation, local, failure))
+        else:
+            _finish_local(operation, local, time.monotonic(), failure)
+
+
+@best_effort
+def _collect_members(data: Any, local: dict) -> None:
+    for key, kind in (("sample_export_ids", "export"), ("sample_indices", "sample")):
+        if data.get(key) is not None:
+            local["members"] = [f"{kind}:{i}" for i in _cpu_list(data[key]) if i >= 0]
+            break
 
 
 @contextmanager
@@ -349,110 +392,68 @@ def _read(
     return result
 
 
-def _representative(item: dict) -> bool:
-    # Keep every stage on the same producer clock. Never switch to an earlier
-    # pipeline stage just because it returns before the result-producing stage.
-    return item["owner"] and item["rank"]["dp"] == item["rank"]["cp"] == 0
-
-
-def _training_stage_attributes(item: dict, rank_count: int) -> dict[str, Any]:
-    return {
-        "rl.timing.scope": "representative_rank",
-        "rl.execution.side": "training",
-        "rl.timing.rank_count": rank_count,
-        **{f"rl.timing.rank.{key}": value for key, value in item["rank"].items()},
-    }
-
-
-def _record_rank_times(observation: Stage, windows: list[dict]) -> None:
-    observation.data(
-        "rl.timing.ranks",
-        [
-            {
-                "rank": item["rank"],
-                "host_name": item.get("host_name"),
-                "process_pid": item.get("process_pid"),
-                "start_time_unix_nano": str(item["start_time"]),
-                "end_time_unix_nano": str(item["end_time"]),
-                "representative": _representative(item),
-            }
-            for item in windows
-        ],
-    )
+def _finish_local(operation: Stage, local: dict, deadline: float, failure: BaseException | None) -> None:
+    try:
+        _record_local_results(operation, local, deadline, failure)
+    finally:
+        operation.end(failure)
 
 
 @best_effort
-def emit_windows(args: Any, reports: list[Any]) -> None:
-    grouped: dict[tuple, list[dict]] = defaultdict(list)
-    for report in reports:
-        if not isinstance(report, dict):
-            continue
-        for item in report.get("rl_trace_windows", []):
-            grouped[(item["name"], item["sequence"])].append(item)
-    for (name, _), windows in grouped.items():
-        representatives = [item for item in windows if _representative(item)]
-        if len(representatives) != 1:
-            logger.warning("RL OTel missing or ambiguous representative timing for %s; stage omitted", name)
-            continue
-        representative = representatives[0]
-        attrs = {**representative["attributes"], **_training_stage_attributes(representative, len(windows))}
-        owners = [item for item in windows if item["owner"]]
-        attrs["rl.batch.id"] = uuid.uuid4().hex
-        if owners and all("members" in item for item in owners):
-            attrs["rl.batch.size"] = len({identity for item in owners for identity in item["members"]})
-        observation = Stage(args, name, attributes=attrs, start_time=representative["start_time"])
-        _record_rank_times(observation, windows)
-        errors = [error for item in owners for error in item.get("capture_errors", [])]
-        expected = {
-            tuple(sorted(report["rl_trace_producer"]["rank"].items()))
-            for report in reports
-            if isinstance(report, dict) and report.get("rl_trace_producer", {}).get("owner")
-        }
-        actual = {tuple(sorted(item["rank"].items())) for item in owners}
-        if expected != actual or any(
-            not isinstance(report, dict) or "rl_trace_producer" not in report for report in reports
-        ):
-            errors.append("missing observation owner")
-        if getattr(args, "use_agentic_rollout", False) and any("members" not in item for item in owners):
-            errors.append("missing Export membership")
-        records: dict[tuple, list[dict]] = defaultdict(list)
-        for item in owners:
-            for row in item.get("records", []):
-                identity_key = "export_id" if "export_id" in row else "sample_index"
-                records[(identity_key, row[identity_key], row.get("update_id"))].append(row)
-        uses = []
-        for (identity_key, identity, update_id), rows in records.items():
-            count = sum(row["effective_tokens"] for row in rows)
-            value = {identity_key: identity, "effective_tokens" if update_id else "token_count": count}
-            if update_id is not None:
-                value.update(update_id=update_id, used=True)
-            denominator = sum(row["advantage_denominator"] for row in rows)
-            if denominator and all(row["advantage_known"] for row in rows):
-                value["advantage_mean" if update_id else "mean"] = (
-                    sum(row["advantage_numerator"] for row in rows) / denominator
-                )
-            uses.append(value)
-        if name.endswith(".train"):
-            updates = {}
-            for item in windows:
-                for row in item["updates"]:
-                    previous = updates.setdefault(row["update_id"], row)
-                    if previous != row:
-                        errors.append(f"Conflicting update results: {row['update_id']}")
-            result = {"updates": list(updates.values())}
-            result["uses"] = uses
-            if not errors:
-                observation.data("rl.train.results", result)
-        elif name == "rl.advantage.compute" and not errors:
-            observation.data("rl.advantage.results", uses)
-        elif name.endswith(".forward") and not errors:
+def _record_local_results(operation: Stage, local: dict, deadline: float, failure: BaseException | None) -> None:
+    records = []
+    for future in local["futures"]:
+        try:
+            records.extend(future.result(timeout=max(0.0, deadline - time.monotonic())))
+        except Exception as error:
+            local.setdefault("capture_errors", []).append(f"{type(error).__name__}: {error}")
+
+    members = set(local["members"]) if "members" in local else None
+    if members is not None:
+        operation.set("rl.batch.size", len(members))
+    if failure is not None:
+        local.setdefault("capture_errors", []).append(f"{type(failure).__name__}: {failure}")
+    if local.get("capture_errors"):
+        operation.data(
+            "relax.observation.partial",
+            {
+                "errors": local["capture_errors"],
+                "records": records,
+                "updates": local["updates"],
+            },
+        )
+        return
+    name = local["name"]
+    if name.endswith(".forward"):
+        if members is not None:
             rows = []
-            for member in sorted({identity for item in owners for identity in item.get("members", [])}):
+            for member in sorted(members):
                 kind, identity = member.split(":", 1)
-                row = {"export_id" if kind == "export" else "sample_index": identity, "status": "valid"}
-                rows.append(row)
-            observation.data("rl.forward.results", rows)
-        if errors:
-            observation.data("relax.observation.partial", {"errors": errors, "fragments": windows})
-            logger.warning("RL OTel incomplete structured data: %s", errors)
-        observation.end(end_time=representative["end_time"])
+                rows.append({"export_id" if kind == "export" else "sample_index": identity, "status": "valid"})
+            operation.data("rl.forward.results", rows)
+        return
+    # Multiple local microbatches can consume the same sample during an update.
+    fragments = defaultdict(list)
+    for record in records:
+        key = "export_id" if "export_id" in record else "sample_index"
+        fragments[(key, record[key], record.get("update_id"))].append(record)
+    rows = []
+    for (key, identity, update_id), items in fragments.items():
+        row = {key: identity}
+        row["effective_tokens" if update_id else "token_count"] = sum(item["effective_tokens"] for item in items)
+        if update_id is not None:
+            row.update(update_id=update_id, used=True)
+        denominator = sum(item["advantage_denominator"] for item in items)
+        if denominator and all(item["advantage_known"] for item in items):
+            row["advantage_mean" if update_id else "mean"] = (
+                sum(item["advantage_numerator"] for item in items) / denominator
+            )
+        rows.append(row)
+    if name.endswith(".train"):
+        result = {"updates": local["updates"]}
+        if local["owner"] and (members is not None or rows):
+            result["uses"] = rows
+        if result["updates"] or "uses" in result:
+            operation.data("rl.train.results", result)
+    elif name == "rl.advantage.compute" and (members is not None or rows):
+        operation.data("rl.advantage.results", rows)

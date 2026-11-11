@@ -747,11 +747,11 @@ def trace_forward(function: Callable) -> Callable:
         elif role == "teacher":
             attrs["rl.forward.output"] = "topk_distribution" if collect_topk else "sampled_token_logprob"
         from relax.utils.rl_tracing import iteration_attributes
-        from relax.utils.rl_train_trace import _WINDOWS, _owner, window
+        from relax.utils.rl_train_trace import _owner, current_rank_span, window
 
         data = getattr(data_iterator[0], "rollout_data", {})
         name = f"rl.{role}.forward"
-        if _WINDOWS.get() is not None:
+        if current_rank_span() is not None:
             with window(
                 owner.args,
                 role,

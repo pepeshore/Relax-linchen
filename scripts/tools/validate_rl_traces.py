@@ -22,7 +22,7 @@ def _validate_timing(span: dict, attrs: dict) -> None:
     if attrs.get("rl.timing.clock") != "host_wall":
         raise ValueError("Missing host timing semantics")
     scope = attrs.get("rl.timing.scope")
-    if scope in ("operation", "source_sync"):
+    if scope in ("operation", "source_sync", "rank_local"):
         return
     if scope != "representative_rank":
         raise ValueError("Unknown timing scope")
@@ -62,6 +62,8 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
     counts, statuses, updates = Counter(), Counter(), Counter()
     runs, steps, references = set(), set(), set()
     records = {}
+    processes = {}
+    rank_children = {}
     inline_values = 0
     for path in files:
         for line_number, line in enumerate(path.read_text().splitlines(), 1):
@@ -83,6 +85,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                             "0.15.0",
                             "0.16.0",
                             "0.17.0",
+                            "0.18.0",
                         ):
                             raise ValueError("Unexpected instrumentation scope")
                         for span in scope["spans"]:
@@ -95,6 +98,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                             if int(span["endTimeUnixNano"]) < int(span["startTimeUnixNano"]):
                                 raise ValueError("Negative stage duration")
                             attrs = attributes(span["attributes"])
+                            processes[identity] = (resource_attrs["host.name"], resource_attrs["process.pid"])
                             records[identity] = (span, attrs, version)
                             runs.add(attrs["rl.run.id"])
                             counts[span["name"]] += 1
@@ -102,6 +106,12 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                             if span["name"].endswith(".train"):
                                 steps.add(attrs["rl.step.id"])
                                 for key in ("rl.batch.id", "rl.batch.size", "rl.model.name", "rl.backend.name"):
+                                    if (
+                                        version == "0.18.0"
+                                        and key == "rl.batch.size"
+                                        and attrs.get("rl.timing.scope") == "rank_local"
+                                    ):
+                                        continue
                                     if key not in attrs:
                                         raise ValueError(f"Missing train attribute {key}")
                             for key, value in attrs.items():
@@ -133,15 +143,53 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
     prompts_by_sample = {
         (attrs["rl.run.id"], attrs["rl.sample.id"]): attrs["rl.prompt.id"]
         for span, attrs, version in records.values()
-        if version in ("0.16.0", "0.17.0") and span["name"] == "rl.rollout.sample" and "rl.prompt.id" in attrs
+        if version in ("0.16.0", "0.17.0", "0.18.0")
+        and span["name"] == "rl.rollout.sample"
+        and "rl.prompt.id" in attrs
     }
     children = Counter()
     timing = Counter()
-    for (trace_id, _), (span, attrs, version) in records.items():
+    for (trace_id, span_id), (span, attrs, version) in records.items():
         if version == "0.9.0":
             continue
         name = span["name"]
-        if version in ("0.16.0", "0.17.0") and name in ("rl.reward.score", "rl.reward.batch"):
+        if version == "0.18.0":
+            scope = attrs.get("rl.timing.scope")
+            if scope == "representative_rank" or "rl.timing.ranks" in attrs:
+                raise ValueError("New training spans must be emitted by individual ranks")
+            if name in ("rl.actor.train", "rl.critic.train") and scope != "rank_local":
+                raise ValueError("Megatron training stage is missing rank-local timing")
+            parent_key = (trace_id, span.get("parentSpanId"))
+            parent = records.get(parent_key)
+            if name in ("rl.actor.train_step", "rl.critic.train_step"):
+                if int(attrs.get("rl.rank.world_size", -1)) < 0 or span.get("parentSpanId"):
+                    raise ValueError("Invalid training dispatch")
+            if name in ("rl.actor.train_rank", "rl.critic.train_rank"):
+                if parent is None or parent[0]["name"] != name.replace("train_rank", "train_step"):
+                    raise ValueError("Missing training dispatch parent")
+                size = int(parent[1]["rl.rank.world_size"])
+                rank = int(attrs["rl.rank.global"])
+                if (
+                    not 0 <= rank < size
+                    or int(attrs["rl.rank.world_size"]) != size
+                    or scope != "rank_local"
+                    or attrs["rl.step.id"] != parent[1]["rl.step.id"]
+                ):
+                    raise ValueError("Invalid training rank identity")
+                rank_children.setdefault(parent_key, set()).add(rank)
+            elif scope == "rank_local" or (name == "rl.weight.sync" and span.get("parentSpanId")):
+                if (
+                    parent is None
+                    or parent[0]["name"] not in ("rl.actor.train_rank", "rl.critic.train_rank")
+                    or attrs["rl.rank.global"] != parent[1]["rl.rank.global"]
+                    or attrs["rl.step.id"] != parent[1]["rl.step.id"]
+                    or processes[(trace_id, span_id)] != processes[parent_key]
+                ):
+                    raise ValueError("Rank-local stage belongs to the wrong worker or parent")
+            elif name in ("rl.actor.publish_weights", "rl.rollout.load_weights") and span.get("parentSpanId"):
+                if parent is None or parent[0]["name"] != "rl.weight.sync":
+                    raise ValueError("Incorrect weight sync parent")
+        if version in ("0.16.0", "0.17.0", "0.18.0") and name in ("rl.reward.score", "rl.reward.batch"):
             expected = prompts_by_sample.get((attrs["rl.run.id"], attrs.get("rl.sample.id")))
             prompt = attrs.get("rl.prompt.id")
             if name == "rl.reward.score" and expected is not None and prompt != expected:
@@ -150,14 +198,14 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                 expected = prompts_by_sample.get((attrs["rl.run.id"], row.get("sample_id")), prompt)
                 if expected is not None and row.get("prompt_id") != expected:
                     raise ValueError("Reward result prompt_id differs from its source")
-        if version in ("0.13.0", "0.14.0", "0.15.0", "0.16.0", "0.17.0"):
+        if version in ("0.13.0", "0.14.0", "0.15.0", "0.16.0", "0.17.0", "0.18.0"):
             _validate_timing(span, attrs)
-        if version in ("0.11.0", "0.12.0", "0.13.0", "0.14.0", "0.15.0", "0.16.0", "0.17.0"):
+        if version in ("0.11.0", "0.12.0", "0.13.0", "0.14.0", "0.15.0", "0.16.0", "0.17.0", "0.18.0"):
             if attrs.get("rl.sample.timing") == "result":
                 raise ValueError("Result rows must be stored on the batch, not emitted as spans")
             if name.endswith(".sample") and name != "rl.rollout.sample":
                 raise ValueError(f"Redundant member span in {version}: {name}")
-        if version == "0.17.0" and name in (
+        if version in ("0.17.0", "0.18.0") and name in (
             "rl.data.filter",
             "rl.data.transfer",
             "rl.actor.train",
@@ -185,13 +233,17 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
             if attrs.get("rl.backend.name") == "sglang" and name in ("rl.actor.forward", "rl.teacher.forward"):
                 if side != "rollout":
                     raise ValueError(f"Missing rollout execution side for {name}")
-        if name == "rl.reward.batch" and version in ("0.15.0", "0.16.0", "0.17.0") and span.get("parentSpanId"):
+        if (
+            name == "rl.reward.batch"
+            and version in ("0.15.0", "0.16.0", "0.17.0", "0.18.0")
+            and span.get("parentSpanId")
+        ):
             parent = records.get((trace_id, span["parentSpanId"]))
             if parent is None or parent[0]["name"] != "rl.rollout.generate":
                 raise ValueError("A rollout-owned reward batch must be a direct child of rl.rollout.generate")
             if attrs["rl.batch.id"] == parent[1]["rl.batch.id"]:
                 raise ValueError("A scoring batch must have its own batch identity")
-        if name == "rl.agent.run" and version in ("0.14.0", "0.15.0", "0.16.0", "0.17.0"):
+        if name == "rl.agent.run" and version in ("0.14.0", "0.15.0", "0.16.0", "0.17.0", "0.18.0"):
             parent = records.get((trace_id, span.get("parentSpanId")))
             if parent is None or parent[0]["name"] != "rl.rollout.sample":
                 raise ValueError("Agent run must be a child of its sample")
@@ -215,6 +267,10 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                 raise ValueError("Batch size duplicated on a member")
             timing[kind] += 1
             children[parent_name] += 1
+    for key, (span, attrs, version) in records.items():
+        if version == "0.18.0" and span["name"] in ("rl.actor.train_step", "rl.critic.train_step"):
+            if rank_children.get(key, set()) != set(range(int(attrs["rl.rank.world_size"]))):
+                raise ValueError("Training dispatch is missing rank spans")
     if len(runs) != 1 or len(steps) < min_train_steps:
         raise ValueError(f"Expected one run and >= {min_train_steps} train steps; got {runs}, {steps}")
     if statuses.get("2"):

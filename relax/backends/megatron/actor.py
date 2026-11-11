@@ -93,6 +93,7 @@ from relax.utils.replay import capture_hooks
 from relax.utils.rl_trace_hooks import trace_forward, trace_iteration
 from relax.utils.rl_tracing import enabled, model_name
 from relax.utils.rl_train_trace import training_rpc, window
+from relax.utils.rl_weights_trace import trace_weight_sync
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
@@ -1396,10 +1397,10 @@ class MegatronTrainRayActor(TrainRayActor):
         """Backward-compatible name kept for existing internal call sites."""
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
+    @training_rpc
     @manual_gc_training
     @trace_iteration
-    @training_rpc
-    def train(self, rollout_id: int) -> None:
+    def train(self, rollout_id: int, *, trace_headers: dict[str, str] | None = None) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
             if self.genrm_manager is not None:
@@ -2570,10 +2571,10 @@ class MegatronTrainRayActor(TrainRayActor):
             if clear_routing_replay_forward:
                 RoutingReplay.clear_all_forward()
 
+    @training_rpc
     @manual_gc_training
     @trace_iteration
-    @training_rpc
-    def train_hybrid(self, rollout_id) -> None:
+    def train_hybrid(self, rollout_id: int, *, trace_headers: dict[str, str] | None = None) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
         pipeline (transfer queue with max-staleness).
@@ -2814,10 +2815,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_train_done:
             self._wait_for_previous_eval()
 
+    @training_rpc
     @manual_gc_training
     @trace_iteration
-    @training_rpc
-    def train_async(self, rollout_id) -> None:
+    def train_async(self, rollout_id: int, *, trace_headers: dict[str, str] | None = None) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
 
@@ -3020,6 +3021,7 @@ class MegatronTrainRayActor(TrainRayActor):
             destroy_process_groups()
 
     @timer
+    @trace_weight_sync
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
@@ -3258,6 +3260,7 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
     @timer
+    @trace_weight_sync
     def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:
         """Fully async version of update_weights, which will be called by actor
         train engine after it train update.

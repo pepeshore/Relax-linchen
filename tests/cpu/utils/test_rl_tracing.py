@@ -34,7 +34,7 @@ def spans(root, name=None):
         for line in path.read_text().splitlines():
             for resource in json.loads(line)["resourceSpans"]:
                 for scope in resource["scopeSpans"]:
-                    assert scope["scope"] == {"name": "relax.rl", "version": "0.17.0"}
+                    assert scope["scope"] == {"name": "relax.rl", "version": "0.18.0"}
                     result.extend(scope["spans"])
     return [span for span in result if name is None or span["name"] == name]
 
@@ -676,7 +676,7 @@ def test_agent_trace_preserves_branches_attempts_and_cross_step_identity(run):
 @pytest.mark.parametrize("identity_kind", ["export", "index"])
 @pytest.mark.parametrize("masked_value", [4.0, float("nan")])
 @pytest.mark.parametrize("full_advantage", [False, True])
-def test_training_rpc_combines_cp_facts_without_duplicate_stage(
+def test_training_rpc_retains_each_cp_shard_on_its_worker(
     run, monkeypatch, masked_value, full_advantage, identity_kind
 ):
     import time
@@ -734,61 +734,35 @@ def test_training_rpc_combines_cp_facts_without_duplicate_stage(
         time.sleep(0.01)  # checkpoint/offload outside the observed window
         cp["rank"] += 10  # live group queries are no longer valid after offload
 
-    reports = []
-    for rank in (0, 1):
-        cp["rank"] = rank
-        reports.append(execute(SimpleNamespace(args=args), 0))
-    before_export = time.time_ns()
-    train.emit_windows(args, reports)
-    record = spans(root, "rl.actor.train")[0]
-    assert len(spans(root, "rl.actor.train")) == 1
+    with tracing.stage(args, "rl.actor.train_step", iteration=0, attributes={"rl.rank.world_size": 2}) as dispatch:
+        for rank in (0, 1):
+            cp["rank"] = rank
+            worker = SimpleNamespace(args=args, role="actor", _rank=rank, _world_size=2)
+            assert execute(worker, 0, trace_headers=dispatch.headers()) is None
+    rank_spans = {r["spanId"]: r for r in spans(root, "rl.actor.train_rank")}
+    stages = spans(root, "rl.actor.train")
+    assert len(stages) == len(rank_spans) == 2
     assert not spans(root, "rl.actor.train.sample")
-    assert attrs(record)["rl.batch.size"] == "1"
-    assert int(record["endTimeUnixNano"]) < before_export
-    result = artifact(record, "rl.train.results")
-    assert result["updates"] == [
-        {"update_id": "generation:actor:0:0", "status": "skipped", "reason": "zero_effective_tokens"}
-    ]
-    assert result["uses"] == [
-        {
-            result_key: "23",
-            "effective_tokens": 2,
-            "update_id": "generation:actor:0:0",
-            "used": True,
-            "advantage_mean": 4.0,
-        }
-    ]
-    assert record.get("status", {}).get("code", 0) == 0
-
-
-def test_incomplete_rank_results_are_not_published_as_complete(run):
-    from relax.utils.rl_train_trace import emit_windows
-
-    args, root = run
-    args.use_agentic_rollout = True
-    rank = {"dp": 0, "cp": 0, "tp": 0, "pp": 0}
-    item = {
-        "name": "rl.actor.train",
-        "sequence": 0,
-        "attributes": {},
-        "owner": True,
-        "rank": rank,
-        "members": ["export:1"],
-        "start_time": 100,
-        "end_time": 200,
-        "updates": [],
-        "records": [],
-    }
-    reports = [
-        {"rl_trace_producer": {"owner": True, "rank": rank}, "rl_trace_windows": [item]},
-        {"rl_trace_producer": {"owner": True, "rank": {**rank, "cp": 1}}, "rl_trace_windows": []},
-    ]
-    emit_windows(args, reports)
-    record = spans(root)[0]
-    assert "rl.train.results" not in attrs(record)
-    assert "rl.train.results_ref" not in attrs(record)
-    assert "missing observation owner" in artifact(record, "relax.observation.partial")["errors"]
-    assert record.get("status", {}).get("code", 0) == 0
+    for record in stages:
+        rank = int(attrs(record)["rl.rank.global"])
+        assert attrs(record)["rl.timing.rank.cp"] == str(rank)
+        assert record["traceId"] == dispatch.context()["trace_id"]
+        assert attrs(rank_spans[record["parentSpanId"]])["rl.rank.global"] == str(rank)
+        assert attrs(record)["rl.batch.size"] == "1"
+        result = artifact(record, "rl.train.results")
+        assert result["updates"] == [
+            {"update_id": "generation:actor:0:0", "status": "skipped", "reason": "zero_effective_tokens"}
+        ]
+        assert result["uses"] == [
+            {
+                result_key: "23",
+                "effective_tokens": 1,
+                "update_id": "generation:actor:0:0",
+                "used": True,
+                "advantage_mean": 2.0 if rank == 0 else 6.0,
+            }
+        ]
+        assert record.get("status", {}).get("code", 0) == 0
 
 
 def test_checkpoint_failure_preserves_finished_training_without_changing_exception(run, monkeypatch):
@@ -814,12 +788,18 @@ def test_checkpoint_failure_preserves_finished_training_without_changing_excepti
                 train.optimizer_result(True)
         raise original
 
-    with pytest.raises(OSError) as caught:
-        execute(SimpleNamespace(args=args), 0)
+    with tracing.stage(args, "rl.actor.train_step", iteration=0) as dispatch:
+        with pytest.raises(OSError) as caught:
+            execute(
+                SimpleNamespace(args=args, role="actor", _rank=0, _world_size=1), 0, trace_headers=dispatch.headers()
+            )
     assert caught.value is original
-    record = spans(root)[0]
+    (record,) = spans(root, "rl.actor.train")
+    (worker,) = spans(root, "rl.actor.train_rank")
+    assert record["parentSpanId"] == worker["spanId"]
+    assert worker["status"]["code"] == 2
     assert record.get("status", {}).get("code", 0) == 0
-    assert artifact(record, "relax.observation.partial")["updates"][0]["status"] == "committed"
+    assert artifact(record, "rl.train.results")["updates"][0]["status"] == "committed"
 
 
 @pytest.mark.parametrize(
@@ -1185,70 +1165,101 @@ def test_generation_context_resets_after_failure(run):
     assert spans(root, "rl.rollout.sample")[0]["status"]["code"] == 2
 
 
-def test_rank_timing_preserves_one_clock_and_full_batch_results(run, monkeypatch):
-    from relax.utils import rl_train_trace as train
-    from scripts.tools.validate_rl_traces import _validate_timing
+def test_dispatch_preserves_async_refs_errors_and_backend_arguments(run, monkeypatch):
+    from concurrent.futures import Future
+
+    from relax.utils.rl_train_trace import dispatch_training
 
     args, root = run
-    names = [
-        "rl.reference.forward",
-        "rl.teacher.forward",
-        "rl.actor.forward",
-        "rl.advantage.compute",
-        "rl.actor.train",
-        "rl.critic.forward",
-        "rl.critic.train",
-    ]
-    reports = []
-    # Rank arrival order and pipeline skew cannot change the chosen producer.
-    for pp, dp, offset in [(0, 0, -900), (3, 1, 900), (3, 0, 0)]:
-        rank = {"pp": pp, "dp": dp, "cp": 0, "tp": 0}
-        windows = [
-            {
-                "name": name,
-                "sequence": 0,
-                "attributes": {},
-                "rank": rank,
-                "owner": pp == 3,
-                "start_time": 1000 + i * 100 + offset,
-                "end_time": 1050 + i * 100 + offset,
-                "host_name": "worker",
-                "process_pid": dp + pp + 1,
-                "updates": [],
-                "records": [],
-                "members": [f"sample:{dp}"],
-            }
-            for i, name in enumerate(names)
-            if name != "rl.advantage.compute" or pp == 3
-        ]
-        reports.append({"rl_trace_producer": {"owner": pp == 3, "rank": rank}, "rl_trace_windows": windows})
-    # Even with a live rollout in the caller, rank windows belong to the training backend.
-    with tracing.rollout_call(args, 0, False):
-        train.emit_windows(args, reports)
-    records = {s["name"]: s for s in spans(root)}
-    for i, name in enumerate(names):
-        record = records[name]
-        _validate_timing(record, attrs(record))
-        assert not record.get("parentSpanId")
-        assert attrs(record)["rl.execution.side"] == "training"
-        assert int(record["startTimeUnixNano"]) == 1000 + i * 100
-        assert int(record["endTimeUnixNano"]) == 1050 + i * 100
-        assert attrs(record)["rl.batch.size"] == "2"
-        assert len(artifact(record, "rl.timing.ranks")) == (2 if name == "rl.advantage.compute" else 3)
-    # A synthetic cross-rank envelope is rejected by the validator.
-    bad = dict(records[names[0]], startTimeUnixNano="100")
-    with pytest.raises(ValueError, match="retain representative timing"):
-        _validate_timing(bad, attrs(bad))
-    # Missing the designated rank must not silently switch to another clock.
-    before = len(spans(root))
-    train.emit_windows(args, reports[:2])
-    assert len(spans(root)) == before
+    futures = [Future(), Future()]
+    refs = [SimpleNamespace(future=lambda future=future: future) for future in futures]
+    calls = []
+
+    def submit(index, step, **kwargs):
+        calls.append((step, kwargs))
+        return refs[index]
+
+    group = SimpleNamespace(
+        args=args,
+        role="critic",
+        _actor_handlers=[SimpleNamespace(train=SimpleNamespace(remote=partial(submit, i))) for i in range(2)],
+    )
+    assert dispatch_training(group, "train", 3) == refs
+    assert calls[0] == calls[1] and "traceparent" in calls[0][1]["trace_headers"]
+    futures[0].set_exception(ValueError("rank 0 failed"))
+    assert not spans(root)
+    futures[1].set_result(None)
+    (parent,) = spans(root, "rl.critic.train_step")
+    assert parent["status"]["code"] == 2
+    assert "rank 0 failed" in parent["status"]["message"]
+    args.train_backend = "fsdp"
+    assert dispatch_training(group, "train", 4) == refs
+    assert calls[-2:] == [(4, {}), (4, {})]
+    args.train_backend = "megatron"
+    monkeypatch.setenv("RELAX_OTEL_ENABLED", "0")
+    assert dispatch_training(group, "train", 5) == refs
+    assert calls[-2:] == [(5, {}), (5, {})]
+    assert len(spans(root)) == 1
+
+
+def test_rank_weight_sync_preserves_sender_link_and_independent_startup(run, monkeypatch):
+    import torch.distributed as dist
+
+    from relax.utils import rl_train_trace as train
+    from relax.utils import rl_weights_trace as weights
+    from scripts.tools.validate_rl_traces import validate
+
+    args, root = run
+    monkeypatch.setitem(sys.modules, "relax.utils.distributed_utils", SimpleNamespace(get_gloo_group=lambda: object()))
+    rank = 0
+    monkeypatch.setattr(dist, "get_rank", lambda group: rank)
+
+    @weights.trace_weight_call
+    def publish(worker):
+        weights.begin_weights(worker)
+        weights.weights_delivered(worker)
+
+    @weights.trace_weight_sync
+    def sync(worker):
+        publish(worker)
+
+    @train.training_rpc
+    @hooks.trace_iteration
+    def execute(worker, rollout_id):
+        sync(worker)
+
+    worker = SimpleNamespace(
+        args=args,
+        role="actor",
+        _rank=0,
+        _world_size=2,
+        weight_version=4,
+        rollout_engines=[SimpleNamespace(_actor_id=b"target")],
+    )
+    sync(worker)
+    with tracing.stage(args, "rl.actor.train_step", iteration=1, attributes={"rl.rank.world_size": 2}) as dispatch:
+        for rank in range(2):
+            worker._rank = rank
+            execute(worker, 1, trace_headers=dispatch.headers())
+    workers = {attrs(s)["rl.rank.global"]: s for s in spans(root, "rl.actor.train_rank")}
+    standalone, first, second = spans(root, "rl.weight.sync")
+    assert not standalone.get("parentSpanId")
+    assert first["parentSpanId"] == workers["0"]["spanId"]
+    assert second["parentSpanId"] == workers["1"]["spanId"]
+    deliveries, loads = spans(root, "rl.actor.publish_weights"), spans(root, "rl.rollout.load_weights")
+    assert len(deliveries) == len(loads) == 2
+    for stage, delivery, activation in zip((standalone, first), deliveries, loads, strict=True):
+        assert stage["spanId"] == delivery["parentSpanId"] == activation["parentSpanId"]
+        assert stage["traceId"] == delivery["traceId"] == activation["traceId"]
+        assert activation["links"][0]["spanId"] == delivery["spanId"]
+        assert attrs(delivery)["rl.weight.transfer.id"] == attrs(activation)["rl.weight.transfer.id"]
+    validate(root)
 
 
 def test_advantage_excludes_pipeline_noop_without_changing_call(run, monkeypatch):
     from relax.utils import rl_train_trace as train
 
-    args, _ = run
+    args, root = run
     args.advantage_estimator = "grpo"
     rank = {"pp": 0}
     mpu = SimpleNamespace(
@@ -1270,16 +1281,24 @@ def test_advantage_excludes_pipeline_noop_without_changing_call(run, monkeypatch
     def execute(owner, rollout_id):
         compute(args, {"rollout_log_probs": [1.0]})
 
-    assert execute(SimpleNamespace(args=args), 0)["rl_trace_windows"] == []
-    rank["pp"] = 3
-    assert len(execute(SimpleNamespace(args=args), 0)["rl_trace_windows"]) == 1
+    with tracing.stage(args, "rl.actor.train_step", iteration=0) as dispatch:
+        for i in (0, 3):
+            rank["pp"] = i
+            execute(
+                SimpleNamespace(args=args, role="actor", _rank=i, _world_size=4), 0, trace_headers=dispatch.headers()
+            )
+    workers = spans(root, "rl.actor.train_rank")
+    assert len(workers) == 2
+    (advantage,) = spans(root, "rl.advantage.compute")
+    assert attrs(advantage)["rl.rank.global"] == "3"
+    assert advantage["parentSpanId"] == workers[1]["spanId"]
     assert calls == [0, 3]
 
 
 def test_async_training_starts_at_train_call_not_rpc_entry(run, monkeypatch):
     from relax.utils import rl_train_trace as train
 
-    args, _ = run
+    args, root = run
     args.advantage_estimator = "grpo"
     clock = {"now": 100}
     monkeypatch.setattr(train.time, "time_ns", lambda: clock["now"])
@@ -1299,9 +1318,15 @@ def test_async_training_starts_at_train_call_not_rpc_entry(run, monkeypatch):
             clock["now"] = 600
         clock["now"] = 900  # checkpoint/export after train
 
-    report = train_async(SimpleNamespace(args=args), 0)
-    assert report["rl_trace_windows"][0]["start_time"] == 500
-    assert report["rl_trace_windows"][0]["end_time"] == 600
+    with tracing.stage(args, "rl.actor.train_step", iteration=0) as dispatch:
+        train_async(
+            SimpleNamespace(args=args, role="actor", _rank=0, _world_size=1), 0, trace_headers=dispatch.headers()
+        )
+    (operation,) = spans(root, "rl.actor.train")
+    assert int(operation["startTimeUnixNano"]) == 500
+    assert int(operation["endTimeUnixNano"]) == 600
+    (worker,) = spans(root, "rl.actor.train_rank")
+    assert int(worker["endTimeUnixNano"]) == 900
 
 
 def test_filter_excludes_result_serialization_time(run, monkeypatch):

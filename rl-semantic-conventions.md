@@ -2,7 +2,7 @@
 
 **Status:** Development
 
-**Version:** 0.17.0
+**Version:** 0.18.0
 
 **Date:** 2026-11-10
 
@@ -33,21 +33,21 @@ Role 表示逻辑职责，如 actor、rollout、reference；它不是所有框�
 
 ## 2 通用要求
 
-阶段 span 由掌握操作边界的一方记录一次，保留原生起止，包括该调用内部的通信、等待和重试。提交成功不代表 GPU 工作完成；未执行的阶段不生成占位 span。分布式结果可全量汇总，计时来源必须另行说明，不能将不同 rank 的最早开始与最晚结束拼成一次实际调用，也不能累加 rank 耗时。
+阶段 span 由掌握操作边界的一方记录一次，保留原生起止，包括该调用内部的通信、等待和重试。提交成功不代表 GPU 工作完成；未执行的阶段不生成占位 span。训练请求和各 rank 分别记录本地时间，不能将不同 rank 的最早开始与最晚结束拼成一次实际调用，也不能累加 rank 耗时。
 
 ### 计时口径
 
 Relax 记录 host wall-clock 调用时间，不是 CUDA kernel 时间。异步 GPU 工作可能在 host 函数返回后继续执行；不得为 trace 新增 barrier、CUDA synchronize 或调整已有训练调度。同一 rank 的串行调用应保留实际先后顺序，不根据图形裁剪或平移 span。
 
-| Key                                         | Stability   | Requirement Level             | Value Type | Description                                                                                                                                         |
-| ------------------------------------------- | ----------- | ----------------------------- | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `rl.timing.clock`                           | Development | Required                      | string     | 当前 RL 实现为 `host_wall`，不表示 GPU 时间                                                                                                         |
-| `rl.timing.scope`                           | Development | Required                      | string     | `operation`：实际调用生命周期；`representative_rank`：固定代表 rank 的调用；`source_sync`：源端观察到的权重同步边界                                 |
-| `rl.timing.rank.dp` / `.cp` / `.tp` / `.pp` | Development | Required：representative_rank | int        | 计时来源的并行 rank，不是导出协调器的 rank                                                                                                          |
-| `rl.timing.rank_count`                      | Development | Required：representative_rank | int        | 本次实际参与并上报该操作时间的 rank 数                                                                                                              |
-| `rl.timing.ranks`                           | Development | Required：representative_rank | string     | 完整 JSON 数组，每项含 rank、host_name、process_pid、start_time_unix_nano、end_time_unix_nano、representative；纳秒时间用十进制 string 避免精度丢失 |
+| Key                                         | Stability   | Requirement Level              | Value Type | Description                                                                                                      |
+| ------------------------------------------- | ----------- | ------------------------------ | ---------- | ---------------------------------------------------------------------------------------------------------------- |
+| `rl.timing.clock`                           | Development | Required                       | string     | 当前 RL 实现为 `host_wall`，不表示 GPU 时间                                                                      |
+| `rl.timing.scope`                           | Development | Required                       | string     | `operation` 为一次调用，`rank_local` 为 Megatron worker 本地调用，`source_sync` 为发送方观察到的权重交付或激活。 |
+| `rl.rank.global`                            | Development | Required：rank 及其训练阶段    | int        | Ray 训练组分配的全局 rank。                                                                                      |
+| `rl.rank.world_size`                        | Development | Required：训练请求和 rank 入口 | int        | 该请求派发的 rank 数或 worker 所在组的规模。                                                                     |
+| `rl.timing.rank.dp` / `.cp` / `.tp` / `.pp` | Development | Conditionally Required         | int        | 进入实际计算时从可用的 Megatron 并行组读取的本地坐标。                                                           |
 
-Megatron 训练 RPC 内的 reference／teacher／actor／critic forward、advantage 和 actor／critic train 使用同一个固定来源：DP0、CP0、TP0、最后一个 PP stage。主 span 的起止必须与其 `rl.timing.ranks` 中唯一 representative 项完全一致。各 DP／CP 的业务结果继续全量合并，`rl.batch.size` 仍是实际批次成员数，不缩成代表 rank 的成员数。其他 rank 的时间仅作诊断，不参与主 span 起止。缺少指定来源时省略该阶段并记录诊断，不临时改用另一个 rank；不完整业务结果沿用 `relax.observation.partial`。
+Relax 在 Ray 训练组分发一次 Megatron 请求时创建一个 `rl.actor.train_step` 或 `rl.critic.train_step`。起点为分发开始，终点为发送端观察到所有已派发 RPC 完成；同步提交失败时结束并记录错误。这个 span 使用框架进程的时钟。每个收到请求的进程在 RPC 入口创建 `rl.actor.train_rank` 或 `rl.critic.train_rank`，以请求的 W3C traceparent 为直接 parent，使用本进程时钟计时、落盘。rank 的 reference／teacher／actor／critic forward、advantage、actor／critic train 直接挂在本 rank 入口下。每个阶段只记录实际执行时间、本地成员和本地可获取的结果；CP 的 token 数和均值是本分片数据。无法确认成员时省略 batch.size 和相应成员明细。0.13–0.17 历史数据使用代表 rank 和 `rl.timing.ranks`。
 
 advantage 只采集真正执行计算的末级 PP，其他 PP 的直接返回不是计算。异步独立 forward 仍按实际 DP 分区调用记录，属于 `operation`，不能冒充全局批次耗时。无 rank 汇总的 rollout、reward、Agent、过滤、数据传输和 CPU advantage 记录各自实际生命周期。跨主机调用比较需要时钟同步；图中的重叠本身不证明 GPU 并行。
 
@@ -73,13 +73,13 @@ span 名称固定，不拼接 Run、Step、rank、模型名或请求内容。角
 
 属性按事实所属的阶段记录，不向后续 span 复制整套上下文：
 
-| 属性                             | 记录位置                                                                                                             | 口径                                                                                               |
-| -------------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `rl.batch.id`、`rl.batch.size`   | 所有批次操作 span                                                                                                    | 各阶段记录自身实际输入集合身份与成员数；真实子操作 span 只记录所属 batch.id，不重复记录 batch.size |
-| `rl.execution.side`              | 本次 rollout 拥有的评分批次、动态过滤、队列写入、自定义 advantage、OPD 前向；训练侧的前向、优势及代表 rank 训练 span | string：`rollout` 或 `training`，表示实际执行侧。独立调用且执行侧未知时省略。                      |
-| `rl.purpose`                     | rollout、样本、Agent、评分及已确定归属的 rollout 子阶段                                                              | `training` 或 `evaluation`，描述采样用途                                                           |
-| `rl.algorithm.name`              | `rl.actor.train`                                                                                                     | 记录本轮策略训练算法；优势阶段单独记录实际 estimator，Critic 不重复复制策略算法名                  |
-| 评分、优势、过滤、传输和训练结果 | 各自执行该操作的 span                                                                                                | 保留逐 Export／Update 结果，后续按对象 ID 关联，不复制到 Agent span                                |
+| 属性                             | 记录位置                                                                                                                                | 口径                                                                                               |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `rl.batch.id`、`rl.batch.size`   | 所有批次操作 span                                                                                                                       | 各阶段记录自身实际输入集合身份与成员数；真实子操作 span 只记录所属 batch.id，不重复记录 batch.size |
+| `rl.execution.side`              | 本次 rollout 拥有的评分批次、动态过滤、队列写入、自定义 advantage、OPD 前向；训练侧的前向、优势及训练请求、rank 入口和各 rank 训练 span | string：`rollout` 或 `training`，表示实际执行侧。独立调用且执行侧未知时省略。                      |
+| `rl.purpose`                     | rollout、样本、Agent、评分及已确定归属的 rollout 子阶段                                                                                 | `training` 或 `evaluation`，描述采样用途                                                           |
+| `rl.algorithm.name`              | `rl.actor.train`                                                                                                                        | 记录本轮策略训练算法；优势阶段单独记录实际 estimator，Critic 不重复复制策略算法名                  |
+| 评分、优势、过滤、传输和训练结果 | 各自执行该操作的 span                                                                                                                   | 保留逐 Export／Update 结果，后续按对象 ID 关联，不复制到 Agent span                                |
 
 生成批次以输入任务为成员，训练批次以实际接纳的训练样本为成员，不能直接沿用生成批次的 ID 或数量。Actor 和 Critic 分别记录自身实际接纳的批次；仅在样本身份和成员集合完全一致时才可使用相同批次 ID。批次规模描述本阶段工作量，不能将各阶段的 size 相加作为全局样本总数。
 
@@ -93,9 +93,9 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 4. **上下文传递。** 跨进程、线程、队列及权重交付时，按实际关系传递 Context：符合第 1 条的共同上游 Context 可用于创建同级阶段、复用 traceId；rollout 内发起的阶段在实际开始时使用所属 rollout 的 Context 作为 parent，样本或其他数据来源的 Context 用于 Link。创建时已知的依赖直接加入 Links，执行中确认的依赖在 span 结束前追加；不修改已经结束的来源 span。来源未被采集或上下文确实不可取得时，保留已有业务 ID 和明细，不根据 Run／Step／Export ID 生成虚假的 traceId 或 spanId。
 5. **后端工作的 RL 封装。** SGLang、Megatron 的后端工作必须归属于负责该次操作的 RL 框架 span，由该 span 记录框架侧调用的完整起止与结果。直接复用本规范已有的阶段 span，不为每个后端内部 span 另建 RL 包装 span。例如，策略训练归属于 `rl.actor.train`，价值训练归属于 `rl.critic.train`，独立前向归属于对应的 forward span；普通生成归属于 `rl.rollout.sample`，其 parent 为首次接纳的 `rl.rollout.generate`；Agent 调用中的生成归属于 `rl.agent.run`，其 parent 是对应 sample。
 6. **SGLang 推理父子关系。** SGLang 请求入口 span 继承负责本次调用的 RL span 的 traceId，并将其作为 parent：普通生成指向 `rl.rollout.sample`，Agentic 模型请求使用第 2 章下述回调规则。通过 HTTP `traceparent`／`tracestate` 传递真实 SpanContext，在进入 Ray HTTP worker 或 router 前完成注入；中间层应保留该上下文。SGLang 内部 spans 保持原有名称和父子树，不为每个内部 span 再创建 RL 包装。单个 sample／Agent 可以包含多次请求，它们可以经不同的 Agent 应用 span 归属于同一个 RL span；重试和恢复不把请求挂到其他样本。若启用 router 自身 tracing，允许真实的 router span 位于 RL 与 SGLang 之间，并保持可追溯的父链。
-7. **其他后端与耗时。** 其他后端（如 Megatron）仍可使用独立 trace，通过入口 Span Link 指向负责该操作的 RL span；当前未实现 Megatron 内部 trace 的自动关联。SGLang 与 RL 共享 trace 后，一条 rollout 批次 trace 可以包含多个样本及其推理细节，不再要求这些 SGLang 请求使用独立 trace。各阶段保留真实起止；父子、并行阶段及 RL／后端耗时不能相加作为 Step 总耗时。
+7. **其他后端与耗时。** 其他后端（如 Megatron）仍可使用独立 trace，通过入口 Span Link 指向负责该操作的 RL span；Relax 的 Megatron 训练 RPC 通过 W3C 上下文关联各 rank 和本地阶段；外部 Megatron profiler 事件仍按其自身采集边界解释。SGLang 与 RL 共享 trace 后，一条 rollout 批次 trace 可以包含多个样本及其推理细节，不再要求这些 SGLang 请求使用独立 trace。各阶段保留真实起止；父子、并行阶段及 RL／后端耗时不能相加作为 Step 总耗时。
 
-**当前实现范围（Relax RL 0.17.0）：** 内置普通 rollout、`GenerateState.post_generate` 和 Agentic SGLang adapter 注入上述 W3C 上下文。RL tracing 关闭或无有效来源 span 时不注入。现有路由 headers 保留；独立并发样本／Session 的上下文相互隔离。自定义生成若绕过这些入口、自行调用 HTTP 客户端，需使用相同的 `inference_headers` 辅助函数。
+**当前实现范围（Relax RL 0.18.0）：** 内置普通 rollout、`GenerateState.post_generate` 和 Agentic SGLang adapter 注入上述 W3C 上下文。RL tracing 关闭或无有效来源 span 时不注入。现有路由 headers 保留；独立并发样本／Session 的上下文相互隔离。自定义生成若绕过这些入口、自行调用 HTTP 客户端，需使用相同的 `inference_headers` 辅助函数。
 
 SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL 的进程内文件 exporter 自动写出。采集两端后按 `(traceId, spanId, parentSpanId)` 还原父子关系；`rl.run.id`／`rl.step.id` 等属性不会由 parent 自动复制，可沿父链定位所属 RL span。不要用时间接近或业务 ID 伪造父关系。
 
@@ -169,6 +169,12 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 Agentic 常驻任务在操作开始时固定 parent 和 Step。上一轮启动并跨轮完成的操作保留原归属。恢复后新启动的操作归当时的 rollout。在两轮之间独立开始、没有活动调用的操作省略 parent 和未知 Step。写队列回填旧分区时，`rl.step.id` 属于发起本次写入的 rollout，`rl.transfer.target.step_id` 表示实际写入的目标。rollout 函数返回后调用的样本过滤回调不在该调用范围内。
 
 训练侧 Megatron 的前向和优势计算、独立 Advantages 服务均标为 `training`，保留各自的调用边界与原生计时。例如，训练侧的 `rl.actor.forward` 可以是 `old_policy` 或 `distillation`；rollout 侧的 OPD student prefill 使用 `distillation`。按 `rl.execution.side` 区分谁执行，按 `rl.forward.purpose` 区分计算用途。一次训练采样中的 rollout 子操作可以同时具有 `rl.execution.side=rollout` 和 `rl.purpose=training`。
+
+### 问答：一个训练请求如何对应多个 Megatron 进程？
+
+展开 `rl.actor.train_step` 或 `rl.critic.train_step`，每个实际收到请求的 rank 都有一个同 trace 的直接子 span。按 `rl.rank.global` 选 rank，按 OTel Resource 的 `host.name`、`process.pid` 找到实际 worker。没有执行计算的 rank 仍有 RPC span，只展开它实际执行的阶段。训练组返回原有 Ray ObjectRef；框架不会收集各 rank 的阶段报告来重建时间线。异常在发生的层级记录；worker 进程硬退出前尚未结束的 span 可能缺失。
+
+训练 RPC 中实际发起权重同步时，各参与 rank 用 `rl.weight.sync` 记录自己的同步调用。发送端 rank 0 已有的 `rl.actor.publish_weights` 和 `rl.rollout.load_weights` 直接挂到它的 sync，并保留交付 Link。独立于训练请求的同步由发起侧 rank 0 记录一个 sync 根。FSDP 和独立提交的前向服务沿用各自入口。
 
 ## 3 核心阶段 span
 
@@ -445,7 +451,7 @@ Agentic 常驻任务在操作开始时固定 parent 和 Step。上一轮启动�
 
 该 span 表示对有界批次或流式输入窗口执行策略训练，包含带梯度前向、loss、反向、梯度累积和优化器更新决策。
 
-从接纳本次训练输入／窗口并开始训练，到该窗口更新流程完成，或失败／取消处理结束。Relax 的代表 rank 从实际 train 调用入口开始，调用内流式取数等待计入 host 时间；RPC 入口、调用前准备／预取（包括 dynamic+VPP 的整桶预取）、权重发布、checkpoint 和训练后 offload 不在此边界内。
+从接纳本次训练输入／窗口并开始训练，到该窗口更新流程完成，或失败／取消处理结束。Relax 的每个参与 rank 从本地实际 train 调用入口开始，调用内流式取数等待计入 host 时间；RPC 入口、调用前准备／预取（包括 dynamic+VPP 的整桶预取）、权重发布、checkpoint 和训练后 offload 不在此边界内。
 
 **Span kind:** `INTERNAL`。
 
@@ -471,7 +477,7 @@ Agentic 常驻任务在操作开始时固定 parent 和 Step。上一轮启动�
 | `rl.model.version.after`  | Development | Conditionally Required：结束时一致版本可确认   | string     | 实际结束版本；全部更新跳过时可与 before 相同，失败后不确定则省略。         | `snapshot-49`                                                                                                                                             |
 | `rl.train.results`        | Development | Required：对应结果可取得时                     | string     | 逐 Update 结果及逐 Export 的实际训练消费关系。\[1\] 值为完整 JSON 字符串。 | `{"updates":[{"update_id":"update-1","status":"committed"}],"uses":[{"export_id":"export-1","update_id":"update-1","used":true,"effective_tokens":158}]}` |
 
-**\[1\] `rl.train.results`:** 包含 updates 和 uses 两个列表。updates 保存 update_id、已确认的 status（committed／skipped／failed）、reason，以及可获得的后端 span_context、source_name、start_time、end_time。uses 保存每个成员与 update_id 的实际消费关系，成员使用真实 export_id 或 sample_index 标识，并记录 used、最终 effective_tokens 和可取得的 advantage_mean，保留多 epoch 的多次消费关系。uses 和 updates 都是 JSON 结果记录，不生成逐样本 train span；共享更新结果不代表每个样本有独立的训练耗时。
+**\[1\] `rl.train.results`:** 可取得时包含 updates 和 uses 两个列表；rank 只写自身可观测的结果。updates 保存 update_id、已确认的 status（committed／skipped／failed）、reason，以及可获得的后端 span_context、source_name、start_time、end_time。uses 保存每个成员与 update_id 的实际消费关系，成员使用真实 export_id 或 sample_index 标识，并记录 used、最终 effective_tokens 和可取得的 advantage_mean，保留多 epoch 的多次消费关系。uses 和 updates 都是 JSON 结果记录，不生成逐样本 train span；共享更新结果不代表每个样本有独立的训练耗时。
 
 更新是否提交取自真实决策，不能由训练函数正常返回推断。used=true、有效 token 大于 0、参数更新已提交是不同事实。时间只引用已有后端记录，不新增 optimizer span，也不能把 train_batch 整段冒充纯 optimizer 耗时。
 
@@ -506,7 +512,7 @@ Agentic 常驻任务在操作开始时固定 parent 和 Step。上一轮启动�
 | `rl.model.version.after`  | Development | Conditionally Required：结束时一致版本可确认   | string     | 实际结束版本；全部更新跳过时可与 before 相同，失败后不确定则省略。         | `snapshot-49`                                                                                                                                             |
 | `rl.train.results`        | Development | Required：对应结果可取得时                     | string     | 逐 Update 结果及逐 Export 的实际训练消费关系。\[1\] 值为完整 JSON 字符串。 | `{"updates":[{"update_id":"update-1","status":"committed"}],"uses":[{"export_id":"export-1","update_id":"update-1","used":true,"effective_tokens":158}]}` |
 
-**\[1\] `rl.train.results`:** 包含 updates 和 uses 两个列表。updates 保存 update_id、已确认的 status（committed／skipped／failed）、reason，以及可获得的后端 span_context、source_name、start_time、end_time。uses 保存每个成员与 update_id 的实际消费关系，成员使用真实 export_id 或 sample_index 标识，并记录 used、最终 effective_tokens 和可取得的 advantage_mean，保留多 epoch 的多次消费关系。uses 和 updates 都是 JSON 结果记录，不生成逐样本 train span；共享更新结果不代表每个样本有独立的训练耗时。
+**\[1\] `rl.train.results`:** 可取得时包含 updates 和 uses 两个列表；rank 只写自身可观测的结果。updates 保存 update_id、已确认的 status（committed／skipped／failed）、reason，以及可获得的后端 span_context、source_name、start_time、end_time。uses 保存每个成员与 update_id 的实际消费关系，成员使用真实 export_id 或 sample_index 标识，并记录 used、最终 effective_tokens 和可取得的 advantage_mean，保留多 epoch 的多次消费关系。uses 和 updates 都是 JSON 结果记录，不生成逐样本 train span；共享更新结果不代表每个样本有独立的训练耗时。
 
 更新是否提交取自真实决策，不能由训练函数正常返回推断。used=true、有效 token 大于 0、参数更新已提交是不同事实。时间只引用已有后端记录，不新增 optimizer span，也不能把 train_batch 整段冒充纯 optimizer 耗时。
 

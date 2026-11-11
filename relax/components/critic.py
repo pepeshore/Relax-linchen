@@ -115,10 +115,7 @@ class Critic(Base):
             # and keeps the historical fire-and-forget.
             train_ref = self.critic_model.async_train(self.step)
             if has_critic:
-                trace_reports = ray.get(train_ref)
-                from relax.utils.rl_train_trace import emit_windows
-
-                emit_windows(self.config, trace_reports)
+                ray.get(train_ref)
             # Note: save_model runs inside ``train_critic`` (backend) while the
             # model is still awake, so no explicit save call here.
 

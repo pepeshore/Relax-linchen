@@ -5,11 +5,34 @@
 from __future__ import annotations
 
 from functools import wraps
+from inspect import signature
 from typing import Any, Callable
 from uuid import uuid4
 
 from relax.utils.agentic_obs.writers import best_effort
-from relax.utils.rl_tracing import Stage, enabled, model_name
+from relax.utils.rl_tracing import Stage, current_stage, enabled, model_name, stage
+from relax.utils.rl_train_trace import current_rank_span
+
+
+def trace_weight_sync(function: Callable) -> Callable:
+    parameters = signature(function)
+
+    @wraps(function)
+    def call(owner: Any, *args: Any, **kwargs: Any) -> Any:
+        rank = current_rank_span()
+        if not enabled(owner.args) or (rank is None and owner._rank != 0):
+            return function(owner, *args, **kwargs)
+        if function.__name__ == "update_weights_fully_async":
+            flags = parameters.bind(owner, *args, **kwargs).arguments
+            if flags.get("actor_fwd_only") and flags.get("rollout_only"):
+                return function(owner, *args, **kwargs)
+        elif getattr(owner.args, "debug_train_only", False) or getattr(owner.args, "debug_rollout_only", False):
+            return function(owner, *args, **kwargs)
+        attrs = {"rl.execution.side": "training", "rl.rank.global": owner._rank, "rl.backend.name": "megatron"}
+        with stage(owner.args, "rl.weight.sync", parent=rank, attributes=attrs):
+            return function(owner, *args, **kwargs)
+
+    return call
 
 
 def trace_weight_call(function: Callable) -> Callable:
@@ -58,10 +81,15 @@ def begin_weights(owner: Any) -> None:
         "rl.model.version": str(owner.weight_version),
         "rl.weight.transfer.id": uuid4().hex,
     }
-    publication = Stage(owner.args, "rl.actor.publish_weights", attributes={**attrs, "rl.backend.name": "megatron"})
+    sync = current_stage()
+    parent = sync if sync is not None and sync.name == "rl.weight.sync" else None
+    publication = Stage(
+        owner.args, "rl.actor.publish_weights", parent=parent, attributes={**attrs, "rl.backend.name": "megatron"}
+    )
     activation = Stage(
         owner.args,
         "rl.rollout.load_weights",
+        parent=parent,
         attributes={
             **attrs,
             "rl.backend.name": "sglang",
