@@ -33,6 +33,21 @@ _PURPOSE: ContextVar[str] = ContextVar("rl_purpose", default="training")
 _GENERATION_BATCH: ContextVar[GenerationBatch | None] = ContextVar("rl_generation_batch", default=None)
 _REWARD_BATCH: ContextVar[RewardBatch | None] = ContextVar("rl_reward_batch", default=None)
 
+_RESIDENT_REWARD_PARENT: ContextVar[Callable[[], Stage | None] | None] = ContextVar(
+    "rl_resident_reward_parent", default=None
+)
+
+
+@contextmanager
+def resident_reward_parent(get_parent: Callable[[], Stage | None]) -> Iterator[None]:
+    """Resolve a resident Group's owner when scoring actually starts after a
+    resume."""
+    token = _RESIDENT_REWARD_PARENT.set(get_parent)
+    try:
+        yield
+    finally:
+        _RESIDENT_REWARD_PARENT.reset(token)
+
 
 def trace_iteration(function: Callable) -> Callable:
     signature = inspect.signature(function)
@@ -126,7 +141,7 @@ class GenerationBatch:
 
     def reward_batch(self) -> RewardBatch:
         if self.reward is None:
-            self.reward = RewardBatch(self.args, [], self.evaluation)
+            self.reward = RewardBatch(self.args, [], self.evaluation, parent=self.observation)
         return self.reward
 
     def close_rewards(self) -> None:
@@ -405,7 +420,7 @@ def record_reward_route(sample: Any, name: str, kind: str) -> None:
 class RewardBatch:
     """One actual scoring window, with independently timed member calls."""
 
-    def __init__(self, args: Any, samples: list[Any], evaluation: bool) -> None:
+    def __init__(self, args: Any, samples: list[Any], evaluation: bool, *, parent: Stage | None = None) -> None:
         self.args = args
         self.samples: list[Any] = []
         self.routes: dict[int, tuple[str, str]] = {}
@@ -414,11 +429,24 @@ class RewardBatch:
         self.sealed = False
         self.error: BaseException | None = None
         self.end_time: int | None = None
+        if parent is None:
+            resident_parent = _RESIDENT_REWARD_PARENT.get()
+            if resident_parent is not None:
+                parent = resident_parent()
+            elif (rollout := current_rollout()) is not None:
+                parent = rollout.span
+        ownership = parent.child_attributes() if parent is not None else {}
         self.observation = Stage(
             args,
             "rl.reward.batch",
+            parent=parent,
             attributes={
                 **reward_attributes(args, evaluation),
+                **{
+                    key: ownership[key]
+                    for key in ("rl.purpose", "rl.step.id", "rl.iteration.index")
+                    if key in ownership
+                },
                 "rl.batch.id": uuid.uuid4().hex,
             },
         )

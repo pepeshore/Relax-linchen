@@ -51,8 +51,8 @@ from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_values
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
-from relax.utils.rl_trace_hooks import trace_iteration
-from relax.utils.rl_tracing import iteration_context
+from relax.utils.rl_trace_hooks import resident_reward_parent, trace_iteration
+from relax.utils.rl_tracing import Stage, current_rollout, iteration_context
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
 from relax.utils.types import Sample
@@ -288,6 +288,7 @@ class AgenticResidentPipeline:
         self._group_observations: dict[asyncio.Task[Optional[GroupExport]], _GroupObservation] = {}
         self._finalized_groups: Deque[GroupExport] = deque()
         self._active_step: Optional[_StepContext] = None
+        self._reward_parent: Stage | None = None
         self._stage_recorder = StageRecorder(args)
 
     def snapshot(self) -> dict[str, object]:
@@ -314,6 +315,8 @@ class AgenticResidentPipeline:
         """Generate one rollout step while resident Group refs may cross
         steps."""
 
+        rollout = current_rollout()
+        self._reward_parent = rollout.span if rollout is not None else None
         started_at = time.monotonic()
         await start_sglang_profile(self.args, rollout_id)
         profile_stopped = False
@@ -336,7 +339,9 @@ class AgenticResidentPipeline:
             self.prepare_domain.open_step(
                 prelaunch_next_step=self.args.agentic_prelaunch and rollout_id + 1 < self.args.num_rollout
             )
-            output = await self._run_rollout_step(context)
+            # Resident tasks inherit the lookup and may submit new scores in a later rollout.
+            with resident_reward_parent(lambda: self._reward_parent):
+                output = await self._run_rollout_step(context)
             self._finish_step_progress(context)
             step_progress_finished = True
 

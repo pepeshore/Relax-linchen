@@ -34,7 +34,7 @@ def spans(root, name=None):
         for line in path.read_text().splitlines():
             for resource in json.loads(line)["resourceSpans"]:
                 for scope in resource["scopeSpans"]:
-                    assert scope["scope"] == {"name": "relax.rl", "version": "0.14.0"}
+                    assert scope["scope"] == {"name": "relax.rl", "version": "0.15.0"}
                     result.extend(scope["spans"])
     return [span for span in result if name is None or span["name"] == name]
 
@@ -204,6 +204,7 @@ def test_generation_batch_records_128_inputs_without_waiting_for_rewards(run):
     assert len(samples) == 128
     assert all(s["parentSpanId"] == generation["spanId"] and s["traceId"] == generation["traceId"] for s in samples)
     (reward_batch,) = spans(root, "rl.reward.batch")
+    assert (reward_batch["traceId"], reward_batch["parentSpanId"]) == (generation["traceId"], generation["spanId"])
     assert attrs(reward_batch)["rl.batch.size"] == "128"
     assert all(
         s["parentSpanId"] == reward_batch["spanId"] and s["traceId"] == reward_batch["traceId"] for s in rewards
@@ -485,7 +486,7 @@ def test_real_batched_reward_entrypoint_has_one_parent(run, monkeypatch):
     monkeypatch.setattr(rewards, "_get_reward_executor", lambda args: SimpleNamespace(execute=execute))
     assert asyncio.run(rewards.batched_async_rm(args, [sample(), sample()])) == [1.0, 1.0]
     (record,) = spans(root, "rl.reward.batch")
-    assert record["name"] == "rl.reward.batch"
+    assert not record.get("parentSpanId")
     assert len(artifact(record, "rl.reward.results")) == 2
 
 
@@ -1039,6 +1040,23 @@ def test_validator_rejects_synthetic_result_spans_in_new_scope(run):
         validate(root)
 
 
+def test_validator_rejects_reward_batch_parented_to_sample(run):
+    from scripts.tools.validate_rl_traces import validate
+
+    args, root = run
+    with tracing.stage(args, "rl.rollout.generate", attributes={"rl.batch.id": "rollout"}) as rollout:
+        with tracing.stage(
+            args,
+            "rl.rollout.sample",
+            parent=rollout,
+            attributes={"rl.batch.id": "rollout", "rl.sample.timing": "operation"},
+        ) as detail:
+            with tracing.stage(args, "rl.reward.batch", parent=detail, attributes={"rl.batch.id": "reward"}):
+                pass
+    with pytest.raises(ValueError, match="direct child of rl.rollout.generate"):
+        validate(root)
+
+
 def test_inference_headers_use_explicit_parent_without_mutating_routing(run, monkeypatch):
     from opentelemetry.trace import get_current_span
     from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
@@ -1301,6 +1319,7 @@ def test_custom_reward_batch_times_postprocessing_and_excludes_result_serializat
 @pytest.mark.parametrize("evaluation", [False, True])
 def test_framework_rollout_owns_multiple_submissions(run, evaluation):
     from relax.engine.rollout.base_types import call_rollout_fn
+    from scripts.tools.validate_rl_traces import validate
 
     args, root = run
     values = [sample() for _ in range(4)]
@@ -1313,11 +1332,18 @@ def test_framework_rollout_owns_multiple_submissions(run, evaluation):
         await asyncio.sleep(0)
         return value
 
+    @hooks.trace_reward
+    async def score(args, value):
+        return 1.0
+
+    async def pipeline(value):
+        await score(args, await generate(None, args, value))
+
     async def collect():
         for offset in range(0, 4, 2):
             with hooks.generation_batch(args, evaluation=evaluation):
                 tasks = [
-                    hooks.track_generation_task(asyncio.create_task(generate(None, args, value)), [value])
+                    hooks.track_generation_task(asyncio.create_task(pipeline(value)), [value])
                     for value in values[offset : offset + 2]
                 ]
             await asyncio.gather(*tasks)
@@ -1334,6 +1360,73 @@ def test_framework_rollout_owns_multiple_submissions(run, evaluation):
     assert sorted(attrs(s)["rl.group.id"] for s in details) == ["0", "0", "1", "1"]
     assert all(s["parentSpanId"] == batch["spanId"] and s["traceId"] == batch["traceId"] for s in details)
     assert all(int(s["endTimeUnixNano"]) <= int(batch["endTimeUnixNano"]) for s in details)
+
+    rewards = spans(root, "rl.reward.batch")
+    assert len(rewards) == 2
+    assert len({attrs(item)["rl.batch.id"] for item in [batch, *rewards]}) == 3
+    scores = spans(root, "rl.reward.score")
+    assert len(scores) == 4
+    for reward in rewards:
+        assert (reward["traceId"], reward["parentSpanId"]) == (batch["traceId"], batch["spanId"])
+        assert attrs(reward)["rl.step.id"] == "iteration:3"
+        assert attrs(reward)["rl.purpose"] == attrs(batch)["rl.purpose"]
+        assert attrs(reward)["rl.batch.size"] == "2"
+        assert sum(s["parentSpanId"] == reward["spanId"] for s in scores) == 2
+    assert {s["links"][0]["spanId"] for s in scores} == {s["spanId"] for s in details}
+    validate(root)
+
+
+def test_agentic_resident_scoring_belongs_to_rollout_at_submission(run, monkeypatch):
+    from relax.agentic.pipeline.reward import RewardDomain
+    from relax.engine import rewards
+    from scripts.tools.validate_rl_traces import validate
+
+    args, root = run
+    args.use_agentic_rollout = True
+    args.group_rm = False
+    args.agentic_custom_advantage_path = None
+    domain = RewardDomain(args, "train", None)
+    values = [sample() for _ in range(3)]
+    for value in values:
+        value.reward = None
+
+    async def execute():
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        async def score(args, value):
+            if value is values[0]:
+                started.set()
+                await resume.wait()
+            return 1.0
+
+        monkeypatch.setattr(rewards, "_get_reward_executor", lambda args: SimpleNamespace(execute=score))
+
+        async def score_exports():
+            await domain._score_sample(values[0])
+            await domain.score_group(SimpleNamespace(samples=values[1:]))
+
+        with tracing.rollout_call(args, 0, False) as first:
+            owner = first.span
+            with hooks.resident_reward_parent(lambda: owner):
+                task = asyncio.create_task(score_exports())
+            await started.wait()
+        with tracing.rollout_call(args, 1, False) as second:
+            owner = second.span
+            resume.set()
+            await task
+            await domain._score_sample(values[0])  # An export with an existing reward skips the scorer.
+
+    asyncio.run(execute())
+    assert [value.reward for value in values] == [1.0, 1.0, 1.0]
+    roots = {attrs(s)["rl.step.id"]: s for s in spans(root, "rl.rollout.generate")}
+    batches = spans(root, "rl.reward.batch")
+    assert len(batches) == 2
+    for size, name in [("1", "iteration:0"), ("2", "iteration:1")]:
+        (batch,) = [s for s in batches if attrs(s)["rl.batch.size"] == size]
+        assert attrs(batch)["rl.step.id"] == name
+        assert (batch["traceId"], batch["parentSpanId"]) == (roots[name]["traceId"], roots[name]["spanId"])
+        assert sum(s["parentSpanId"] == batch["spanId"] for s in spans(root, "rl.reward.score")) == int(size)
+    validate(root)
 
 
 def test_agent_callback_preserves_its_call_or_falls_back_to_its_session(run):

@@ -80,6 +80,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                             "0.12.0",
                             "0.13.0",
                             "0.14.0",
+                            "0.15.0",
                         ):
                             raise ValueError("Unexpected instrumentation scope")
                         for span in scope["spans"]:
@@ -133,14 +134,20 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
         if version == "0.9.0":
             continue
         name = span["name"]
-        if version in ("0.13.0", "0.14.0"):
+        if version in ("0.13.0", "0.14.0", "0.15.0"):
             _validate_timing(span, attrs)
-        if version in ("0.11.0", "0.12.0", "0.13.0", "0.14.0"):
+        if version in ("0.11.0", "0.12.0", "0.13.0", "0.14.0", "0.15.0"):
             if attrs.get("rl.sample.timing") == "result":
                 raise ValueError("Result rows must be stored on the batch, not emitted as spans")
             if name.endswith(".sample") and name != "rl.rollout.sample":
                 raise ValueError(f"Redundant member span in {version}: {name}")
-        if name == "rl.agent.run" and version == "0.14.0":
+        if name == "rl.reward.batch" and version == "0.15.0" and span.get("parentSpanId"):
+            parent = records.get((trace_id, span["parentSpanId"]))
+            if parent is None or parent[0]["name"] != "rl.rollout.generate":
+                raise ValueError("A rollout-owned reward batch must be a direct child of rl.rollout.generate")
+            if attrs["rl.batch.id"] == parent[1]["rl.batch.id"]:
+                raise ValueError("A scoring batch must have its own batch identity")
+        if name == "rl.agent.run" and version in ("0.14.0", "0.15.0"):
             parent = records.get((trace_id, span.get("parentSpanId")))
             if parent is None or parent[0]["name"] != "rl.rollout.sample":
                 raise ValueError("Agent run must be a child of its sample")
