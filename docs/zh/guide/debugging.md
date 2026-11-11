@@ -183,6 +183,8 @@ PYTHONPATH=. python scripts/tools/collect_otlp_traces.py \
 
 `rl.agent.run` 是 Relax 的 Session span。外部 Agent 应用及工具不会自动产生自己的 OTel spans，也不会自动接入这个父链。自定义 rollout 如果自行使用 HTTP 客户端，可在真实生成调用内用 `relax.utils.rl_tracing.inference_headers` 合并出站 headers；绕过内置入口的请求需要自行接入。
 
+示例 `examples/otel_tracing/agent.py` 在进入 Session 时创建 `agent.invoke`，父节点是 Relax 传入的 `rl.agent.run`。每次模型请求创建一个 `llm.call`，并将它的上下文注入回调。两轮解题默认只调用模型。扩展示例时，用 `await call_tool(工具名, 函数, *args, **kwargs)` 执行同步或异步工具，`tool.call` 会覆盖从调用到返回或抛错的时间。示例使用 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` 导出应用 spans，Agentic smoke 脚本会将它设为 SGLang 使用的接收器。
+
 采集高吞吐、多轮推理时，导出队列不足可能导致 spans 丢失，即使请求入口关联正确也会出现缺失的父节点。上述 smoke 脚本启用 SGLang tracing 时默认使用 `OTEL_BSP_MAX_QUEUE_SIZE=65536` 和 `SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE=512`，可通过环境变量覆盖。接收器建议先写节点本地磁盘，训练及导出结束后再复制到持久化存储；应校验完整父链，不能仅检查请求入口数量。
 
 各批次阶段使用独立 trace，通过 `rl.run.id` 和 `rl.step.id` 关联；`rl.iteration.index` 保留从 0 开始的 rollout 轮次。每个批次记录自身 `rl.batch.id` 和实际输入数，真实成员操作 span 与批次共用 trace 并指定真实 parent：`rl.rollout.sample` 记录一条输入的完整 rollout，`rl.reward.score` 归属于 `rl.reward.batch`。不同阶段的依赖使用 Links。每次框架发起 rollout 产生一个 `rl.rollout.generate`，其耗时包含函数返回前的等待。不同 prompt group 的样本通过 `rl.group.id` 区分。`rl.agent.run` 是本 Session 样本的子 span。Agent 可提取子进程环境中的 `RELAX_TRACEPARENT`／`RELAX_TRACESTATE`，在发起模型请求时注入当前调用的 W3C 上下文。

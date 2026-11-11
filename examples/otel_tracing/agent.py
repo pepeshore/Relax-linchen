@@ -5,36 +5,69 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import httpx
 
 
 @contextmanager
-def model_request_headers():
-    """Use the Session's parent for a real application span around each HTTP
-    call."""
-    headers = {"Authorization": "Bearer " + os.environ["RELAX_SESSION_ID"]}
+def agent_span(name: str, attributes: dict[str, str], *, entry: bool = False, client: bool = False) -> Iterator[bool]:
+    """Attach the invocation to Relax and each operation to its active
+    application parent."""
     traceparent = os.getenv("RELAX_TRACEPARENT")
     if not traceparent:
-        yield headers
+        yield False
         return
 
     from opentelemetry import trace
+    from opentelemetry.context import Context
     from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
-    propagator = TraceContextTextMapPropagator()
     carrier = {"traceparent": traceparent}
     if tracestate := os.getenv("RELAX_TRACESTATE"):
         carrier["tracestate"] = tracestate
+    parent = TraceContextTextMapPropagator().extract(carrier, context=Context())
+    session = trace.get_current_span(parent).get_span_context()
+    if not session.is_valid:
+        yield False
+        return
+    if not entry and trace.get_current_span().get_span_context().trace_id == session.trace_id:
+        parent = None  # Let the SDK use the active operation within this invocation.
+
+    kind = trace.SpanKind.CLIENT if client else trace.SpanKind.INTERNAL
     with trace.get_tracer("relax.example.agent").start_as_current_span(
-        "llm.call", context=propagator.extract(carrier), kind=trace.SpanKind.CLIENT
+        name, context=parent, kind=kind, attributes=attributes
     ):
-        propagator.inject(headers)
+        yield True
+
+
+@contextmanager
+def model_request_headers() -> Iterator[dict[str, str]]:
+    headers = {"Authorization": "Bearer " + os.environ["RELAX_SESSION_ID"]}
+    with agent_span(
+        "llm.call", {"gen_ai.operation.name": "chat", "gen_ai.request.model": "model"}, client=True
+    ) as active:
+        if active:
+            from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+            TraceContextTextMapPropagator().inject(headers)
         yield headers
+
+
+async def call_tool(name: str, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    """Execute an actual tool and keep its span open until its result is
+    available."""
+    with agent_span("tool.call", {"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name}):
+        result = function(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
 
 def configure_tracer():
@@ -54,6 +87,13 @@ def configure_tracer():
 
 
 async def main() -> None:
+    with agent_span(
+        "agent.invoke", {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": "two-turn-math"}, entry=True
+    ):
+        await run_session()
+
+
+async def run_session() -> None:
     session_input = json.loads(Path(os.environ["RELAX_INPUT_JSON"]).read_text(encoding="utf-8"))
     messages = list(session_input["messages"])
     url = os.environ["RELAX_BASE_URL"].rstrip("/") + "/v1/chat/completions"
@@ -71,8 +111,8 @@ async def main() -> None:
                     json={"model": "model", "messages": messages, "stream": False},
                 )
                 response.raise_for_status()
-            # Keep the full message, including reasoning, for SessionForest lineage.
-            messages.append(response.json()["choices"][0]["message"])
+                # Keep the full message, including reasoning, for SessionForest lineage.
+                messages.append(response.json()["choices"][0]["message"])
     # The configured DAPO reward function scores the real implicit export.
     output = Path(os.environ["RELAX_OUTPUT_JSON"])
     temporary = output.with_suffix(output.suffix + ".tmp")

@@ -100,6 +100,8 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 
 **Agent 应用上下文：** Session 启动子进程时提供 `RELAX_TRACEPARENT` 和可选的 `RELAX_TRACESTATE`，值来自该 Session 的 `rl.agent.run`。应用提取此 carrier 后启动自己的 span，回调时注入当前 span。Relax 仅保存这次逻辑请求的 W3C headers，重试和恢复沿用。有效且 traceId 与此次采样一致时，发送给 SGLang 的父上下文采用来路的 parent-id、flags 和配套 tracestate。缺失、无效或跨 trace 时重新从当前 Session 的 `rl.agent.run` 注入，丢弃来路 tracestate。同一 rollout 的多个 Session 共享 traceId；应用负责隔离各 Session 的上下文。Agent 自身的 span 由应用 SDK 导出。
 
+示例 Agent 在应用 scope `relax.example.agent` 中为每次收到的任务创建 `agent.invoke`，作为 `rl.agent.run` 的子 span。应用中的实际 LLM 请求与工具执行分别使用 `llm.call` 和 `tool.call`，继承当时的活动父 span。发往 Relax 的推理回调携带该次 `llm.call` 的 W3C 上下文。工具执行 span 从调用开始，到同步或异步结果返回或抛错时结束。模型仅提出工具调用、应用未执行时，省略工具 span。
+
 结构化数据直接保存为 span 的 string 类型 JSON 属性，包括题目、response、评分、优势、过滤、传输及训练结果。自 0.10.0 起，新采集不再输出对应的 `_ref`；完整内容随 OTLP JSONL 保存，不依赖附件或旧详情接口。禁止按长度截断，也不使用随机采样结果冒充全量数据。读取工具可以兼容旧版 `_ref`，但不能将旧引用当作新数据已内联的证据。
 
 结构化内容中的 ID 为 string，计数为非负 int，结果数值为 double，布尔值为 boolean，`start_time`／`end_time` 为 Unix 秒 double。未知时间边界省略，后端原始字段保留原单位。普通 SDK 通常在 span 结束后导出；运行中展示需要同一 span 身份的状态／数据快照，终态记录去重合并，不增加业务 span 类型。
