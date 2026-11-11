@@ -597,6 +597,63 @@ def rollout_module(monkeypatch):
     sys.modules.pop("relax.agentic.rollout", None)
 
 
+def test_resident_step_rebinds_a_surviving_group_and_clears_owner_on_failure(tmp_path, rollout_module, monkeypatch):
+    from relax.engine.filters.base_types import call_dynamic_filter
+    from relax.utils.rl_tracing import initialize_run, rollout_call
+    from scripts.tools.validate_rl_traces import attributes
+
+    args = _obs_args(tmp_path, use_agentic_rollout=True)
+    monkeypatch.setenv("RELAX_OTEL_ENABLED", "1")
+    monkeypatch.setenv("RELAX_OTEL_DIR", str(tmp_path))
+    monkeypatch.delenv("RELAX_OTEL_RUN_ID", raising=False)
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+    initialize_run(args)
+    pipeline = object.__new__(rollout_module.AgenticResidentPipeline)
+
+    async def scenario():
+        resume, filtered, after_failure = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def group():
+            for release in (resume, after_failure):
+                await release.wait()
+                call_dynamic_filter(lambda values: SimpleNamespace(keep=True, reason=None), [])
+                filtered.set()
+
+        async def body(step):
+            if step == 0:
+                return asyncio.create_task(group())
+            resume.set()
+            await filtered.wait()
+            raise RuntimeError("step failed")
+
+        monkeypatch.setattr(pipeline, "_run_step", body)
+        with rollout_call(args, 0, False):
+            task = await pipeline.run_step(0)
+        with pytest.raises(RuntimeError, match="step failed"), rollout_call(args, 1, False):
+            await pipeline.run_step(1)
+        after_failure.set()
+        await task
+
+    asyncio.run(scenario())
+    records = [
+        span
+        for path in (tmp_path / args.rl_trace_run_id).glob("*.jsonl")
+        for payload in _read_jsonl(path)
+        for resource in payload["resourceSpans"]
+        for scope in resource["scopeSpans"]
+        for span in scope["spans"]
+    ]
+    second = next(
+        s
+        for s in records
+        if s["name"] == "rl.rollout.generate" and attributes(s["attributes"])["rl.step.id"] == "iteration:1"
+    )
+    during, after = [s for s in records if s["name"] == "rl.data.filter"]
+    assert (during["traceId"], during["parentSpanId"]) == (second["traceId"], second["spanId"])
+    assert attributes(during["attributes"])["rl.step.id"] == "iteration:1"
+    assert not after.get("parentSpanId") and "rl.step.id" not in attributes(after["attributes"])
+
+
 def _obs_pipeline(module, args):
     pipeline = object.__new__(module.AgenticResidentPipeline)
     pipeline.args = args

@@ -51,7 +51,7 @@ from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_values
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
-from relax.utils.rl_trace_hooks import resident_reward_parent, trace_iteration
+from relax.utils.rl_trace_hooks import resident_rollout_parent, trace_iteration
 from relax.utils.rl_tracing import Stage, current_rollout, iteration_context
 from relax.utils.rl_tracing import enabled as rl_tracing_enabled
 from relax.utils.training.eval_config import EvalDatasetConfig
@@ -289,7 +289,7 @@ class AgenticResidentPipeline:
         self._group_observations: dict[asyncio.Task[Optional[GroupExport]], _GroupObservation] = {}
         self._finalized_groups: Deque[GroupExport] = deque()
         self._active_step: Optional[_StepContext] = None
-        self._reward_parent: Stage | None = None
+        self._rollout_parent: Stage | None = None
         self._stage_recorder = StageRecorder(args)
 
     def snapshot(self) -> dict[str, object]:
@@ -317,7 +317,15 @@ class AgenticResidentPipeline:
         steps."""
 
         rollout = current_rollout()
-        self._reward_parent = rollout.span if rollout is not None else None
+        self._rollout_parent = rollout.span if rollout is not None else None
+        try:
+            # A Group task can outlive a step. Resolve its owner when each operation starts.
+            with resident_rollout_parent(lambda: self._rollout_parent):
+                return await self._run_step(rollout_id)
+        finally:
+            self._rollout_parent = None
+
+    async def _run_step(self, rollout_id: int) -> RolloutFnTrainOutput:
         started_at = time.monotonic()
         await start_sglang_profile(self.args, rollout_id)
         profile_stopped = False
@@ -340,9 +348,7 @@ class AgenticResidentPipeline:
             self.prepare_domain.open_step(
                 prelaunch_next_step=self.args.agentic_prelaunch and rollout_id + 1 < self.args.num_rollout
             )
-            # Resident tasks inherit the lookup and may submit new scores in a later rollout.
-            with resident_reward_parent(lambda: self._reward_parent):
-                output = await self._run_rollout_step(context)
+            output = await self._run_rollout_step(context)
             self._finish_step_progress(context)
             step_progress_finished = True
 

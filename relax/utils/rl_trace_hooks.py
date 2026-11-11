@@ -34,20 +34,57 @@ _PURPOSE: ContextVar[str] = ContextVar("rl_purpose", default="training")
 _GENERATION_BATCH: ContextVar[GenerationBatch | None] = ContextVar("rl_generation_batch", default=None)
 _REWARD_BATCH: ContextVar[RewardBatch | None] = ContextVar("rl_reward_batch", default=None)
 
-_RESIDENT_REWARD_PARENT: ContextVar[Callable[[], Stage | None] | None] = ContextVar(
-    "rl_resident_reward_parent", default=None
+_RESIDENT_ROLLOUT_PARENT: ContextVar[Callable[[], Stage | None] | None] = ContextVar(
+    "rl_resident_rollout_parent", default=None
 )
 
 
 @contextmanager
-def resident_reward_parent(get_parent: Callable[[], Stage | None]) -> Iterator[None]:
-    """Resolve a resident Group's owner when scoring actually starts after a
-    resume."""
-    token = _RESIDENT_REWARD_PARENT.set(get_parent)
+def resident_rollout_parent(get_parent: Callable[[], Stage | None]) -> Iterator[None]:
+    """Look up the current invocation when a resident task starts a new
+    operation."""
+    invocation = current_rollout()
+
+    def active_parent() -> Stage | None:
+        current = current_rollout()
+        # A nested framework call establishes its own owner even inside a resident task.
+        if current is not invocation:
+            return current.span if current is not None else None
+        return get_parent()
+
+    token = _RESIDENT_ROLLOUT_PARENT.set(active_parent)
     try:
         yield
     finally:
-        _RESIDENT_REWARD_PARENT.reset(token)
+        _RESIDENT_ROLLOUT_PARENT.reset(token)
+
+
+# Backwards compatibility with the scoring-only context manager.
+resident_reward_parent = resident_rollout_parent
+
+
+def _rollout_stage_options(attributes: dict[str, Any], parent: Stage | None = None) -> dict[str, Any]:
+    """Bind the caller at operation start; source Links and target partitions
+    have separate meanings."""
+    resident_parent = _RESIDENT_ROLLOUT_PARENT.get()
+    if parent is None:
+        if resident_parent is not None:
+            parent = resident_parent()
+        elif (rollout := current_rollout()) is not None:
+            parent = rollout.span
+    if parent is None:
+        # Between resident invocations a long-lived task still has its launch iteration in its Context.
+        return {"attributes": attributes, "inherit_iteration": resident_parent is None}
+    ownership = parent.child_attributes()
+    return {
+        "parent": parent,
+        "inherit_iteration": False,
+        "attributes": {
+            **attributes,
+            **{key: ownership[key] for key in ("rl.purpose", "rl.step.id", "rl.iteration.index") if key in ownership},
+            "rl.execution.side": "rollout",
+        },
+    }
 
 
 def trace_iteration(function: Callable) -> Callable:
@@ -433,26 +470,10 @@ class RewardBatch:
         self.sealed = False
         self.error: BaseException | None = None
         self.end_time: int | None = None
-        if parent is None:
-            resident_parent = _RESIDENT_REWARD_PARENT.get()
-            if resident_parent is not None:
-                parent = resident_parent()
-            elif (rollout := current_rollout()) is not None:
-                parent = rollout.span
-        ownership = parent.child_attributes() if parent is not None else {}
         self.observation = Stage(
             args,
             "rl.reward.batch",
-            parent=parent,
-            attributes={
-                **reward_attributes(args, evaluation),
-                **{
-                    key: ownership[key]
-                    for key in ("rl.purpose", "rl.step.id", "rl.iteration.index")
-                    if key in ownership
-                },
-                "rl.batch.id": uuid.uuid4().hex,
-            },
+            **_rollout_stage_options({**reward_attributes(args, evaluation), "rl.batch.id": uuid.uuid4().hex}, parent),
         )
         for sample in samples:
             self.admit(sample)
@@ -625,13 +646,16 @@ def trace_transfer(function: Callable) -> Callable:
         with stage(
             args,
             "rl.data.transfer",
-            attributes={
-                "rl.batch.id": uuid.uuid4().hex,
-                "rl.batch.size": len(samples),
-                "rl.transfer.target": f"train_{rollout_id}",
-                "rl.transfer.target.step_id": f"iteration:{rollout_id}",
-            },
             links=_sources(samples),
+            **_rollout_stage_options(
+                {
+                    "rl.batch.id": uuid.uuid4().hex,
+                    "rl.batch.size": len(samples),
+                    "rl.execution.side": "rollout",
+                    "rl.transfer.target": f"train_{rollout_id}",
+                    "rl.transfer.target.step_id": f"iteration:{rollout_id}",
+                }
+            ),
         ) as observation:
             try:
                 result = await function(args, batch_samples, batch_count, rollout_id, *rest, **kwargs)
@@ -676,12 +700,14 @@ def trace_filter(function: Callable) -> Callable:
         with stage(
             config,
             "rl.data.filter",
-            attributes={
-                "rl.filter.name": callable_name(fn),
-                "rl.batch.id": uuid.uuid4().hex,
-                "rl.batch.size": len(samples),
-            },
             links=_sources(samples),
+            **_rollout_stage_options(
+                {
+                    "rl.filter.name": callable_name(fn),
+                    "rl.batch.id": uuid.uuid4().hex,
+                    "rl.batch.size": len(samples),
+                }
+            ),
         ) as observation:
             result = function(fn, *args, **kwargs)
             observation.freeze_end()
@@ -744,6 +770,7 @@ def trace_forward(function: Callable) -> Callable:
             {
                 "rl.batch.id": uuid.uuid4().hex,
                 "rl.partition.dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
+                "rl.execution.side": "training",
             }
         )
         with stage(owner.args, name, attributes=attrs, active=active) as observation:
@@ -823,13 +850,16 @@ def trace_agentic_transfer(function: Callable) -> Callable:
         with stage(
             args,
             "rl.data.transfer",
-            attributes={
-                "rl.batch.id": uuid.uuid4().hex,
-                "rl.batch.size": len(samples),
-                "rl.transfer.target": f"train_{partition_id}",
-                "rl.transfer.target.step_id": f"iteration:{partition_id}",
-            },
             links=_sources(samples),
+            **_rollout_stage_options(
+                {
+                    "rl.batch.id": uuid.uuid4().hex,
+                    "rl.batch.size": len(samples),
+                    "rl.execution.side": "rollout",
+                    "rl.transfer.target": f"train_{partition_id}",
+                    "rl.transfer.target.step_id": f"iteration:{partition_id}",
+                }
+            ),
         ) as observation:
             try:
                 result = await function(args=args, batch_samples=batch_samples, partition_id=partition_id, **kwargs)
@@ -868,7 +898,9 @@ def trace_custom_advantage(function: Callable) -> Callable:
         with stage(
             owner.args,
             "rl.advantage.compute",
-            attributes={"rl.advantage.estimator": callable_name(owner.custom_advantage_func)},
+            **_rollout_stage_options(
+                {"rl.advantage.estimator": callable_name(owner.custom_advantage_func), "rl.execution.side": "rollout"}
+            ),
         ) as observation:
             result = await function(owner, group)
             observation.freeze_end()
@@ -887,6 +919,7 @@ def trace_opd_forward(role: str) -> Callable:
             attrs = {
                 "rl.model.name": model_name(owner.args, role),
                 "rl.backend.name": "sglang",
+                "rl.execution.side": "rollout",
                 "rl.batch.id": uuid.uuid4().hex,
                 "rl.batch.size": 1,
                 **sample_attributes(sample),
@@ -898,7 +931,9 @@ def trace_opd_forward(role: str) -> Callable:
                 )
             else:
                 attrs["rl.forward.purpose"] = "distillation"
-            with stage(owner.args, f"rl.{role}.forward", attributes=attrs, links=_sources([sample])) as observation:
+            with stage(
+                owner.args, f"rl.{role}.forward", links=_sources([sample]), **_rollout_stage_options(attrs)
+            ) as observation:
                 result = await function(owner, sample, *args, **kwargs)
                 observation.freeze_end()
                 row = {"export_id": export_id(sample), "status": "invalid" if result is False else "valid"}

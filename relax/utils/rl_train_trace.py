@@ -81,7 +81,7 @@ def training_rpc(function: Callable) -> Callable:
                     observation = Stage(
                         owner.args,
                         item["name"],
-                        attributes={**item["attributes"], **_timing_attributes(item, 1)},
+                        attributes={**item["attributes"], **_training_stage_attributes(item, 1)},
                         start_time=item["start_time"],
                     )
                     _record_rank_times(observation, [item])
@@ -183,7 +183,7 @@ def window(
             failed = Stage(
                 args,
                 name,
-                attributes={**attrs, **_timing_attributes(observation, 1)},
+                attributes={**attrs, **_training_stage_attributes(observation, 1)},
                 start_time=observation["start_time"],
             )
             _record_rank_times(failed, [observation])
@@ -355,9 +355,10 @@ def _representative(item: dict) -> bool:
     return item["owner"] and item["rank"]["dp"] == item["rank"]["cp"] == 0
 
 
-def _timing_attributes(item: dict, rank_count: int) -> dict[str, Any]:
+def _training_stage_attributes(item: dict, rank_count: int) -> dict[str, Any]:
     return {
         "rl.timing.scope": "representative_rank",
+        "rl.execution.side": "training",
         "rl.timing.rank_count": rank_count,
         **{f"rl.timing.rank.{key}": value for key, value in item["rank"].items()},
     }
@@ -394,7 +395,7 @@ def emit_windows(args: Any, reports: list[Any]) -> None:
             logger.warning("RL OTel missing or ambiguous representative timing for %s; stage omitted", name)
             continue
         representative = representatives[0]
-        attrs = {**representative["attributes"], **_timing_attributes(representative, len(windows))}
+        attrs = {**representative["attributes"], **_training_stage_attributes(representative, len(windows))}
         owners = [item for item in windows if item["owner"]]
         attrs["rl.batch.id"] = uuid.uuid4().hex
         if owners and all("members" in item for item in owners):

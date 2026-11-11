@@ -34,7 +34,7 @@ def spans(root, name=None):
         for line in path.read_text().splitlines():
             for resource in json.loads(line)["resourceSpans"]:
                 for scope in resource["scopeSpans"]:
-                    assert scope["scope"] == {"name": "relax.rl", "version": "0.16.0"}
+                    assert scope["scope"] == {"name": "relax.rl", "version": "0.17.0"}
                     result.extend(scope["spans"])
     return [span for span in result if name is None or span["name"] == name]
 
@@ -1057,6 +1057,8 @@ def test_opd_forward_uses_one_request_span_and_reports_result(run, role, success
     assert asyncio.run(forward(owner, value)) is success
     (record,) = spans(root, f"rl.{role}.forward")
     assert not spans(root, f"rl.{role}.forward.sample")
+    assert attrs(record)["rl.execution.side"] == "rollout"
+    assert not record.get("parentSpanId")
     assert attrs(record)["rl.batch.size"] == "1"
     assert attrs(record)["rl.export.id"] == hooks.export_id(value)
     assert record["links"][0]["spanId"] == source.context()["span_id"]
@@ -1220,11 +1222,15 @@ def test_rank_timing_preserves_one_clock_and_full_batch_results(run, monkeypatch
             if name != "rl.advantage.compute" or pp == 3
         ]
         reports.append({"rl_trace_producer": {"owner": pp == 3, "rank": rank}, "rl_trace_windows": windows})
-    train.emit_windows(args, reports)
+    # Even with a live rollout in the caller, rank windows belong to the training backend.
+    with tracing.rollout_call(args, 0, False):
+        train.emit_windows(args, reports)
     records = {s["name"]: s for s in spans(root)}
     for i, name in enumerate(names):
         record = records[name]
         _validate_timing(record, attrs(record))
+        assert not record.get("parentSpanId")
+        assert attrs(record)["rl.execution.side"] == "training"
         assert int(record["startTimeUnixNano"]) == 1000 + i * 100
         assert int(record["endTimeUnixNano"]) == 1050 + i * 100
         assert attrs(record)["rl.batch.size"] == "2"
@@ -1428,6 +1434,160 @@ def test_framework_rollout_owns_multiple_submissions(run, evaluation):
         assert sum(s["parentSpanId"] == reward["spanId"] for s in scores) == 2
     assert {s["links"][0]["spanId"] for s in scores} == {s["spanId"] for s in details}
     validate(root)
+
+
+@pytest.mark.parametrize("agentic", [False, True], ids=["ordinary", "agentic-resume"])
+def test_rollout_operations_use_the_invocation_at_start(run, agentic):
+    from relax.engine.filters.base_types import call_dynamic_filter
+    from relax.engine.rollout.base_types import call_rollout_fn
+    from scripts.tools.validate_rl_traces import validate
+
+    args, root = run
+    args.use_agentic_rollout = agentic
+    value = sample()
+    value.response_length, value.custom_advantage, value.loss_mask = 1, 1.0, [1]
+    owner = SimpleNamespace(args=args, custom_advantage_func=sum, topk_worker=None)
+    group = SimpleNamespace(samples=[value])
+
+    def accept(*args):
+        return SimpleNamespace(keep=True, reason=None)
+
+    @hooks.trace_custom_advantage
+    async def advantage(owner, group):
+        return True
+
+    async def prefill(owner, sample):
+        return True
+
+    @hooks.trace_transfer
+    async def ordinary_put(args, samples, count, partition):
+        return "ack"
+
+    @hooks.trace_agentic_transfer
+    async def agentic_put(**kwargs):
+        return "ack"
+
+    async def execute():
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        @hooks.trace_opd_forward("teacher")
+        async def teacher(owner, sample):
+            started.set()
+            await resume.wait()
+            return True
+
+        async def work():
+            await teacher(owner, value)
+            assert call_dynamic_filter(accept, [value]).keep
+            if agentic:
+                assert await advantage(owner, group)
+            assert await hooks.trace_opd_forward("actor")(prefill)(owner, value)
+            if agentic:
+                assert await agentic_put(args=args, batch_samples=[[value]], partition_id=0) == "ack"
+            else:
+                assert await ordinary_put(args, [[value]], 1, 0) == "ack"
+
+        if not agentic:
+            resume.set()
+            await work()
+            return []
+        with tracing.rollout_call(args, 0, False) as first:
+            live = first.span
+            with hooks.resident_rollout_parent(lambda: live):
+                task = asyncio.create_task(work())
+            await started.wait()
+        with tracing.rollout_call(args, 1, False) as second:
+            live = second.span
+            resume.set()
+            await task
+
+    if agentic:
+        asyncio.run(execute())
+    else:
+        call_rollout_fn(lambda *a, **kw: asyncio.run(execute()), args, 1, evaluation=False)
+    roots = {attrs(s)["rl.step.id"]: s for s in spans(root, "rl.rollout.generate")}
+    operations = [s for s in spans(root) if s["name"] != "rl.rollout.generate"]
+    expected = {"rl.data.filter", "rl.data.transfer", "rl.actor.forward", "rl.teacher.forward"}
+    if agentic:
+        expected.add("rl.advantage.compute")
+    assert sorted(s["name"] for s in operations) == sorted(expected)
+    for record in operations:
+        name = record["name"]
+        step = "iteration:0" if agentic and name == "rl.teacher.forward" else "iteration:1"
+        assert (record["traceId"], record["parentSpanId"]) == (roots[step]["traceId"], roots[step]["spanId"])
+        assert attrs(record)["rl.step.id"] == step
+        assert attrs(record)["rl.execution.side"] == "rollout"
+        assert attrs(record)["rl.batch.id"] != attrs(roots[step])["rl.batch.id"]
+        if name == "rl.data.transfer":
+            assert attrs(record)["rl.transfer.target.step_id"] == "iteration:0"
+    validate(root)
+
+
+def test_megatron_and_sglang_student_forward_keep_distinct_origins(run, monkeypatch):
+    from scripts.tools.validate_rl_traces import validate
+
+    args, root = run
+    args.use_opd = True
+    owner = SimpleNamespace(args=args)
+    mpu = SimpleNamespace(
+        is_pipeline_last_stage=lambda **kwargs: True,
+        get_tensor_model_parallel_rank=lambda: 0,
+        get_context_parallel_rank=lambda: 0,
+        get_data_parallel_rank=lambda **kwargs: 0,
+    )
+    monkeypatch.setitem(sys.modules, "megatron.core", SimpleNamespace(mpu=mpu))
+    value = sample()
+    value.response_length = 1
+
+    @hooks.trace_forward
+    def megatron_forward(owner, data_iterator, num_microbatches, **kwargs):
+        return True
+
+    @hooks.trace_opd_forward("actor")
+    async def sglang_prefill(owner, sample):
+        return True
+
+    with tracing.rollout_call(args, 0, False):
+        assert megatron_forward(owner, [SimpleNamespace(rollout_data={"sample_indices": [0]})], 1)
+        assert asyncio.run(sglang_prefill(owner, value))
+    (rollout,) = spans(root, "rl.rollout.generate")
+    training, prefill = spans(root, "rl.actor.forward")
+    assert attrs(training)["rl.forward.purpose"] == attrs(prefill)["rl.forward.purpose"] == "distillation"
+    assert attrs(training)["rl.execution.side"] == "training" and not training.get("parentSpanId")
+    assert attrs(prefill)["rl.execution.side"] == "rollout"
+    assert (prefill["traceId"], prefill["parentSpanId"]) == (rollout["traceId"], rollout["spanId"])
+    validate(root)
+
+
+def test_resident_filter_without_active_step_or_in_nested_rollout(run):
+    from relax.engine.filters.base_types import call_dynamic_filter
+
+    args, root = run
+
+    async def execute():
+        released = asyncio.Event()
+
+        async def later():
+            await released.wait()
+            with tracing.rollout_call(args, 7, True):
+                call_dynamic_filter(lambda values: SimpleNamespace(keep=True, reason=None), [sample()])
+            call_dynamic_filter(lambda values: SimpleNamespace(keep=True, reason=None), [sample()])
+
+        with tracing.iteration_context(2), tracing.rollout_call(args, 2, False) as first:
+            live = first.span
+            with hooks.resident_rollout_parent(lambda: live):
+                task = asyncio.create_task(later())
+        live = None
+        released.set()
+        await task
+
+    asyncio.run(execute())
+    nested, standalone = spans(root, "rl.data.filter")
+    nested_root = next(s for s in spans(root, "rl.rollout.generate") if attrs(s)["rl.step.id"] == "iteration:7")
+    assert (nested["traceId"], nested["parentSpanId"]) == (nested_root["traceId"], nested_root["spanId"])
+    assert attrs(nested)["rl.purpose"] == "evaluation"
+    assert not standalone.get("parentSpanId")
+    assert "rl.step.id" not in attrs(standalone) and "rl.execution.side" not in attrs(standalone)
 
 
 def test_agentic_resident_scoring_belongs_to_rollout_at_submission(run, monkeypatch):

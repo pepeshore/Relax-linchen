@@ -115,7 +115,10 @@ class Advantages(Base):
                         self.config,
                         "rl.advantage.compute",
                         iteration=step,
-                        attributes={"rl.advantage.estimator": self.config.advantage_estimator},
+                        attributes={
+                            "rl.advantage.estimator": self.config.advantage_estimator,
+                            "rl.execution.side": "training",
+                        },
                     ) as observation:
                         advantages_and_returns = self.compute_advantages_and_returns(rollout_data)
                         observation.freeze_end()

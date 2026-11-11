@@ -82,6 +82,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                             "0.14.0",
                             "0.15.0",
                             "0.16.0",
+                            "0.17.0",
                         ):
                             raise ValueError("Unexpected instrumentation scope")
                         for span in scope["spans"]:
@@ -132,7 +133,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
     prompts_by_sample = {
         (attrs["rl.run.id"], attrs["rl.sample.id"]): attrs["rl.prompt.id"]
         for span, attrs, version in records.values()
-        if version == "0.16.0" and span["name"] == "rl.rollout.sample" and "rl.prompt.id" in attrs
+        if version in ("0.16.0", "0.17.0") and span["name"] == "rl.rollout.sample" and "rl.prompt.id" in attrs
     }
     children = Counter()
     timing = Counter()
@@ -140,7 +141,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
         if version == "0.9.0":
             continue
         name = span["name"]
-        if version == "0.16.0" and name in ("rl.reward.score", "rl.reward.batch"):
+        if version in ("0.16.0", "0.17.0") and name in ("rl.reward.score", "rl.reward.batch"):
             expected = prompts_by_sample.get((attrs["rl.run.id"], attrs.get("rl.sample.id")))
             prompt = attrs.get("rl.prompt.id")
             if name == "rl.reward.score" and expected is not None and prompt != expected:
@@ -149,20 +150,48 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                 expected = prompts_by_sample.get((attrs["rl.run.id"], row.get("sample_id")), prompt)
                 if expected is not None and row.get("prompt_id") != expected:
                     raise ValueError("Reward result prompt_id differs from its source")
-        if version in ("0.13.0", "0.14.0", "0.15.0", "0.16.0"):
+        if version in ("0.13.0", "0.14.0", "0.15.0", "0.16.0", "0.17.0"):
             _validate_timing(span, attrs)
-        if version in ("0.11.0", "0.12.0", "0.13.0", "0.14.0", "0.15.0", "0.16.0"):
+        if version in ("0.11.0", "0.12.0", "0.13.0", "0.14.0", "0.15.0", "0.16.0", "0.17.0"):
             if attrs.get("rl.sample.timing") == "result":
                 raise ValueError("Result rows must be stored on the batch, not emitted as spans")
             if name.endswith(".sample") and name != "rl.rollout.sample":
                 raise ValueError(f"Redundant member span in {version}: {name}")
-        if name == "rl.reward.batch" and version in ("0.15.0", "0.16.0") and span.get("parentSpanId"):
+        if version == "0.17.0" and name in (
+            "rl.data.filter",
+            "rl.data.transfer",
+            "rl.actor.train",
+            "rl.critic.train",
+            "rl.advantage.compute",
+            "rl.actor.forward",
+            "rl.teacher.forward",
+            "rl.reference.forward",
+            "rl.critic.forward",
+        ):
+            side = attrs.get("rl.execution.side")
+            parent = records.get((trace_id, span.get("parentSpanId")))
+            rollout_parent = parent is not None and parent[0]["name"] == "rl.rollout.generate"
+            if side not in (None, "training", "rollout") or (rollout_parent and side != "rollout"):
+                raise ValueError(f"Incorrect execution side for {name}")
+            if side == "rollout" and span.get("parentSpanId") and not rollout_parent:
+                raise ValueError(f"Incorrect rollout parent for {name}")
+            if rollout_parent:
+                for key in ("rl.run.id", "rl.step.id", "rl.iteration.index", "rl.purpose"):
+                    if attrs.get(key) != parent[1].get(key):
+                        raise ValueError(f"Rollout child {name} disagrees with its parent on {key}")
+            if attrs.get("rl.timing.scope") == "representative_rank" or attrs.get("rl.backend.name") == "megatron":
+                if side != "training":
+                    raise ValueError(f"Missing training execution side for {name}")
+            if attrs.get("rl.backend.name") == "sglang" and name in ("rl.actor.forward", "rl.teacher.forward"):
+                if side != "rollout":
+                    raise ValueError(f"Missing rollout execution side for {name}")
+        if name == "rl.reward.batch" and version in ("0.15.0", "0.16.0", "0.17.0") and span.get("parentSpanId"):
             parent = records.get((trace_id, span["parentSpanId"]))
             if parent is None or parent[0]["name"] != "rl.rollout.generate":
                 raise ValueError("A rollout-owned reward batch must be a direct child of rl.rollout.generate")
             if attrs["rl.batch.id"] == parent[1]["rl.batch.id"]:
                 raise ValueError("A scoring batch must have its own batch identity")
-        if name == "rl.agent.run" and version in ("0.14.0", "0.15.0", "0.16.0"):
+        if name == "rl.agent.run" and version in ("0.14.0", "0.15.0", "0.16.0", "0.17.0"):
             parent = records.get((trace_id, span.get("parentSpanId")))
             if parent is None or parent[0]["name"] != "rl.rollout.sample":
                 raise ValueError("Agent run must be a child of its sample")

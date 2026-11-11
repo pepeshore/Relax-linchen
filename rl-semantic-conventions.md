@@ -2,7 +2,7 @@
 
 **Status:** Development
 
-**Version:** 0.16.0
+**Version:** 0.17.0
 
 **Date:** 2026-11-10
 
@@ -73,28 +73,29 @@ span 名称固定，不拼接 Run、Step、rank、模型名或请求内容。角
 
 属性按事实所属的阶段记录，不向后续 span 复制整套上下文：
 
-| 属性                             | 记录位置                                                                                         | 口径                                                                                               |
-| -------------------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
-| `rl.batch.id`、`rl.batch.size`   | 所有批次操作 span                                                                                | 各阶段记录自身实际输入集合身份与成员数；真实子操作 span 只记录所属 batch.id，不重复记录 batch.size |
-| `rl.purpose`                     | `rl.rollout.generate`、`rl.rollout.sample`、`rl.reward.batch`、`rl.reward.score`、`rl.agent.run` | 区分训练采样与评估；训练及训练准备阶段的用途已由职责确定，权重操作可能同时服务多个用途             |
-| `rl.algorithm.name`              | `rl.actor.train`                                                                                 | 记录本轮策略训练算法；优势阶段单独记录实际 estimator，Critic 不重复复制策略算法名                  |
-| 评分、优势、过滤、传输和训练结果 | 各自执行该操作的 span                                                                            | 保留逐 Export／Update 结果，后续按对象 ID 关联，不复制到 Agent span                                |
+| 属性                             | 记录位置                                                                                                             | 口径                                                                                               |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `rl.batch.id`、`rl.batch.size`   | 所有批次操作 span                                                                                                    | 各阶段记录自身实际输入集合身份与成员数；真实子操作 span 只记录所属 batch.id，不重复记录 batch.size |
+| `rl.execution.side`              | 本次 rollout 拥有的评分批次、动态过滤、队列写入、自定义 advantage、OPD 前向；训练侧的前向、优势及代表 rank 训练 span | string：`rollout` 或 `training`，表示实际执行侧。独立调用且执行侧未知时省略。                      |
+| `rl.purpose`                     | rollout、样本、Agent、评分及已确定归属的 rollout 子阶段                                                              | `training` 或 `evaluation`，描述采样用途                                                           |
+| `rl.algorithm.name`              | `rl.actor.train`                                                                                                     | 记录本轮策略训练算法；优势阶段单独记录实际 estimator，Critic 不重复复制策略算法名                  |
+| 评分、优势、过滤、传输和训练结果 | 各自执行该操作的 span                                                                                                | 保留逐 Export／Update 结果，后续按对象 ID 关联，不复制到 Agent span                                |
 
 生成批次以输入任务为成员，训练批次以实际接纳的训练样本为成员，不能直接沿用生成批次的 ID 或数量。Actor 和 Critic 分别记录自身实际接纳的批次；仅在样本身份和成员集合完全一致时才可使用相同批次 ID。批次规模描述本阶段工作量，不能将各阶段的 size 相加作为全局样本总数。
 
 Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件记录；模型、后端和版本描述本阶段实际执行对象，也可能因阶段不同而不同。各 span 的属性表列出其完整属性要求；未列出的其他阶段属性不复制，parent 或 Link 不会自动继承属性。轨迹流转使用逐 Export ID 关联。
 
-**Trace 与关联规则：** 同一 iteration 的核心阶段在条件允许时复用 traceId，但不强制共用 trace；一次框架 rollout 直接拥有样本和它发起的评分批次；同一阶段的批次与真实独立成员操作按第 2.1 节建立父子关系，结果数组中的记录不构成子 span。通过业务 ID 关联查询，通过 Span Link 表达实际依赖。
+**Trace 与关联规则：** 同一 iteration 的核心阶段在条件允许时复用 traceId，但不强制共用 trace；一次框架 rollout 直接拥有样本、评分批次以及它发起的动态过滤、队列交付、Agentic 自定义优势计算和 OPD 推理前向；同一阶段的批次与真实独立成员操作按第 2.1 节建立父子关系，结果数组中的记录不构成子 span。通过业务 ID 关联查询，通过 Span Link 表达实际依赖。
 
 1. **Trace 复用。** 第 3 章同一 iteration 内的核心阶段，已有合适的共同上游 Context 时应复用同一个 traceId，各次操作使用不同的 spanId，有明确包含关系时使用实际调用者作为 parent（例如 rollout 内的评分批次），其他阶段作为共同上游下的同级 span。没有这样的 Context 时，各批次阶段可以创建独立 trace 的根 span；本规范不为复用 traceId 新增统一的 Run／Step 父 span。按照 [OTel Span Creation](https://opentelemetry.io/docs/specs/otel/trace/api/#span-creation)，同一 trace 中的 spans 应属于同一棵调用树，不能将多个无 parent 的根 span 手动设置为相同 traceId。第 4 章的 Agent 调用是对应 sample 的子 span，暂停恢复沿用原 span 和 traceId。
 2. **业务聚合。** 无论是否复用 traceId，都通过 `rl.run.id` 聚合运行，通过 `(rl.run.id, rl.step.id)` 关联查询同一 Step 的各阶段和轨迹；查询必须支持一个 Step 对应多条 trace，不能依赖 traceId 完成整个 Step 的聚合。明确唯一 Step 归属时必须填写 `rl.step.id`；未知、未分配或跨 Step 时省略单值，按已有的真实业务归属明细关联，不能任选一个 Step。相同 Run／Step 只表示业务归属，不自动构成依赖关系。
 3. **依赖关联。** 无论同 trace 还是跨 trace，有实际调用触发、数据消费或参数版本来源关系时，由被触发方／消费方的 span Link 到直接来源 span 的真实 SpanContext；parent 表达调用归属，Link 表达数据或版本来源。例如，训练 Link 到实际消费的优势计算／数据交付，权重加载 Link 到对应权重发布。多来源操作关联各实际直接来源，并按 `(traceId, spanId)` 去重；不因同轮、时间相近或仅先后执行而建立 Link，不要求补齐所有间接祖先。
-4. **上下文传递。** 跨进程、线程、队列及权重交付时，按实际关系传递 Context：符合第 1 条的共同上游 Context 可用于创建同级阶段、复用 traceId；评分接纳时使用所属 rollout 的 Context 作为 parent，样本或其他数据来源的 Context 用于 Link。创建时已知的依赖直接加入 Links，执行中确认的依赖在 span 结束前追加；不修改已经结束的来源 span。来源未被采集或上下文确实不可取得时，保留已有业务 ID 和明细，不根据 Run／Step／Export ID 生成虚假的 traceId 或 spanId。
+4. **上下文传递。** 跨进程、线程、队列及权重交付时，按实际关系传递 Context：符合第 1 条的共同上游 Context 可用于创建同级阶段、复用 traceId；rollout 内发起的阶段在实际开始时使用所属 rollout 的 Context 作为 parent，样本或其他数据来源的 Context 用于 Link。创建时已知的依赖直接加入 Links，执行中确认的依赖在 span 结束前追加；不修改已经结束的来源 span。来源未被采集或上下文确实不可取得时，保留已有业务 ID 和明细，不根据 Run／Step／Export ID 生成虚假的 traceId 或 spanId。
 5. **后端工作的 RL 封装。** SGLang、Megatron 的后端工作必须归属于负责该次操作的 RL 框架 span，由该 span 记录框架侧调用的完整起止与结果。直接复用本规范已有的阶段 span，不为每个后端内部 span 另建 RL 包装 span。例如，策略训练归属于 `rl.actor.train`，价值训练归属于 `rl.critic.train`，独立前向归属于对应的 forward span；普通生成归属于 `rl.rollout.sample`，其 parent 为首次接纳的 `rl.rollout.generate`；Agent 调用中的生成归属于 `rl.agent.run`，其 parent 是对应 sample。
 6. **SGLang 推理父子关系。** SGLang 请求入口 span 继承负责本次调用的 RL span 的 traceId，并将其作为 parent：普通生成指向 `rl.rollout.sample`，Agentic 模型请求使用第 2 章下述回调规则。通过 HTTP `traceparent`／`tracestate` 传递真实 SpanContext，在进入 Ray HTTP worker 或 router 前完成注入；中间层应保留该上下文。SGLang 内部 spans 保持原有名称和父子树，不为每个内部 span 再创建 RL 包装。单个 sample／Agent 可以包含多次请求，它们可以经不同的 Agent 应用 span 归属于同一个 RL span；重试和恢复不把请求挂到其他样本。若启用 router 自身 tracing，允许真实的 router span 位于 RL 与 SGLang 之间，并保持可追溯的父链。
 7. **其他后端与耗时。** 其他后端（如 Megatron）仍可使用独立 trace，通过入口 Span Link 指向负责该操作的 RL span；当前未实现 Megatron 内部 trace 的自动关联。SGLang 与 RL 共享 trace 后，一条 rollout 批次 trace 可以包含多个样本及其推理细节，不再要求这些 SGLang 请求使用独立 trace。各阶段保留真实起止；父子、并行阶段及 RL／后端耗时不能相加作为 Step 总耗时。
 
-**当前实现范围（Relax RL 0.16.0）：** 内置普通 rollout、`GenerateState.post_generate` 和 Agentic SGLang adapter 注入上述 W3C 上下文。RL tracing 关闭或无有效来源 span 时不注入。现有路由 headers 保留；独立并发样本／Session 的上下文相互隔离。自定义生成若绕过这些入口、自行调用 HTTP 客户端，需使用相同的 `inference_headers` 辅助函数。
+**当前实现范围（Relax RL 0.17.0）：** 内置普通 rollout、`GenerateState.post_generate` 和 Agentic SGLang adapter 注入上述 W3C 上下文。RL tracing 关闭或无有效来源 span 时不注入。现有路由 headers 保留；独立并发样本／Session 的上下文相互隔离。自定义生成若绕过这些入口、自行调用 HTTP 客户端，需使用相同的 `inference_headers` 辅助函数。
 
 SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL 的进程内文件 exporter 自动写出。采集两端后按 `(traceId, spanId, parentSpanId)` 还原父子关系；`rl.run.id`／`rl.step.id` 等属性不会由 parent 自动复制，可沿父链定位所属 RL span。不要用时间接近或业务 ID 伪造父关系。
 
@@ -108,21 +109,21 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 
 ## 2.1 批次、独立样本操作与结果明细
 
-每个实际批次操作生成一个总 span，记录该操作的 `rl.batch.id`、实际输入数 `rl.batch.size` 和完整结果。只有存在真实、可独立观测起止和结果的成员操作时才创建子 span。结果数组、逐样本统计或样本参与记录本身不构成独立操作；这些明细直接保留在批次的 JSON attributes 中，不生成零时长 span 或虚构时间事件。
+每个实际批次操作生成一个总 span，记录该操作的 `rl.batch.id`、实际输入数 `rl.batch.size` 和完整结果。只有存在真实、可独立观测起止和结果的成员操作时才创建样本级子 span。结果数组、逐样本统计或样本参与记录本身不构成独立操作；这些明细直接保留在批次的 JSON attributes 中，不生成零时长 span 或虚构时间事件。
 
-| 实际操作                     | 总 span                                                                               | 子 span                                | 结果明细位置与判断                                                                              |
-| ---------------------------- | ------------------------------------------------------------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| 普通／Agentic 完整 rollout   | `rl.rollout.generate`                                                                 | `rl.rollout.sample`、`rl.reward.batch` | 每条样本记录题目、response 和真实起止；每个实际评分批次单独列在 rollout 下                      |
-| 逐条调用评分器               | `rl.reward.batch`                                                                     | `rl.reward.score`                      | 保留：每条 Export 有独立评分调用，父级保留全批结果，子级保留自身结果                            |
-| 一次调用批量评分器           | `rl.reward.batch`                                                                     | 无                                     | `rl.reward.results` 保存所有成员；不能根据返回数组补造 score span                               |
-| Megatron 批量前向            | `rl.reference.forward`、`rl.teacher.forward`、`rl.critic.forward`、`rl.actor.forward` | 无                                     | `rl.forward.results` 保存成员结果；packed tensor 执行没有单样本调用边界                         |
-| OPD 单样本前向               | `rl.teacher.forward`、`rl.actor.forward`                                              | 无                                     | 一次真实调用只记录一个 span，batch.size=1，直接带样本身份与结果，不重复包装相同调用             |
-| 优势计算（包含自定义组计算） | `rl.advantage.compute`                                                                | 无                                     | `rl.advantage.results` 保存逐成员统计；优势可依赖整个 Group，统计行不是独立计算                 |
-| 过滤                         | `rl.data.filter`                                                                      | 无                                     | `rl.filter.results` 保存逐成员 keep/drop；当前组／批次决策不拆成虚构样本操作                    |
-| 数据传输                     | `rl.data.transfer`                                                                    | 无                                     | `rl.transfer.data` 保存成员与实际发送／ACK；共享批次 ACK 不拆成独立交付耗时                     |
-| Actor／Critic 训练           | `rl.actor.train`、`rl.critic.train`                                                   | 无                                     | `rl.train.results.uses` 保存样本参与记录，`updates` 保存优化器更新；训练按批次／microbatch 执行 |
+| 实际操作                     | 总 span                                                                               | 子 span                | 结果明细位置与判断                                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------- |
+| 普通／Agentic 完整 rollout   | `rl.rollout.generate`                                                                 | 样本及实际发起的子阶段 | 样本和评分的归属见下文；过滤、交付、自定义优势和 OPD 前向也按实际调用挂接                       |
+| 逐条调用评分器               | `rl.reward.batch`                                                                     | `rl.reward.score`      | 保留：每条 Export 有独立评分调用，父级保留全批结果，子级保留自身结果                            |
+| 一次调用批量评分器           | `rl.reward.batch`                                                                     | 无                     | `rl.reward.results` 保存所有成员；不能根据返回数组补造 score span                               |
+| Megatron 批量前向            | `rl.reference.forward`、`rl.teacher.forward`、`rl.critic.forward`、`rl.actor.forward` | 无                     | `rl.forward.results` 保存成员结果；packed tensor 执行没有单样本调用边界                         |
+| OPD 单样本前向               | `rl.teacher.forward`、`rl.actor.forward`                                              | 无                     | 一次真实调用只记录一个 span，batch.size=1，直接带样本身份与结果，不重复包装相同调用             |
+| 优势计算（包含自定义组计算） | `rl.advantage.compute`                                                                | 无                     | `rl.advantage.results` 保存逐成员统计；优势可依赖整个 Group，统计行不是独立计算                 |
+| 过滤                         | `rl.data.filter`                                                                      | 无                     | `rl.filter.results` 保存逐成员 keep/drop；当前组／批次决策不拆成虚构样本操作                    |
+| 数据传输                     | `rl.data.transfer`                                                                    | 无                     | `rl.transfer.data` 保存成员与实际发送／ACK；共享批次 ACK 不拆成独立交付耗时                     |
+| Actor／Critic 训练           | `rl.actor.train`、`rl.critic.train`                                                   | 无                     | `rl.train.results.uses` 保存样本参与记录，`updates` 保存优化器更新；训练按批次／microbatch 执行 |
 
-生成批次按输入 Sample 计数，评分等下游批次按实际输入 Export 计数，不能假定两者总数相同。真实子操作与总 span 共用 traceId，parentSpanId 指向真实总 span。评分批次与样本是生成 span 下的两类直接子操作，各评分批次拥有自己的 `rl.batch.id`。逐成员的数据来源通过 Link 关联：例如逐条 `rl.reward.score` 的 parent 是 `rl.reward.batch`，其 Link 指向实际消费的 `rl.rollout.sample`。批量评分没有 score 子 span 时，后续阶段 Link 到实际 `rl.reward.batch`；过滤与传输同样发布批次来源，保留逐成员业务 ID。SDK 显式使用真实父 Context，不手动拼接 traceId。
+生成批次按输入 Sample 计数，评分等下游批次按实际输入 Export 计数，不能假定两者总数相同。真实子操作与总 span 共用 traceId，parentSpanId 指向真实总 span。样本与 rollout 发起的各阶段都是生成 span 的直接子操作。评分、过滤、交付、优势与前向各自保留本阶段的批次身份和计数。逐成员的数据来源通过 Link 关联：例如逐条 `rl.reward.score` 的 parent 是 `rl.reward.batch`，其 Link 指向实际消费的 `rl.rollout.sample`。批量评分没有 score 子 span 时，后续阶段 Link 到实际 `rl.reward.batch`；过滤与传输同样发布批次来源，保留逐成员业务 ID。SDK 显式使用真实父 Context，不手动拼接 traceId。
 
 **完整调用与窗口：** Sample 暂停／可续跑中断不结束 span，恢复沿用同一 sample.id、spanId、traceId 和首次 parent；后续窗口通过 Link 和 `rl.sample.memberships` 记录实际归属，不重新挂 parent。一个完整 Sample 可以晚于首次接纳窗口结束。框架每次调用 rollout 函数（训练和评估分别计）创建一个生成 span，跨 Group 和补交共享。预取的 Session 继承发起准备的调用上下文，首次接纳后保留原 parent，实际消费轮次记在 sample 的 memberships 中。若调用返回时预取仍在决定是否接纳 Session，生成 span 可延后导出以记录准确的批次大小，结束时间仍取调用返回或抛错的时刻。
 
@@ -161,13 +162,21 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 
 自定义数据源可提供 `Sample.prompt_id`，也可沿用 `Sample.agentic_prompt_source["prompt_id"]` 或 `Sample.metadata["prompt_id"]`，按此顺序取首个有效值。字符串和整数形式的 ID 统一输出为字符串。对缺少稳定题目标识的自定义输入或旧数据，省略题目 ID，仍可按已有的样本、Export 身份查询。
 
+### 问答：怎样区分训练侧和 rollout 侧的同名 span？
+
+查 `rl.execution.side`。在普通和 Agentic rollout 中，实际发起的动态过滤 `rl.data.filter`、队列交付 `rl.data.transfer`、Agentic 自定义 `rl.advantage.compute`、OPD 的 `rl.teacher.forward` 和 `rl.actor.forward` 都标为 `rollout`。每个操作与当次 `rl.rollout.generate` 共享 traceId，parentSpanId 指向它。新根按实际框架调用划分；一次 step 可以有多次调用。相同 run、step 或样本来源 Link 单独都不足以确定 parent。单独调用专用的 OPD prefill、Agentic 自定义优势计算或 rollout 队列写入时，仍可从入口确定执行侧为 `rollout`，但保留根 span。独立调用通用过滤器或评分器、执行侧未知时省略此属性。
+
+Agentic 常驻任务在操作开始时固定 parent 和 Step。上一轮启动并跨轮完成的操作保留原归属。恢复后新启动的操作归当时的 rollout。在两轮之间独立开始、没有活动调用的操作省略 parent 和未知 Step。写队列回填旧分区时，`rl.step.id` 属于发起本次写入的 rollout，`rl.transfer.target.step_id` 表示实际写入的目标。rollout 函数返回后调用的样本过滤回调不在该调用范围内。
+
+训练侧 Megatron 的前向和优势计算、独立 Advantages 服务均标为 `training`，保留各自的调用边界与原生计时。例如，训练侧的 `rl.actor.forward` 可以是 `old_policy` 或 `distillation`；rollout 侧的 OPD student prefill 使用 `distillation`。按 `rl.execution.side` 区分谁执行，按 `rl.forward.purpose` 区分计算用途。一次训练采样中的 rollout 子操作可以同时具有 `rl.execution.side=rollout` 和 `rl.purpose=training`。
+
 ## 3 核心阶段 span
 
 ### Span: `rl.rollout.generate`
 
 **Status:** Development
 
-该 span 对应框架发起的一次 rollout 调用，记录这一调用接纳的所有样本。每个样本使用 `rl.rollout.sample`，通过 `rl.group.id` 标出所属 prompt group。这次调用发起的每个 `rl.reward.batch` 也是它的直接子 span，普通和 Agentic rollout 使用相同层级。一个 step 可以发起多次 rollout 调用。
+该 span 对应框架发起的一次 rollout 调用，记录这一调用接纳的所有样本。每个样本使用 `rl.rollout.sample`，通过 `rl.group.id` 标出所属 prompt group。这次调用发起的评分批次、动态过滤、队列写入、Agentic 自定义优势计算和 OPD teacher／student prefill 直接挂在它下面；各操作以实际发生次数计。普通和 Agentic rollout 使用相同的调用归属规则。一个 step 可以发起多次 rollout 调用。
 
 从框架调用 rollout 函数到该函数返回、失败或取消，包含函数内实际执行或等待的生成、评分、组后处理以及队列交付。并发工作按实际墙钟时间记录。后续训练和调用方的过滤不计入。
 
