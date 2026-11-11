@@ -38,6 +38,7 @@ from relax.agentic.pipeline import (
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
 from relax.utils.agentic_obs.records import utc_now
+from relax.utils.agentic_obs.source import sample_prompt_id
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
@@ -813,6 +814,7 @@ def _build_session_specs(
                 input_payload=input_payload,
                 sampling_params=sampling_params,
                 session_id=session_id,
+                prompt_id=sample_prompt_id(sample),
                 group_index=sample.group_index,
                 index=sample.index,
                 label=sample.label,

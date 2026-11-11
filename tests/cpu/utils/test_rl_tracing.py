@@ -34,7 +34,7 @@ def spans(root, name=None):
         for line in path.read_text().splitlines():
             for resource in json.loads(line)["resourceSpans"]:
                 for scope in resource["scopeSpans"]:
-                    assert scope["scope"] == {"name": "relax.rl", "version": "0.15.0"}
+                    assert scope["scope"] == {"name": "relax.rl", "version": "0.16.0"}
                     result.extend(scope["spans"])
     return [span for span in result if name is None or span["name"] == name]
 
@@ -615,22 +615,51 @@ def test_agent_trace_preserves_branches_attempts_and_cross_step_identity(run):
         forest=forest,
         group=SimpleNamespace(rollout_mode="train", group_id="group", result_cells={"session": None}),
     )
-    observation = AgentTrace(
-        args, session, SimpleNamespace(input_payload={"messages": [{"role": "user", "content": "task"}]})
+    from relax.agentic.pipeline.runtime import _build_session_specs
+    from relax.agentic.runner.ipc import SessionInput
+    from relax.utils.types import Sample
+
+    (spec,) = _build_session_specs(
+        [Sample(prompt="task", prompt_id="question-A")], session_ids=["session"], include_input_payload=True
     )
+    session_input = SessionInput(
+        "session", "train", "group", input_payload=spec.input_payload, prompt_id=spec.prompt_id
+    )
+    assert session_input.to_agent_payload() == {"messages": [{"role": "user", "content": "task"}]}
+    observation = AgentTrace(args, session, session_input)
     identity = observation.span.context()
     observation.assign(0)
     observation.assign(1)
     observation.execution_end(None)
     observation.capture_states(forest)
-    observation.capture_exports(
-        [
-            ("a", {"name": "first", "sample_payload": {"sample_export_id": 11, "response_length": 3, "reward": 0.0}}),
-            ("c", {"name": "second", "sample_payload": {"sample_export_id": 12, "response_length": 3}}),
-        ],
-        1.0,
-    )
+    exports = [
+        (
+            "a",
+            {"name": "first", "sample_payload": Sample(sample_export_id=11, response_length=3, reward=0.0).to_dict()},
+        ),
+        ("c", {"name": "second", "sample_payload": Sample(sample_export_id=12, response_length=3).to_dict()}),
+    ]
+    observation.capture_exports(exports, 1.0)
     observation.finish()
+
+    @hooks.trace_reward
+    async def score(args, sample):
+        return sample.sample_export_id / 10
+
+    for _, payload in exports:
+        asyncio.run(score(args, Sample.from_dict(payload["sample_payload"])))
+    (detail,) = spans(root, "rl.rollout.sample")
+    scores = spans(root, "rl.reward.score")
+    assert attrs(detail)["rl.prompt.id"] == spec.prompt_id == "question-A"
+    assert {(attrs(s)["rl.prompt.id"], attrs(s)["rl.sample.id"], attrs(s)["rl.export.id"]) for s in scores} == {
+        ("question-A", "session", "11"),
+        ("question-A", "session", "12"),
+    }
+    rows = [row for b in spans(root, "rl.reward.batch") for row in artifact(b, "rl.reward.results")]
+    assert {(r["prompt_id"], r["sample_id"], r["export_id"], r["value"]) for r in rows} == {
+        ("question-A", "session", "11", 1.1),
+        ("question-A", "session", "12", 1.2),
+    }
     record = spans(root)[0]
     assert identity["span_id"] == record["spanId"]
     assert "rl.step.id" not in attrs(record)
@@ -822,6 +851,7 @@ def test_complete_sample_continues_across_windows_and_keeps_input(run):
 
     args, root = run
     value = sample()
+    value.prompt_id = "question-before-resume"
     value.prompt = [{"role": "user", "content": "题目" * 10000}]
     value.response = "partial"
     value.status = SimpleNamespace(name="ABORTED")
@@ -863,6 +893,7 @@ def test_complete_sample_continues_across_windows_and_keeps_input(run):
     assert "rl.step.id" not in attrs(detail)
     assert len(artifact(detail, "rl.sample.memberships")) == 2
     assert artifact(detail, "rl.sample.input") == value.prompt
+    assert attrs(detail)["rl.prompt.id"] == resumed.prompt_id == "question-before-resume"
     assert artifact(detail, "rl.sample.response")[0]["text"] == resumed.response
     assert len(detail["links"]) == 1
 
@@ -872,6 +903,7 @@ def test_complete_sample_continues_across_windows_and_keeps_input(run):
 def test_custom_batch_reward_keeps_results_without_synthetic_children(run):
     args, root = run
     values = [sample(), sample()]
+    values[0].metadata["prompt_id"] = 0
 
     @hooks.trace_batched_reward
     async def reward(args, values):
@@ -881,7 +913,10 @@ def test_custom_batch_reward_keeps_results_without_synthetic_children(run):
     (batch,) = spans(root, "rl.reward.batch")
     assert not spans(root, "rl.reward.score")
     assert attrs(batch)["rl.batch.size"] == "2"
-    assert [row["value"] for row in artifact(batch, "rl.reward.results")] == [0.0, 1.0]
+    rows = artifact(batch, "rl.reward.results")
+    assert [row["value"] for row in rows] == [0.0, 1.0]
+    assert rows[0]["prompt_id"] == "0"
+    assert "prompt_id" not in rows[1]
     assert all(value.metadata["_rl_source"]["span_id"] == batch["spanId"] for value in values)
 
 
@@ -1318,13 +1353,24 @@ def test_custom_reward_batch_times_postprocessing_and_excludes_result_serializat
 
 @pytest.mark.parametrize("evaluation", [False, True])
 def test_framework_rollout_owns_multiple_submissions(run, evaluation):
+    import copy
+
     from relax.engine.rollout.base_types import call_rollout_fn
+    from relax.utils.data.data import Dataset
     from scripts.tools.validate_rl_traces import validate
 
     args, root = run
-    values = [sample() for _ in range(4)]
+    path = root.parent / "questions.jsonl"
+    path.write_text('{"text":"What is 2+2?"}\n{"text":"What is 3+3?"}\n')
+    dataset = Dataset(
+        str(path), None, None, None, record_prompt_id=True, source_split="eval" if evaluation else "train"
+    )
+    prompt_ids = {s.prompt_id for s in dataset.samples}
+    assert len(prompt_ids) == 2 and all(re.fullmatch(r"prompt_[0-9a-f]{64}", p) for p in prompt_ids)
+    values = [copy.deepcopy(s) for _ in range(2) for s in dataset.samples]
     for i, value in enumerate(values):
-        value.group_index = i // 2
+        value.group_index = i % 2
+        value.response = ("4", "6", "5", "7")[i]
         value.weight_versions = ["actor-7"]
 
     @hooks.trace_generation
@@ -1334,7 +1380,7 @@ def test_framework_rollout_owns_multiple_submissions(run, evaluation):
 
     @hooks.trace_reward
     async def score(args, value):
-        return 1.0
+        return float(value.response in ("4", "6"))
 
     async def pipeline(value):
         await score(args, await generate(None, args, value))
@@ -1366,7 +1412,15 @@ def test_framework_rollout_owns_multiple_submissions(run, evaluation):
     assert len({attrs(item)["rl.batch.id"] for item in [batch, *rewards]}) == 3
     scores = spans(root, "rl.reward.score")
     assert len(scores) == 4
+    answers = {attrs(s)["rl.sample.id"]: attrs(s)["rl.prompt.id"] for s in details}
+    assert len(answers) == 4
+    assert all(list(answers.values()).count(prompt_id) == 2 for prompt_id in prompt_ids)
+    assert all(attrs(s)["rl.prompt.id"] == answers[attrs(s)["rl.sample.id"]] for s in scores)
     for reward in rewards:
+        rows = artifact(reward, "rl.reward.results")
+        assert {row["prompt_id"] for row in rows} == prompt_ids
+        assert all(row["prompt_id"] == answers[row["sample_id"]] for row in rows)
+        assert "rl.prompt.id" not in attrs(reward)
         assert (reward["traceId"], reward["parentSpanId"]) == (batch["traceId"], batch["spanId"])
         assert attrs(reward)["rl.step.id"] == "iteration:3"
         assert attrs(reward)["rl.purpose"] == attrs(batch)["rl.purpose"]

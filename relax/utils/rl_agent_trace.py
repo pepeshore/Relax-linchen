@@ -114,6 +114,7 @@ class AgentTrace:
     def __init__(self, args: Any, session: Any, session_input: Any) -> None:
         self.observation = session.observation
         self.session_id = session.session_id
+        self.prompt_id = getattr(session_input, "prompt_id", None)
         self.steps: set[int] = set()
         self.exports: list[dict[str, Any]] = []
         self.version: str | None = None
@@ -146,6 +147,7 @@ class AgentTrace:
             inherit_iteration=False,
             attributes={
                 **attrs,
+                "rl.prompt.id": self.prompt_id,
                 "rl.group.id": session.group.group_id,
                 "rl.sample.id": session.session_id,
                 "rl.session.id": session.session_id,
@@ -224,6 +226,8 @@ class AgentTrace:
             if not isinstance(metadata, dict):
                 metadata = sample["metadata"] = {}
             metadata.update(_rl_sample_id=self.session_id, _rl_source=self.sample.context())
+            if self.prompt_id is not None:
+                sample["prompt_id"] = self.prompt_id
             if self.version is not None:
                 metadata["_rl_session_model_version"] = self.version
             item = {

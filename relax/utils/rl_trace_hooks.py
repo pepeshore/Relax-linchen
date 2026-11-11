@@ -15,6 +15,7 @@ from contextvars import ContextVar
 from functools import wraps
 from typing import Any, Callable
 
+from relax.utils.agentic_obs.source import sample_prompt_id
 from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.rl_sample_trace import admit_sample, sample_attributes
 from relax.utils.rl_tracing import (
@@ -356,6 +357,8 @@ def record_rewards(observation: Any, samples: list[Any], values: list[Any], args
             "status": "valid",
             "value": value,
         }
+        if (prompt_id := sample_prompt_id(sample)) is not None:
+            item["prompt_id"] = prompt_id
         if isinstance(value, dict) and getattr(args, "reward_key", None):
             item["scalar_key"] = args.reward_key
         if value is None:
@@ -385,6 +388,7 @@ def trace_reward(function: Callable) -> Callable:
         attrs = {
             **batch.observation.child_attributes(),
             **sample_attributes(sample),
+            "rl.prompt.id": sample_prompt_id(sample),
             "rl.export.id": export_id(sample),
             "rl.sample.timing": "operation",
         }
@@ -483,6 +487,8 @@ class RewardBatch:
                 else {}
             ),
         }
+        if (prompt_id := sample_prompt_id(sample)) is not None:
+            row["prompt_id"] = prompt_id
         if error is not None:
             row.update(status="error", reason=f"{type(error).__name__}: {error}")
             self.error = self.error or error

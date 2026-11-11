@@ -1647,6 +1647,7 @@ class AgenticSessionShard:
                         rollout_mode=rollout_mode,
                         input_payload=session_spec.input_payload,
                         rollout_trace=session_spec.rollout_trace,
+                        prompt_id=getattr(session_spec, "prompt_id", None),
                     ),
                 )
         except BaseException as error:

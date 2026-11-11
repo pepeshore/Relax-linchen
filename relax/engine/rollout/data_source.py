@@ -12,6 +12,7 @@ from relax.utils.data.processing_utils import load_processor, load_tokenizer
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.multimodal.config import MultimodalConfig
+from relax.utils.rl_tracing import enabled as rl_tracing_enabled
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.types import Sample
 
@@ -105,6 +106,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
             teacher_multimodal_keys=teacher_mm_keys,
             record_source=agentic_obs_enabled(args),
+            record_prompt_id=rl_tracing_enabled(args),
         )
     else:
         logger.info("Using traditional Dataset (eager loading)")
@@ -128,6 +130,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
             teacher_multimodal_keys=teacher_mm_keys,
             record_source=agentic_obs_enabled(args),
+            record_prompt_id=rl_tracing_enabled(args),
         )
 
 

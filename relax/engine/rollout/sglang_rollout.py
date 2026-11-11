@@ -61,6 +61,7 @@ from relax.utils.rl_trace_hooks import (
     trace_iteration,
     track_generation_task,
 )
+from relax.utils.rl_tracing import enabled as rl_tracing_enabled
 from relax.utils.rl_tracing import inference_headers
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.score_centering import (
@@ -1384,7 +1385,8 @@ async def eval_rollout_single_dataset(
     global EVAL_PROMPT_DATASET
 
     prepare_model_maybe_update_args(args, completeness="metadata")
-    cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template)
+    record_prompt_id = rl_tracing_enabled(args)
+    cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template, record_prompt_id)
     if cache_key not in EVAL_PROMPT_DATASET:
         tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
@@ -1402,6 +1404,8 @@ async def eval_rollout_single_dataset(
             apply_chat_template_kwargs=args.apply_chat_template_kwargs,
             use_audio_in_video=args.use_audio_in_video,
             system_prompt=args.system_prompt,
+            record_prompt_id=record_prompt_id,
+            source_split="eval",
         )
     dataset = EVAL_PROMPT_DATASET[cache_key]
 

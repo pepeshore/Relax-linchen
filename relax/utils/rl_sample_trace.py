@@ -9,6 +9,7 @@ import copy
 import uuid
 from typing import Any
 
+from relax.utils.agentic_obs.source import sample_prompt_id
 from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.rl_tracing import Stage, current_rollout, iteration_attributes, run_id
 
@@ -33,7 +34,13 @@ class SampleTrace:
             sample.metadata = {}
         identity = sample.metadata.setdefault("_rl_sample_id", uuid.uuid4().hex)
         self.key = (run_id(args), identity)
-        attrs = {**parent.child_attributes(), **sample_attributes(sample), "rl.sample.timing": "operation"}
+        self.prompt_id = sample_prompt_id(sample)
+        attrs = {
+            **parent.child_attributes(),
+            **sample_attributes(sample),
+            "rl.prompt.id": self.prompt_id,
+            "rl.sample.timing": "operation",
+        }
         group = sample.metadata.get("_rl_group_id", getattr(sample, "group_index", None))
         if group is not None:
             attrs["rl.group.id"] = str(group)
@@ -75,6 +82,8 @@ class SampleTrace:
             if not isinstance(result.metadata, dict):
                 result.metadata = {}
             result.metadata["_rl_sample_id"] = self.key[1]
+            if self.prompt_id is not None:
+                result.prompt_id = self.prompt_id
         _publish_source(results, self.span)
         responses = [
             {

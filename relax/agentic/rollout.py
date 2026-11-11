@@ -53,6 +53,7 @@ from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_va
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
 from relax.utils.rl_trace_hooks import resident_reward_parent, trace_iteration
 from relax.utils.rl_tracing import Stage, current_rollout, iteration_context
+from relax.utils.rl_tracing import enabled as rl_tracing_enabled
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
 from relax.utils.types import Sample
@@ -1213,6 +1214,7 @@ def _build_eval_samples(
             system_prompt=args.system_prompt,
             custom_prompt_func=custom_prompt_func,
             record_source=agentic_obs_enabled(args),
+            record_prompt_id=rl_tracing_enabled(args),
             source_split="eval",
         )
         samples = []

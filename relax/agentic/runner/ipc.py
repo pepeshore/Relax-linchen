@@ -338,6 +338,7 @@ class SessionInput:
     input_payload: dict[str, Any] = field(default_factory=dict)
     rollout_trace: dict[str, Any] | None = None
     agent_trace_headers: dict[str, str] | None = None
+    prompt_id: str | None = None
 
     def to_agent_payload(self) -> dict[str, Any]:
         return copy.deepcopy(self.input_payload)

@@ -1515,6 +1515,18 @@ def test_prompt_source_survives_slices_shuffle_and_replication(tmp_path, extensi
     eager_sources = [sample.agentic_prompt_source for sample in eager.samples]
     stream_sources = [streaming[i].agentic_prompt_source for i in range(len(streaming))]
     assert eager_sources == stream_sources
+    for dataset_type in (Dataset, StreamingDataset):
+        lightweight = dataset_type(
+            **{**options, "record_source": False, "record_prompt_id": True},
+            custom_prompt_func=lambda _prompt, _row: "changed template",
+        )
+        expected_ids = {source["prompt_id"] for source in eager_sources}
+        assert len(expected_ids) == len(eager_sources)
+        for epoch in (0, 1):
+            lightweight.shuffle(epoch)
+            samples = [lightweight[i] for i in range(len(lightweight))]
+            assert {sample.prompt_id for sample in samples} == expected_ids
+            assert all(sample.agentic_prompt_source is None for sample in samples)
     assert [source["source_row_id"] for source in eager_sources] == expected_rows
     assert eager_sources[0]["prompt_id"] != eager_sources[1]["prompt_id"]
     for epoch in (0, 1, 4):
