@@ -10,7 +10,7 @@ import uuid
 from typing import Any
 
 from relax.utils.agentic_obs.writers import best_effort
-from relax.utils.rl_tracing import Stage, iteration_attributes, run_id
+from relax.utils.rl_tracing import Stage, current_rollout, iteration_attributes, run_id
 
 
 _LIVE: dict[tuple[str, str], SampleTrace] = {}
@@ -34,6 +34,9 @@ class SampleTrace:
         identity = sample.metadata.setdefault("_rl_sample_id", uuid.uuid4().hex)
         self.key = (run_id(args), identity)
         attrs = {**parent.child_attributes(), **sample_attributes(sample), "rl.sample.timing": "operation"}
+        group = sample.metadata.get("_rl_group_id", getattr(sample, "group_index", None))
+        if group is not None:
+            attrs["rl.group.id"] = str(group)
         attrs.pop("rl.step.id", None)
         attrs.pop("rl.iteration.index", None)
         self.span = Stage(args, "rl.rollout.sample", parent=parent, attributes=attrs, inherit_iteration=False)
@@ -45,6 +48,9 @@ class SampleTrace:
 
     def admit(self, parent: Stage) -> None:
         attrs = parent.child_attributes()
+        rollout = current_rollout()
+        if rollout is not None and rollout.span is parent:
+            rollout.admit([self.key[1]])
         membership = {"batch_id": attrs.get("rl.batch.id")}
         iteration = iteration_attributes()
         if iteration:
@@ -85,6 +91,9 @@ class SampleTrace:
         versions = {str(v) for history in histories if history for v in history if v not in (None, "")}
         known = histories and all(history and all(v not in (None, "") for v in history) for history in histories)
         self.version = next(iter(versions)) if known and len(versions) == 1 else None
+        rollout = current_rollout()
+        if rollout is not None:
+            rollout.version(self.key[1], None if continuing else self.version)
         # ABORTED can be carried to a later window even with partial_rollout=False.
         if continuing:
             return

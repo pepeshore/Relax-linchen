@@ -34,7 +34,7 @@ def spans(root, name=None):
         for line in path.read_text().splitlines():
             for resource in json.loads(line)["resourceSpans"]:
                 for scope in resource["scopeSpans"]:
-                    assert scope["scope"] == {"name": "relax.rl", "version": "0.13.0"}
+                    assert scope["scope"] == {"name": "relax.rl", "version": "0.14.0"}
                     result.extend(scope["spans"])
     return [span for span in result if name is None or span["name"] == name]
 
@@ -885,7 +885,7 @@ def test_custom_batch_reward_keeps_results_without_synthetic_children(run):
 
 
 @pytest.mark.parametrize("startup_failure", [False, True])
-def test_agent_group_owns_samples_and_keeps_agents_independent(run, startup_failure):
+def test_agent_group_owns_samples_and_their_agent_runs(run, startup_failure):
     from relax.utils.rl_agent_trace import AgentTrace, trace_agentic_group
 
     args, root = run
@@ -935,8 +935,8 @@ def test_agent_group_owns_samples_and_keeps_agents_independent(run, startup_fail
     assert attrs(batch)["rl.batch.size"] == "2"
     assert batch.get("status", {}).get("code", 0) == (2 if startup_failure else 0)
     assert all(d["parentSpanId"] == batch["spanId"] and d["traceId"] == batch["traceId"] for d in details)
-    assert all(a["traceId"] != batch["traceId"] and not a.get("parentSpanId") for a in agents)
-    assert {a["links"][0]["spanId"] for a in agents} == {d["spanId"] for d in details}
+    assert all(a["traceId"] == batch["traceId"] for a in agents)
+    assert {a["parentSpanId"] for a in agents} == {d["spanId"] for d in details}
 
 
 def test_bad_custom_scorer_shape_does_not_replace_business_return(run):
@@ -1296,3 +1296,201 @@ def test_custom_reward_batch_times_postprocessing_and_excludes_result_serializat
     (record,) = spans(root, "rl.reward.batch")
     assert int(record["endTimeUnixNano"]) == 400
     assert int(spans(root, "rl.reward.score")[0]["endTimeUnixNano"]) == 200
+
+
+@pytest.mark.parametrize("evaluation", [False, True])
+def test_framework_rollout_owns_multiple_submissions(run, evaluation):
+    from relax.engine.rollout.base_types import call_rollout_fn
+
+    args, root = run
+    values = [sample() for _ in range(4)]
+    for i, value in enumerate(values):
+        value.group_index = i // 2
+        value.weight_versions = ["actor-7"]
+
+    @hooks.trace_generation
+    async def generate(state, config, value):
+        await asyncio.sleep(0)
+        return value
+
+    async def collect():
+        for offset in range(0, 4, 2):
+            with hooks.generation_batch(args, evaluation=evaluation):
+                tasks = [
+                    hooks.track_generation_task(asyncio.create_task(generate(None, args, value)), [value])
+                    for value in values[offset : offset + 2]
+                ]
+            await asyncio.gather(*tasks)
+        assert not spans(root, "rl.rollout.generate")
+        return values
+
+    call_rollout_fn(lambda *a, **k: asyncio.run(collect()), args, 3, evaluation=evaluation)
+    (batch,) = spans(root, "rl.rollout.generate")
+    details = spans(root, "rl.rollout.sample")
+    assert attrs(batch)["rl.batch.size"] == "4"
+    assert attrs(batch)["rl.model.version"] == "actor-7"
+    assert attrs(batch)["rl.step.id"] == "iteration:3"
+    assert attrs(batch)["rl.purpose"] == ("evaluation" if evaluation else "training")
+    assert sorted(attrs(s)["rl.group.id"] for s in details) == ["0", "0", "1", "1"]
+    assert all(s["parentSpanId"] == batch["spanId"] and s["traceId"] == batch["traceId"] for s in details)
+    assert all(int(s["endTimeUnixNano"]) <= int(batch["endTimeUnixNano"]) for s in details)
+
+
+def test_agent_callback_preserves_its_call_or_falls_back_to_its_session(run):
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    from relax.engine.rollout.base_types import call_rollout_fn
+    from relax.utils.rl_agent_trace import AgentTrace
+
+    args, root = run
+    args.use_agentic_rollout = True
+    args.agent_command = "example"
+    external = TracerProvider()
+    exported = InMemorySpanExporter()
+    external.add_span_processor(SimpleSpanProcessor(exported))
+    tracer = external.get_tracer("test.external")
+    propagator = TraceContextTextMapPropagator()
+
+    async def simulate_session(sid):
+        rollout = tracing.current_rollout()
+        rollout.admit([sid])
+        session = SimpleNamespace(
+            session_id=sid,
+            observation=SimpleNamespace(calls={}),
+            session_sampling_params={},
+            forest=None,
+            group=SimpleNamespace(rollout_mode="train", group_id="prompt", result_cells={"A": None, "B": None}),
+        )
+        # Ray crosses a serialization boundary, including when preparation is prefetched.
+        origin = json.loads(json.dumps(rollout.carrier()))
+        agent = AgentTrace(args, session, SimpleNamespace(input_payload={}, rollout_trace=origin))
+        launch = agent.span.headers()
+        with tracer.start_as_current_span("llm.call", context=propagator.extract(launch)) as app:
+            callback = {}
+            propagator.inject(callback)
+            callback["tracestate"] = "vendor=local"
+            foreign = dict(traceparent="00-" + "1" * 32 + "-" + "2" * 16 + "-01", tracestate="wrong=foreign")
+            for incoming, forwarded in [
+                (callback, True),
+                (None, False),
+                (foreign, False),
+                ({"traceparent": "bad", "tracestate": "wrong=bad"}, False),
+            ]:
+                with tracing.inference_context(agent.span, incoming):
+                    await asyncio.sleep(0)
+                    carrier = tracing.inference_headers({"X-SMG-Routing-Key": sid})
+                    assert carrier["X-SMG-Routing-Key"] == sid
+                    assert carrier.get("tracestate") == ("vendor=local" if forwarded else None)
+                    with tracer.start_as_current_span("Req", context=propagator.extract(carrier)) as req:
+                        expected = app if forwarded else agent.span.span
+                        assert req.parent.span_id == expected.get_span_context().span_id
+                        assert req.parent.trace_id == rollout.span.span.get_span_context().trace_id
+            app.set_attribute("session", sid)
+        agent.assign(0)
+        agent.finish()
+
+    async def collect():
+        await asyncio.gather(simulate_session("A"), simulate_session("B"))
+        return []
+
+    try:
+        call_rollout_fn(lambda *a, **k: asyncio.run(collect()), args, 0, evaluation=False)
+        (batch,) = spans(root, "rl.rollout.generate")
+        agents = {attrs(s)["rl.session.id"]: s for s in spans(root, "rl.agent.run")}
+        details = {attrs(s)["rl.session.id"]: s for s in spans(root, "rl.rollout.sample")}
+        calls = [s for s in exported.get_finished_spans() if s.name == "llm.call"]
+        assert len(calls) == 2 and attrs(batch)["rl.batch.size"] == "2"
+        for call in calls:
+            sid = call.attributes["session"]
+            assert details[sid]["parentSpanId"] == batch["spanId"]
+            assert agents[sid]["parentSpanId"] == details[sid]["spanId"]
+            assert call.parent.span_id == int(agents[sid]["spanId"], 16)
+    finally:
+        external.shutdown()
+
+
+def test_prefetched_agent_keeps_first_parent_and_links_consumer(run):
+    from relax.utils.rl_agent_trace import AgentTrace
+
+    args, root = run
+    args.agent_command = "agent.py"
+    args.use_agentic_rollout = True
+    with tracing.rollout_call(args, 0, False):
+        origin = tracing.current_rollout()
+        origin.admit(["prefetched"])
+        session = SimpleNamespace(
+            session_id="prefetched",
+            session_sampling_params={},
+            observation=SimpleNamespace(calls={}),
+            forest=None,
+            group=SimpleNamespace(group_id="g", result_cells={}, rollout_mode="train"),
+        )
+        origin_carrier = origin.carrier()
+    agent = AgentTrace(args, session, SimpleNamespace(input_payload={}, rollout_trace=origin_carrier))
+    with tracing.rollout_call(args, 1, False):
+        consumer = tracing.current_rollout()
+        consumer.admit(["prefetched"])
+        agent.assign(1, consumer.carrier())
+        agent.assign(1, consumer.carrier())
+        agent.finish()
+    roots = {attrs(s)["rl.step.id"]: s for s in spans(root, "rl.rollout.generate")}
+    (detail,) = spans(root, "rl.rollout.sample")
+    assert detail["parentSpanId"] == roots["iteration:0"]["spanId"]
+    assert len(detail["links"]) == 1 and detail["links"][0]["spanId"] == roots["iteration:1"]["spanId"]
+    memberships = artifact(detail, "rl.sample.memberships")
+    assert memberships == [
+        {"batch_id": attrs(roots["iteration:0"])["rl.batch.id"]},
+        {"batch_id": attrs(roots["iteration:1"])["rl.batch.id"], "step_id": "iteration:1"},
+    ]
+
+
+def test_rollout_prefetch_counts_late_admission_without_extending_duration(run, monkeypatch):
+    args, root = run
+    now = {"ns": 100}
+    monkeypatch.setattr(tracing.time, "time_ns", lambda: now["ns"])
+
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        fetch, decision, cleanup = [loop.create_future() for _ in range(3)]
+        with tracing.rollout_call(args, 0, False) as origin:
+            origin.track_admission(fetch)
+            now["ns"] = 200
+        assert not spans(root, "rl.rollout.generate")
+        now["ns"] = 300
+        origin.track_admission(decision, cleanup)
+        fetch.set_result(None)
+        await asyncio.sleep(0)
+        assert not spans(root, "rl.rollout.generate")
+        decision.set_result(True)
+        origin.admit(["late"])
+        await asyncio.sleep(0)
+        cleanup.cancel()
+        await asyncio.sleep(0)
+
+    asyncio.run(exercise())
+    (record,) = spans(root, "rl.rollout.generate")
+    assert int(record["endTimeUnixNano"]) == 200
+    assert attrs(record)["rl.batch.size"] == "1"
+
+
+def test_resumed_group_attributes_model_version_to_consuming_rollout(run):
+    from relax.engine.rollout.base_types import RolloutFnTrainOutput, call_rollout_fn
+
+    args, root = run
+    args.use_agentic_rollout = True
+    member = sample()
+    member.metadata = {"_rl_sample_id": "resumed", "_rl_session_model_version": "actor-4"}
+    with tracing.rollout_call(args, 0, False) as origin:
+        origin.admit(["resumed"])
+
+    def consume(*args, **kwargs):
+        tracing.current_rollout().admit(["resumed"])
+        return RolloutFnTrainOutput(samples=[[member]])
+
+    call_rollout_fn(consume, args, 1, evaluation=False)
+    roots = {attrs(s)["rl.step.id"]: attrs(s) for s in spans(root, "rl.rollout.generate")}
+    assert "rl.model.version" not in roots["iteration:0"]
+    assert roots["iteration:1"]["rl.model.version"] == "actor-4"

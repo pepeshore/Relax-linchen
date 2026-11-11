@@ -94,7 +94,7 @@ def trace_agentic_group(function: Any) -> Any:
         # Ray serializes this wrapper by value as part of the actor class.
         from relax.utils.rl_agent_trace import _AGENT_BATCH
 
-        if not enabled(owner.args) or not session_specs:
+        if not enabled(owner.args) or not session_specs or getattr(session_specs[0], "rollout_trace", None):
             return await function(owner, rollout_mode, group_id, session_specs)
         batch = AgentBatch(owner.args, group_id, rollout_mode, {spec.session_id for spec in session_specs})
         token = _AGENT_BATCH.set(batch)
@@ -127,16 +127,26 @@ class AgentTrace:
             self.input["label"] = copy.deepcopy(session.forest.label)
             self.input["tools"] = copy.deepcopy(session_input.input_payload.get("tools", []))
         self.external_links = copy.deepcopy(getattr(session.forest, "static_metadata", {}).get("external_links", []))
-        self.batch = _AGENT_BATCH.get() or AgentBatch(
-            args, session.group.group_id, session.group.rollout_mode, {session.session_id}
-        )
+        origin = getattr(session_input, "rollout_trace", None)
+        self.batch = None
+        if origin is None:
+            # Direct Shard calls outside a framework rollout own their standalone group.
+            self.batch = _AGENT_BATCH.get() or AgentBatch(
+                args, session.group.group_id, session.group.rollout_mode, {session.session_id}
+            )
+        attrs = origin["attributes"] if origin else self.batch.span.child_attributes()
+        attrs = {k: v for k, v in attrs.items() if k not in ("rl.step.id", "rl.iteration.index")}
+        self.batch_id = attrs.get("rl.batch.id")
+        self.memberships: list[dict[str, str]] = [{"batch_id": self.batch_id}]
         self.sample = Stage(
             args,
             "rl.rollout.sample",
-            parent=self.batch.span,
+            parent=self.batch.span if self.batch else None,
+            parent_headers=origin["headers"] if origin else None,
             inherit_iteration=False,
             attributes={
-                **self.batch.span.child_attributes(),
+                **attrs,
+                "rl.group.id": session.group.group_id,
                 "rl.sample.id": session.session_id,
                 "rl.session.id": session.session_id,
                 "rl.sample.timing": "operation",
@@ -147,7 +157,7 @@ class AgentTrace:
         self.span = Stage(
             args,
             "rl.agent.run",
-            links=[self.sample.context()],
+            parent=self.sample,
             inherit_iteration=False,
             attributes={
                 "rl.sample.id": session.session_id,
@@ -160,8 +170,16 @@ class AgentTrace:
         )
 
     @best_effort
-    def assign(self, iteration: int) -> None:
+    def assign(self, iteration: int, rollout_trace: dict | None = None) -> None:
         self.steps.add(iteration)
+        batch_id = rollout_trace["attributes"]["rl.batch.id"] if rollout_trace else self.batch_id
+        membership = {"batch_id": batch_id, "step_id": f"iteration:{iteration}"}
+        if batch_id == self.batch_id and self.memberships == [{"batch_id": self.batch_id}]:
+            self.memberships.clear()
+        if membership not in self.memberships:
+            self.memberships.append(membership)
+            if rollout_trace and batch_id != self.batch_id:
+                self.sample.add_link(rollout_trace["context"])
 
     @best_effort
     def execution_end(self, error: BaseException | None) -> None:
@@ -206,6 +224,8 @@ class AgentTrace:
             if not isinstance(metadata, dict):
                 metadata = sample["metadata"] = {}
             metadata.update(_rl_sample_id=self.session_id, _rl_source=self.sample.context())
+            if self.version is not None:
+                metadata["_rl_session_model_version"] = self.version
             item = {
                 "export_id": str(sample["sample_export_id"]),
                 "name": payload["name"],
@@ -286,20 +306,15 @@ class AgentTrace:
                     node = nodes.get(node["parent_hash"])
             if responses:
                 self.sample.data("rl.sample.response", responses)
-            self.sample.data(
-                "rl.sample.memberships",
-                [
-                    {"batch_id": self.batch.span.child_attributes().get("rl.batch.id"), "step_id": f"iteration:{step}"}
-                    for step in sorted(self.steps)
-                ],
-            )
+            self.sample.data("rl.sample.memberships", self.memberships)
             if len(self.steps) == 1:
                 for key, value in iteration_attributes(next(iter(self.steps))).items():
                     self.sample.set(key, value)
         finally:
             self.span.end(error)
             self.sample.end(error)
-            self.batch.finish(self.session_id, self.steps, error, self.version, end_time=end_time)
+            if self.batch is not None:
+                self.batch.finish(self.session_id, self.steps, error, self.version, end_time=end_time)
 
 
 @best_effort

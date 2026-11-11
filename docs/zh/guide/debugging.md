@@ -169,7 +169,7 @@ batch 相关参数（`--global-batch-size`、`--n-samples-per-prompt`、并行�
 
 提交任务前设置 `RELAX_OTEL_DIR` 可更改输出根目录，设置 `RELAX_OTEL_ENABLED=0` 可关闭 RL trace，`OTEL_SDK_DISABLED=true` 也会关闭采集。若需要在一台机器上读取所有 worker 的数据，请使用共享持久化目录；使用节点本地磁盘时，需要分别收集各 worker 的文件。采集不依赖 Collector 地址。
 
-内置普通 rollout 和 Agentic rollout 会通过 W3C headers 将对应 RL span 传给 SGLang：普通请求的 parent 是 `rl.rollout.sample`，Agentic 请求的 parent 是 `rl.agent.run`。SGLang 请求继承相同 trace ID，其内部父子树保持不变。使用 `--sglang-enable-trace --sglang-otlp-traces-endpoint "$SGLANG_TRACE_ENDPOINT"` 启用后端采集；该地址必须能被各推理节点访问。后端仍单独导出，不会自动写入上述 RL 文件。
+内置普通 rollout 和 Agentic rollout 会通过 W3C headers 将对应 RL span 传给 SGLang：普通请求的 parent 是 `rl.rollout.sample`，Agentic 请求使用该回调中有效、同 trace 的父上下文，缺失、无效或跨 trace 时使用当前 `rl.agent.run`。SGLang 请求继承相同 trace ID，其内部父子树保持不变。使用 `--sglang-enable-trace --sglang-otlp-traces-endpoint "$SGLANG_TRACE_ENDPOINT"` 启用后端采集；该地址必须能被各推理节点访问。后端仍单独导出，不会自动写入上述 RL 文件。
 
 仓库提供一个用于实验验证的 OTLP/gRPC 接收器，在装有 SGLang tracing 依赖的环境中运行：
 
@@ -185,7 +185,7 @@ PYTHONPATH=. python scripts/tools/collect_otlp_traces.py \
 
 采集高吞吐、多轮推理时，导出队列不足可能导致 spans 丢失，即使请求入口关联正确也会出现缺失的父节点。上述 smoke 脚本启用 SGLang tracing 时默认使用 `OTEL_BSP_MAX_QUEUE_SIZE=65536` 和 `SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE=512`，可通过环境变量覆盖。接收器建议先写节点本地磁盘，训练及导出结束后再复制到持久化存储；应校验完整父链，不能仅检查请求入口数量。
 
-各批次阶段使用独立 trace，通过 `rl.run.id` 和 `rl.step.id` 关联；`rl.iteration.index` 保留从 0 开始的 rollout 轮次。每个批次记录自身 `rl.batch.id` 和实际输入数，真实成员操作 span 与批次共用 trace 并指定真实 parent：`rl.rollout.sample` 记录一条输入的完整 rollout，`rl.reward.score` 归属于 `rl.reward.batch`。不同阶段的依赖使用 Links。Agent 调用保持独立 trace，并 Link 到对应样本。
+各批次阶段使用独立 trace，通过 `rl.run.id` 和 `rl.step.id` 关联；`rl.iteration.index` 保留从 0 开始的 rollout 轮次。每个批次记录自身 `rl.batch.id` 和实际输入数，真实成员操作 span 与批次共用 trace 并指定真实 parent：`rl.rollout.sample` 记录一条输入的完整 rollout，`rl.reward.score` 归属于 `rl.reward.batch`。不同阶段的依赖使用 Links。每次框架发起 rollout 产生一个 `rl.rollout.generate`，其耗时包含函数返回前的等待。不同 prompt group 的样本通过 `rl.group.id` 区分。`rl.agent.run` 是本 Session 样本的子 span。Agent 可提取子进程环境中的 `RELAX_TRACEPARENT`／`RELAX_TRACESTATE`，在发起模型请求时注入当前调用的 W3C 上下文。
 
 结构化结果、题目和 response 直接以完整 JSON 字符串保存在 span 属性中，新 trace 不依赖 `_ref` 附件。仅真实的逐样本 rollout 和评分调用创建子 span，标记 `rl.sample.timing=operation`。批量评分、前向、优势、过滤、传输和训练将成员结果保存在批次 span 上，不生成零时长结果 span。OPD 单样本前向只保留一个真实请求 span。训练 uses 通过 update_id 关联 updates 中的更新结果。旧版 0.10 的 result span 可兼容读取，但应与执行时间线分开展示。父子 span 的耗时也不能相加。Agentic 运行还会启用已有 observation 记录，保存 Session 的请求、尝试、状态及 Export，并通过 Export ID 关联实际训练消费。无法观测的外部工具时间保持未知。这些记录包含模型输入输出，应根据训练数据设置目录权限和保留期限。
 

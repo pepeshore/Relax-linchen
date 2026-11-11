@@ -1773,7 +1773,14 @@ def test_session_lifecycle_exports_one_otel_agent_span(tmp_path, rollout_module,
             output=SimpleNamespace(reward=1.0, metadata={}, records=()),
         )
         shard._agent_launcher = SimpleNamespace(start_agent=lambda payload: process)
-        shard._start_session(session, SimpleNamespace(input_payload={"messages": [{"role": "user", "content": "hi"}]}))
+        from relax.agentic.runner import SessionInput
+
+        shard._start_session(
+            session,
+            SessionInput(
+                session.session_id, "train", session.group.group_id, {"messages": [{"role": "user", "content": "hi"}]}
+            ),
+        )
         watcher = session.resources.watcher_task
         await shard.resume_generation(0)
         original_context = session.observation.rl_trace.span.context()
@@ -2677,6 +2684,6 @@ def test_real_shard_group_exports_batch_and_sample_spans(tmp_path, rollout_modul
     agents = [span for span in records if span["name"] == "rl.agent.run"]
     assert len(samples) == len(agents) == 2
     assert all(s["parentSpanId"] == batch["spanId"] and s["traceId"] == batch["traceId"] for s in samples)
-    assert {a["links"][0]["spanId"] for a in agents} == {s["spanId"] for s in samples}
-    assert all(a["traceId"] != batch["traceId"] for a in agents)
+    assert {a["parentSpanId"] for a in agents} == {s["spanId"] for s in samples}
+    assert all(a["traceId"] == batch["traceId"] for a in agents)
     assert batch.get("status", {}).get("code", 0) == (2 if startup_failure else 0)

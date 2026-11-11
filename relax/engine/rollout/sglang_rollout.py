@@ -1430,6 +1430,7 @@ async def eval_rollout_single_dataset(
                 sample.index = sample_index
                 sample_index += 1
                 sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
+                sample.metadata["_rl_group_id"] = f"eval:{dataset_cfg.name}:{rollout_id}:{_i}"
                 sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
                 group.append(sample)
             sampling_params = base_sampling_params
@@ -1470,6 +1471,7 @@ async def eval_rollout_single_dataset(
                 sample.index = sample_index
                 sample_index += 1
                 sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
+                sample.metadata["_rl_group_id"] = f"eval:{dataset_cfg.name}:{rollout_id}:{_i}"
                 sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
                 sampling_params = base_sampling_params
                 if getattr(args, "sglang_enable_deterministic_inference", False):

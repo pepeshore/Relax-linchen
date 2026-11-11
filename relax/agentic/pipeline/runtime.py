@@ -41,7 +41,7 @@ from relax.utils.agentic_obs.records import utc_now
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
-from relax.utils.rl_tracing import inference_headers
+from relax.utils.rl_tracing import current_rollout, inference_headers
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.score_centering import (
     configure_score_centering_request,
@@ -1011,7 +1011,13 @@ class RuntimeDomain:
             self._inventory.preparation_failed(group_id, session_ids, error, started_at=prepare_started_at)
             raise
         self._inventory.record_group(group_id, group_input.samples, session_ids, started_at=prepare_started_at_utc)
+        rollout = current_rollout()
+        if rollout is not None:
+            rollout.span.set("rl.backend.name", "sglang")
+            rollout.admit(list(session_ids))
+        rollout_trace = rollout.carrier() if rollout is not None else None
         for spec in session_specs:
+            spec.rollout_trace = rollout_trace
             spec.observation_stage_id = f"session:{spec.session_id}:rollout"
             spec.observation_started_at = prepare_started_at_utc
         shard.group_streams[group_id] = stream
@@ -1074,7 +1080,12 @@ class RuntimeDomain:
         if stream.trace_admitted_at is None:
             stream.trace_admitted_at = time.time_ns()
         try:
-            await stream.shard.handle.lease_group.remote(stream.group_id, rollout_id)
+            rollout = current_rollout()
+            trace_kwargs = {"rollout_trace": rollout.carrier()} if rollout else {}
+            await stream.shard.handle.lease_group.remote(stream.group_id, rollout_id, **trace_kwargs)
+            if rollout:
+                rollout.span.set("rl.backend.name", "sglang")
+                rollout.admit([result.session_id for result in stream.session_results])
             stream.trace_iterations.add(rollout_id)
         except BaseException:
             await finish_before_cancellation(
@@ -1087,9 +1098,19 @@ class RuntimeDomain:
         """Release the partial-resume gate for the same requests."""
 
         self._start_shard_observers()
-        revisions = await asyncio.gather(
-            *(shard.handle.resume_generation.remote(rollout_id) for shard in self._shards)
+        rollout = current_rollout()
+        trace_kwargs = {"rollout_trace": rollout.carrier()} if rollout else {}
+        responses = await asyncio.gather(
+            *(shard.handle.resume_generation.remote(rollout_id, **trace_kwargs) for shard in self._shards)
         )
+        if rollout:
+            revisions = []
+            for revision, resumed in responses:
+                revisions.append(revision)
+                rollout.admit(resumed)
+            rollout.span.set("rl.backend.name", "sglang")
+        else:
+            revisions = responses
         await self._wait_for_shard_revisions(revisions)
         for shard in self._shards:
             for stream in shard.group_streams.values():
@@ -1270,6 +1291,9 @@ class RuntimeDomain:
                 ),
             )
             await self._release_shard_group(stream)
+            rollout = current_rollout()
+            if rollout:
+                rollout.exported_versions(group.samples)
             return group
         except BaseException:
             await finish_before_cancellation(

@@ -79,6 +79,7 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
                             "0.11.0",
                             "0.12.0",
                             "0.13.0",
+                            "0.14.0",
                         ):
                             raise ValueError("Unexpected instrumentation scope")
                         for span in scope["spans"]:
@@ -132,13 +133,19 @@ def validate(root: Path, min_train_steps: int = 0) -> dict:
         if version == "0.9.0":
             continue
         name = span["name"]
-        if version == "0.13.0":
+        if version in ("0.13.0", "0.14.0"):
             _validate_timing(span, attrs)
-        if version in ("0.11.0", "0.12.0", "0.13.0"):
+        if version in ("0.11.0", "0.12.0", "0.13.0", "0.14.0"):
             if attrs.get("rl.sample.timing") == "result":
                 raise ValueError("Result rows must be stored on the batch, not emitted as spans")
             if name.endswith(".sample") and name != "rl.rollout.sample":
                 raise ValueError(f"Redundant member span in {version}: {name}")
+        if name == "rl.agent.run" and version == "0.14.0":
+            parent = records.get((trace_id, span.get("parentSpanId")))
+            if parent is None or parent[0]["name"] != "rl.rollout.sample":
+                raise ValueError("Agent run must be a child of its sample")
+            if not attrs.get("rl.session.id") or attrs["rl.session.id"] != parent[1].get("rl.session.id"):
+                raise ValueError("Agent run and sample must belong to the same Session")
         parent_name = {"rl.rollout.sample": "rl.rollout.generate", "rl.reward.score": "rl.reward.batch"}.get(name)
         if parent_name is None and name.endswith(".sample"):
             parent_name = name[:-7]

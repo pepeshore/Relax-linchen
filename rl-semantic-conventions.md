@@ -2,7 +2,7 @@
 
 **Status:** Development
 
-**Version:** 0.13.0
+**Version:** 0.14.0
 
 **Date:** 2026-11-10
 
@@ -86,19 +86,19 @@ Run／Step／Iteration 是查询和关联所需的上下文，仍按各表条件
 
 **Trace 与关联规则：** 同一 iteration 的核心阶段在条件允许时复用 traceId，但不强制共用 trace；不同阶段之间不建立父子关系；同一阶段的批次与真实独立成员操作按第 2.1 节建立父子关系，结果数组中的记录不构成子 span。通过业务 ID 关联查询，通过 Span Link 表达实际依赖。
 
-1. **Trace 复用。** 第 3 章同一 iteration 内的核心阶段，已有合适的共同上游 Context 时应复用同一个 traceId，各次操作使用不同的 spanId，作为该共同上游下的同级 span，阶段之间不互为父子。没有这样的 Context 时，各批次阶段可以创建独立 trace 的根 span；本规范不为复用 traceId 新增统一的 Run／Step 父 span。按照 [OTel Span Creation](https://opentelemetry.io/docs/specs/otel/trace/api/#span-creation)，同一 trace 中的 spans 应属于同一棵调用树，不能将多个无 parent 的根 span 手动设置为相同 traceId。第 4 章的 Agent 调用仍保持独立 trace；同一次 Agent 调用的暂停恢复沿用原 span 和 traceId。
+1. **Trace 复用。** 第 3 章同一 iteration 内的核心阶段，已有合适的共同上游 Context 时应复用同一个 traceId，各次操作使用不同的 spanId，作为该共同上游下的同级 span，阶段之间不互为父子。没有这样的 Context 时，各批次阶段可以创建独立 trace 的根 span；本规范不为复用 traceId 新增统一的 Run／Step 父 span。按照 [OTel Span Creation](https://opentelemetry.io/docs/specs/otel/trace/api/#span-creation)，同一 trace 中的 spans 应属于同一棵调用树，不能将多个无 parent 的根 span 手动设置为相同 traceId。第 4 章的 Agent 调用是对应 sample 的子 span，暂停恢复沿用原 span 和 traceId。
 2. **业务聚合。** 无论是否复用 traceId，都通过 `rl.run.id` 聚合运行，通过 `(rl.run.id, rl.step.id)` 关联查询同一 Step 的各阶段和轨迹；查询必须支持一个 Step 对应多条 trace，不能依赖 traceId 完成整个 Step 的聚合。明确唯一 Step 归属时必须填写 `rl.step.id`；未知、未分配或跨 Step 时省略单值，按已有的真实业务归属明细关联，不能任选一个 Step。相同 Run／Step 只表示业务归属，不自动构成依赖关系。
-3. **依赖关联。** 无论同 trace 还是跨 trace，有实际调用触发、数据消费或参数版本来源关系时，由被触发方／消费方的 span Link 到直接来源 span 的真实 SpanContext；阶段之间不通过 parent 表达该依赖。例如，训练 Link 到实际消费的优势计算／数据交付，权重加载 Link 到对应权重发布，Agent Link 到实际接纳或恢复它的 rollout。多来源操作关联各实际直接来源，并按 `(traceId, spanId)` 去重；不因同轮、时间相近或仅先后执行而建立 Link，不要求补齐所有间接祖先。
+3. **依赖关联。** 无论同 trace 还是跨 trace，有实际调用触发、数据消费或参数版本来源关系时，由被触发方／消费方的 span Link 到直接来源 span 的真实 SpanContext；阶段之间不通过 parent 表达该依赖。例如，训练 Link 到实际消费的优势计算／数据交付，权重加载 Link 到对应权重发布。多来源操作关联各实际直接来源，并按 `(traceId, spanId)` 去重；不因同轮、时间相近或仅先后执行而建立 Link，不要求补齐所有间接祖先。
 4. **上下文传递。** 跨进程、线程、队列及权重交付时，按实际关系传递 Context：符合第 1 条的共同上游 Context 可用于创建同级阶段、复用 traceId；直接来源的阶段 SpanContext 则用于 Link，不作为接收阶段 span 的 parent。创建时已知的依赖直接加入 Links，执行中确认的依赖在 span 结束前追加；不修改已经结束的来源 span。来源未被采集或上下文确实不可取得时，保留已有业务 ID 和明细，不根据 Run／Step／Export ID 生成虚假的 traceId 或 spanId。
-5. **后端工作的 RL 封装。** SGLang、Megatron 的后端工作必须归属于负责该次操作的 RL 框架 span，由该 span 记录框架侧调用的完整起止与结果。直接复用本规范已有的阶段 span，不为每个后端内部 span 另建 RL 包装 span。例如，策略训练归属于 `rl.actor.train`，价值训练归属于 `rl.critic.train`，独立前向归属于对应的 forward span；普通生成归属于 `rl.rollout.sample`，其 parent 为首次接纳的 `rl.rollout.generate`；Agent 调用中的生成归属于 `rl.agent.run`，再由 Agent Link 到对应 sample。
-6. **SGLang 推理父子关系。** SGLang 请求入口 span 继承负责本次调用的 RL span 的 traceId，并将其作为 parent：普通生成指向 `rl.rollout.sample`，Agentic 模型请求指向 `rl.agent.run`。通过 HTTP `traceparent`／`tracestate` 传递真实 SpanContext，在进入 Ray HTTP worker 或 router 前完成注入；中间层应保留该上下文。SGLang 内部 spans 保持原有名称和父子树，不为每个内部 span 再创建 RL 包装。单个 sample／Agent 可以包含多次请求，它们分别归属于同一个 RL span；重试和恢复不把请求挂到其他样本。若启用 router 自身 tracing，允许真实的 router span 位于 RL 与 SGLang 之间，并保持可追溯的父链。
+5. **后端工作的 RL 封装。** SGLang、Megatron 的后端工作必须归属于负责该次操作的 RL 框架 span，由该 span 记录框架侧调用的完整起止与结果。直接复用本规范已有的阶段 span，不为每个后端内部 span 另建 RL 包装 span。例如，策略训练归属于 `rl.actor.train`，价值训练归属于 `rl.critic.train`，独立前向归属于对应的 forward span；普通生成归属于 `rl.rollout.sample`，其 parent 为首次接纳的 `rl.rollout.generate`；Agent 调用中的生成归属于 `rl.agent.run`，其 parent 是对应 sample。
+6. **SGLang 推理父子关系。** SGLang 请求入口 span 继承负责本次调用的 RL span 的 traceId，并将其作为 parent：普通生成指向 `rl.rollout.sample`，Agentic 模型请求使用第 2 章下述回调规则。通过 HTTP `traceparent`／`tracestate` 传递真实 SpanContext，在进入 Ray HTTP worker 或 router 前完成注入；中间层应保留该上下文。SGLang 内部 spans 保持原有名称和父子树，不为每个内部 span 再创建 RL 包装。单个 sample／Agent 可以包含多次请求，它们可以经不同的 Agent 应用 span 归属于同一个 RL span；重试和恢复不把请求挂到其他样本。若启用 router 自身 tracing，允许真实的 router span 位于 RL 与 SGLang 之间，并保持可追溯的父链。
 7. **其他后端与耗时。** 其他后端（如 Megatron）仍可使用独立 trace，通过入口 Span Link 指向负责该操作的 RL span；当前未实现 Megatron 内部 trace 的自动关联。SGLang 与 RL 共享 trace 后，一条 rollout 批次 trace 可以包含多个样本及其推理细节，不再要求这些 SGLang 请求使用独立 trace。各阶段保留真实起止；父子、并行阶段及 RL／后端耗时不能相加作为 Step 总耗时。
 
-**当前实现范围（Relax RL 0.13.0）：** 内置普通 rollout、`GenerateState.post_generate` 和 Agentic SGLang adapter 注入上述 W3C 上下文。RL tracing 关闭或无有效来源 span 时不注入。现有路由 headers 保留；独立并发样本／Session 的上下文相互隔离。自定义生成若绕过这些入口、自行调用 HTTP 客户端，需使用相同的 `inference_headers` 辅助函数。
+**当前实现范围（Relax RL 0.14.0）：** 内置普通 rollout、`GenerateState.post_generate` 和 Agentic SGLang adapter 注入上述 W3C 上下文。RL tracing 关闭或无有效来源 span 时不注入。现有路由 headers 保留；独立并发样本／Session 的上下文相互隔离。自定义生成若绕过这些入口、自行调用 HTTP 客户端，需使用相同的 `inference_headers` 辅助函数。
 
 SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL 的进程内文件 exporter 自动写出。采集两端后按 `(traceId, spanId, parentSpanId)` 还原父子关系；`rl.run.id`／`rl.step.id` 等属性不会由 parent 自动复制，可沿父链定位所属 RL span。不要用时间接近或业务 ID 伪造父关系。
 
-**Agent 应用自身的 spans：** `rl.agent.run` 是 Relax Session 侧的框架 span，继续作为独立 trace 根并 Link 到对应 `rl.rollout.sample`。本次 SGLang 关联不会自动为外部 Agent 应用、工具或 Agent SDK 创建 spans，也不向外部 Agent 进程注入 W3C carrier。外部应用已有的 spans 不会因此自动成为 `rl.agent.run` 的子 span；需在应用边界另外显式接入，不能把轨迹 JSON 中的请求／工具记录当成这些 spans。
+**Agent 应用上下文：** Session 启动子进程时提供 `RELAX_TRACEPARENT` 和可选的 `RELAX_TRACESTATE`，值来自该 Session 的 `rl.agent.run`。应用提取此 carrier 后启动自己的 span，回调时注入当前 span。Relax 仅保存这次逻辑请求的 W3C headers，重试和恢复沿用。有效且 traceId 与此次采样一致时，发送给 SGLang 的父上下文采用来路的 parent-id、flags 和配套 tracestate。缺失、无效或跨 trace 时重新从当前 Session 的 `rl.agent.run` 注入，丢弃来路 tracestate。同一 rollout 的多个 Session 共享 traceId；应用负责隔离各 Session 的上下文。Agent 自身的 span 由应用 SDK 导出。
 
 结构化数据直接保存为 span 的 string 类型 JSON 属性，包括题目、response、评分、优势、过滤、传输及训练结果。自 0.10.0 起，新采集不再输出对应的 `_ref`；完整内容随 OTLP JSONL 保存，不依赖附件或旧详情接口。禁止按长度截断，也不使用随机采样结果冒充全量数据。读取工具可以兼容旧版 `_ref`，但不能将旧引用当作新数据已内联的证据。
 
@@ -122,7 +122,7 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 
 生成批次按输入 Sample 计数，评分等下游批次按实际输入 Export 计数，不能假定两者总数相同。真实子操作与总 span 共用 traceId，parentSpanId 指向真实总 span。不同阶段仍通过 Link 关联：例如逐条 `rl.reward.score` 的 parent 是 `rl.reward.batch`，其 Link 指向实际消费的 `rl.rollout.sample`。批量评分没有 score 子 span 时，后续阶段 Link 到实际 `rl.reward.batch`；过滤与传输同样发布批次来源，保留逐成员业务 ID。SDK 显式使用真实父 Context，不手动拼接 traceId。
 
-**完整调用与窗口：** Sample 暂停／可续跑中断不结束 span，恢复沿用同一 sample.id、spanId、traceId 和首次 parent；后续窗口通过 Link 和 `rl.sample.memberships` 记录实际归属，不重新挂 parent。一个完整 Sample 可以晚于首次接纳窗口结束。Agentic 批次按 Shard 接纳的一整个 Group 生命周期定义：开始启动其 Sessions，直到所有已启动 Sessions 终态或启动失败清理结束；预取、暂停、恢复不新建批次。`rl.agent.run` 保持独立 trace，并 Link 到对应 sample。
+**完整调用与窗口：** Sample 暂停／可续跑中断不结束 span，恢复沿用同一 sample.id、spanId、traceId 和首次 parent；后续窗口通过 Link 和 `rl.sample.memberships` 记录实际归属，不重新挂 parent。一个完整 Sample 可以晚于首次接纳窗口结束。框架每次调用 rollout 函数（训练和评估分别计）创建一个生成 span，跨 Group 和补交共享。预取的 Session 继承发起准备的调用上下文，首次接纳后保留原 parent，实际消费轮次记在 sample 的 memberships 中。若调用返回时预取仍在决定是否接纳 Session，生成 span 可延后导出以记录准确的批次大小，结束时间仍取调用返回或抛错的时刻。
 
 **时间真实性：**
 
@@ -156,9 +156,9 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 
 **Status:** Development
 
-该 span 表示一个有界输入批次或采集窗口的轨迹生成操作，包含模型调用、Agent／工具／环境交互及生成结果收集。
+该 span 对应框架发起的一次 rollout 调用，记录这一调用接纳的所有样本。每个样本使用 `rl.rollout.sample`，通过 `rl.group.id` 标出所属 prompt group。一个 step 可以发起多次调用。
 
-从生成职责接纳输入开始，到本窗口关闭并交付已有结果，或失败／取消处理结束。独立 reward、训练准备和后续训练不属于此边界。
+从框架调用 rollout 函数到该函数返回、失败或取消，包含实际发生在调用内的评分等待。后续训练和调用方的过滤不计入。
 
 **Span kind:** `INTERNAL`。
 
@@ -183,7 +183,7 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 | `rl.backend.name`    | Development | Conditionally Required：模型执行后端已知且唯一 | string     | 实际模型执行后端；Ray 不属于模型执行后端。                         | `sglang`           |
 | `rl.model.version`   | Development | Conditionally Required：使用唯一已知参数快照   | string     | 实际使用／交付的参数版本，不填期望版本；混合版本在轨迹中逐段记录。 | `snapshot-48`      |
 
-普通部分 rollout 窗口可以在样本暂停时结束，完整 sample 保持未结束；窗口 Status 按交付承诺判断。Agentic 总批次覆盖完整 Group，跨轮保持不变。每次实际 Agent 调用使用第 4 章的独立 trace，并 Link 到对应 `rl.rollout.sample`。
+普通部分 rollout 窗口可以在样本暂停时结束，完整 sample 保持未结束；窗口 Status 按交付承诺判断。Agentic 按一次框架调用聚合多个 Group。每个 Session 的 `rl.agent.run` 以该 Session 的 `rl.rollout.sample` 为 parent。
 
 ### Span: `rl.rollout.sample`
 
@@ -201,15 +201,16 @@ SGLang 仍需启用其 tracing 并配置 OTLP 导出，后端 spans 不会由 RL
 
 除第 2.1 节公共属性，还记录：
 
-| Key                                                    | Stability   | Requirement Level                    | Value Type | Description                                                                            |
-| ------------------------------------------------------ | ----------- | ------------------------------------ | ---------- | -------------------------------------------------------------------------------------- |
-| `rl.run.id`                                            | Development | Required                             | string     | 本次运行身份                                                                           |
-| `rl.purpose`                                           | Development | Required                             | string     | training 或 evaluation                                                                 |
-| `rl.rollout.mode`                                      | Development | Required                             | string     | single_turn、multi_turn 或 agentic                                                     |
-| `rl.session.id`                                        | Development | Conditionally Required：Agentic      | string     | 对应完整 Session 身份                                                                  |
-| `rl.sample.input`                                      | Development | Required：输入可取得时               | string     | 完整原始题目／messages 的 JSON；保持文本或消息结构，不填格式化后的猜测                 |
-| `rl.sample.response`                                   | Development | Conditionally Required：已有实际输出 | string     | JSON 数组，每项保存 export_id、可取得的 name 及 text 或 messages；多 Export 不任选一条 |
-| `rl.model.name`、`rl.backend.name`、`rl.model.version` | Development | Conditionally Required：唯一且已知   | string     | 本次真实执行的模型、后端和参数快照                                                     |
+| Key                                                    | Stability   | Requirement Level                         | Value Type | Description                                                                            |
+| ------------------------------------------------------ | ----------- | ----------------------------------------- | ---------- | -------------------------------------------------------------------------------------- |
+| `rl.run.id`                                            | Development | Required                                  | string     | 本次运行身份                                                                           |
+| `rl.purpose`                                           | Development | Required                                  | string     | training 或 evaluation                                                                 |
+| `rl.rollout.mode`                                      | Development | Required                                  | string     | single_turn、multi_turn 或 agentic                                                     |
+| `rl.group.id`                                          | Development | Conditionally Required：prompt group 已知 | string     | 同一 prompt 本次重复采样的分组身份；每个样本仍拥有独立的 sample ID。                   |
+| `rl.session.id`                                        | Development | Conditionally Required：Agentic           | string     | 对应完整 Session 身份                                                                  |
+| `rl.sample.input`                                      | Development | Required：输入可取得时                    | string     | 完整原始题目／messages 的 JSON；保持文本或消息结构，不填格式化后的猜测                 |
+| `rl.sample.response`                                   | Development | Conditionally Required：已有实际输出      | string     | JSON 数组，每项保存 export_id、可取得的 name 及 text 或 messages；多 Export 不任选一条 |
+| `rl.model.name`、`rl.backend.name`、`rl.model.version` | Development | Conditionally Required：唯一且已知        | string     | 本次真实执行的模型、后端和参数快照                                                     |
 
 普通 rollout 的 response 保存实际生成文本和框架状态 status；取消／失败时保留已有部分文本，`rl.sample.cancelled=true` 表示已确认丢弃，不把部分文本冒充完整答案。Agentic response 由各 Export 的状态树分支取得最后的 assistant 消息，不把混合工具观察的训练 continuation 冒充最终回答。完整轨迹继续记录在 `rl.agent.run`。失败／无输出时省略 response，不用空字符串表示未知。
 
@@ -624,7 +625,7 @@ CPU/GPU 驻留恢复但参数版本未变化，不属于新版本加载。
 
 **Requirement level:** `Required`；实际执行该操作时采集。
 
-**Span links:** 按第 2 章创建独立 trace 的根 span，不设置 parent；必须 Link 到对应 `rl.rollout.sample` 的真实 SpanContext；sample 是实际 Group 生成批次的子 span。暂停恢复保留同一个 Agent span 和 traceId，跨轮保留实际 Step 归属。预取阶段提前终止且从未分配的调用仍有 sample 和批次，必须标记 unassigned。
+**Parent:** 对应 Session 的 `rl.rollout.sample`，与发起本次 rollout 的 `rl.rollout.generate` 共享 traceId。暂停恢复保留同一个 Agent span 和 traceId，跨轮保留实际 Step 归属。预取阶段提前终止且从未分配的调用仍有 sample 和批次，必须标记 unassigned。
 
 **Attributes:**
 

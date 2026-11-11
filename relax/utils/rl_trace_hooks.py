@@ -10,7 +10,7 @@ import inspect
 import time
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
 from typing import Any, Callable
@@ -19,6 +19,7 @@ from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.rl_sample_trace import admit_sample, sample_attributes
 from relax.utils.rl_tracing import (
     Stage,
+    current_rollout,
     current_stage,
     enabled,
     inference_context,
@@ -109,7 +110,8 @@ class GenerationBatch:
     def __init__(self, args: Any, evaluation: bool) -> None:
         self.args = args
         self.evaluation = evaluation
-        self.observation: Stage | None = None
+        self.rollout = current_rollout()
+        self.observation: Stage | None = self.rollout.span if self.rollout else None
         self.members: dict[int, Any] = {}
         self.pending: set[int] = set()
         self.owners: dict[int, asyncio.Task] = {}
@@ -159,11 +161,14 @@ class GenerationBatch:
                 },
             )
         if self.observation is not None:
-            self.observation.set("rl.batch.size", len(self.members))
+            self.observation.set("rl.backend.name", "sglang")
+            if self.rollout is None:
+                self.observation.set("rl.batch.size", len(self.members))
             multi_turn = getattr(self.args, "custom_generate_function_path", None) or any(
                 getattr(sample, "generate_function_path", None) for sample in self.members.values()
             )
-            self.observation.set("rl.rollout.mode", "multi_turn" if multi_turn else "single_turn")
+            if multi_turn or self.rollout is None:
+                self.observation.set("rl.rollout.mode", "multi_turn" if multi_turn else "single_turn")
             for identity in identities:
                 if identity not in self.sample_observations:
                     self.sample_observations[identity] = admit_sample(
@@ -212,9 +217,10 @@ class GenerationBatch:
     def close_if_finished(self) -> None:
         self.close_rewards()
         if self.sealed and not self.pending and self.observation is not None:
-            if not self.unknown_version and len(self.versions) == 1:
-                self.observation.set("rl.model.version", next(iter(self.versions)))
-            self.observation.end(self.error, end_time=self.end_time)
+            if self.rollout is None:
+                if not self.unknown_version and len(self.versions) == 1:
+                    self.observation.set("rl.model.version", next(iter(self.versions)))
+                self.observation.end(self.error, end_time=self.end_time)
             self.members.clear()
             self.owners.clear()
 
@@ -275,7 +281,8 @@ def trace_generation(function: Callable) -> Callable:
                 raise
             finally:
                 batch.finish(sample, results, error)
-        # Standalone callers have a genuine singleton input operation.
+        # If a custom callback generates directly, retain its framework invocation.
+        rollout = current_rollout()
         attrs = {
             "rl.batch.id": uuid.uuid4().hex,
             "rl.batch.size": 1,
@@ -286,21 +293,23 @@ def trace_generation(function: Callable) -> Callable:
             "rl.model.name": model_name(args),
             "rl.backend.name": "sglang",
         }
-        with stage(args, "rl.rollout.generate", attributes=attrs) as observation:
+        scope = nullcontext(rollout.span) if rollout else stage(args, "rl.rollout.generate", attributes=attrs)
+        with scope as observation:
             detail = admit_sample(args, sample, observation)
             results, error = [], None
             try:
                 with inference_context(detail.span if detail is not None else None):
                     result = await function(state, args, sample, *rest, **kwargs)
-                observation.freeze_end()
                 results = _samples(result)
-                _record_generation_version(observation, results)
+                if rollout is None:
+                    observation.freeze_end()
+                    _record_generation_version(observation, results)
                 return result
             except BaseException as exc:
                 error = exc
                 raise
             finally:
-                end_time = observation.freeze_end()
+                end_time = time.time_ns() if rollout else observation.freeze_end()
                 if detail is not None:
                     detail.finish(sample, results, error, end_time=end_time)
 

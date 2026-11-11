@@ -172,6 +172,11 @@ if [[ "${OTEL_SMOKE_AGENTIC:-0}" == 1 ]]; then
       --agentic-concurrency 4
       --agentic-reasoning-parser qwen3
    )
+   if [[ -n "${SGLANG_TRACE_ENDPOINT:-}" ]]; then
+      agent_otlp_endpoint=${SGLANG_TRACE_ENDPOINT}
+      [[ ${agent_otlp_endpoint} == *://* ]] || agent_otlp_endpoint="http://${agent_otlp_endpoint}"
+      ROLLOUT_ARGS+=(--agent-env "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${agent_otlp_endpoint}")
+   fi
 fi
 
 WANDB_ARGS=(

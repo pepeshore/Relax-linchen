@@ -42,3 +42,33 @@ async def test_two_turn_agent_preserves_reasoning_and_uses_real_reward(tmp_path,
     assert requests[1]["messages"][2]["role"] == "user"
     assert json.loads(output.read_text()) == {}
     assert not output.with_suffix(".json.tmp").exists()
+
+
+def test_model_calls_inject_distinct_children_of_the_session_agent_run(monkeypatch):
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(trace, "get_tracer", provider.get_tracer)
+    monkeypatch.setenv("RELAX_SESSION_ID", "session")
+    trace_id, run_id = "1" * 32, "2" * 16
+    monkeypatch.setenv("RELAX_TRACEPARENT", f"00-{trace_id}-{run_id}-01")
+    monkeypatch.setenv("RELAX_TRACESTATE", "vendor=session")
+    try:
+        sent = []
+        for _ in range(2):
+            with agent.model_request_headers() as headers:
+                sent.append(headers["traceparent"])
+                assert headers["tracestate"] == "vendor=session"
+        calls = exporter.get_finished_spans()
+        assert len(calls) == len(set(sent)) == 2
+        for call, header in zip(calls, sent, strict=True):
+            assert call.name == "llm.call"
+            assert call.parent.span_id == int(run_id, 16)
+            assert header == f"00-{trace_id}-{call.context.span_id:016x}-01"
+    finally:
+        provider.shutdown()

@@ -1,7 +1,10 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from dataclasses import dataclass
 from typing import Any
 
 from relax.utils.misc import load_function
+from relax.utils.rl_tracing import rollout_call
 from relax.utils.types import Sample
 
 
@@ -18,7 +21,16 @@ class RolloutFnEvalOutput:
 
 
 def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):
-    output = fn(*args, **kwargs, evaluation=evaluation)
+    config = args[0] if args else kwargs.get("args")
+    rollout_id = args[1] if len(args) > 1 else kwargs.get("rollout_id")
+    with rollout_call(config, rollout_id, evaluation) as rollout:
+        output = fn(*args, **kwargs, evaluation=evaluation)
+        if rollout is not None:
+            rollout.span.freeze_end()
+            # Resident group tasks can survive a pause. Attribute their exports to the actual consuming call.
+            if getattr(config, "use_agentic_rollout", False) and isinstance(output, RolloutFnTrainOutput):
+                for group in output.samples:
+                    rollout.exported_versions(group)
 
     # compatibility for legacy version
     if not isinstance(output, (RolloutFnTrainOutput, RolloutFnEvalOutput)):

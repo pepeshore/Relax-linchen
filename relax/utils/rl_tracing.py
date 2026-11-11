@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""RL semantic conventions 0.13.0, with process-local OTLP JSON files.
+"""RL semantic conventions 0.14.0, with process-local OTLP JSON files.
 
 RL batch stages are independent roots; their member spans are explicit
 children. Business identities cross Ray boundaries in the existing args
@@ -10,6 +10,7 @@ SGLang requests explicitly inherit their responsible RL span via W3C headers.
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import base64
 import json
@@ -34,7 +35,10 @@ _LOCK = threading.RLock()
 _RUNTIMES: dict[tuple[int, str, str], Any] = {}
 _ITERATION: ContextVar[int | None] = ContextVar("rl_iteration", default=None)
 _CURRENT: ContextVar[Stage | None] = ContextVar("rl_stage", default=None)
-_INFERENCE_PARENT: ContextVar[Stage | None] = ContextVar("rl_inference_parent", default=None)
+_INFERENCE_PARENT: ContextVar[tuple[Stage | None, dict[str, str] | None]] = ContextVar(
+    "rl_inference_parent", default=(None, None)
+)
+_ROLLOUT_CALL: ContextVar[RolloutCall | None] = ContextVar("rl_rollout_call", default=None)
 _ENV_NAMES = ("RELAX_OTEL_ENABLED", "RELAX_OTEL_DIR", "RELAX_OTEL_RUN_ID", "OTEL_SDK_DISABLED")
 
 
@@ -160,7 +164,7 @@ def _runtime(args: Namespace | None) -> Any:
             ),
         )
         provider.add_span_processor(SimpleSpanProcessor(DiskExporter()))
-        tracer = provider.get_tracer("relax.rl", "0.13.0")
+        tracer = provider.get_tracer("relax.rl", "0.14.0")
         result = (provider, tracer, root)
         _RUNTIMES[key] = result
         return result
@@ -194,6 +198,7 @@ class Stage:
         active: bool = True,
         inherit_iteration: bool = True,
         parent: Stage | None = None,
+        parent_headers: dict[str, str] | None = None,
     ) -> None:
         self.args = args
         self.name = name
@@ -219,9 +224,14 @@ class Stage:
             }
             if start_time is None:
                 self.start_time = time.time_ns()
+            context = set_span_in_context(parent.span, Context()) if parent and parent.span else Context()
+            if parent_headers:
+                from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+                context = TraceContextTextMapPropagator().extract(parent_headers, context=Context())
             self.span = tracer.start_span(
                 name,
-                context=set_span_in_context(parent.span, Context()) if parent and parent.span else Context(),
+                context=context,
                 attributes={k: v for k, v in attrs.items() if v is not None},
                 start_time=self.start_time,
             )
@@ -243,6 +253,18 @@ class Stage:
             self.set(key, json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
         except Exception:
             logger.exception("RL OTel structured data write failed: %s", key)
+
+    @best_effort
+    def headers(self) -> dict[str, str]:
+        if self.span is None:
+            return {}
+        from opentelemetry.context import Context
+        from opentelemetry.trace import set_span_in_context
+        from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+        carrier = {}
+        TraceContextTextMapPropagator().inject(carrier, context=set_span_in_context(self.span, Context()))
+        return carrier
 
     def child_attributes(self) -> dict[str, Any]:
         if self.span is None:
@@ -353,11 +375,125 @@ class Stage:
         self.span.end(end_time=end_time if end_time is not None else self._operation_end_time)
 
 
+class RolloutCall:
+    """Owned by one framework rollout invocation, including top-ups and eval
+    datasets."""
+
+    def __init__(self, span: Stage) -> None:
+        self.span = span
+        self.members: dict[str, str | None] = {}
+        self._lock = threading.RLock()
+        self._closed = False
+        self._pending = 0
+        self._error: BaseException | None = None
+
+    def admit(self, identities: list[str]) -> None:
+        with self._lock:
+            for identity in identities:
+                self.members.setdefault(identity, None)
+
+    def version(self, identity: str, value: str | None) -> None:
+        with self._lock:
+            if identity in self.members:
+                self.members[identity] = value
+
+    def exported_versions(self, samples: list[Any]) -> None:
+        for sample in samples:
+            metadata = getattr(sample, "metadata", None)
+            if isinstance(metadata, dict) and "_rl_sample_id" in metadata:
+                self.version(metadata["_rl_sample_id"], metadata.get("_rl_session_model_version"))
+
+    def track_admission(self, *outcomes: asyncio.Future) -> None:
+        """Hold export until this scheduled fetch/prepare decides which
+        Sessions it admitted."""
+        with self._lock:
+            self._pending += 1
+        resolved = False
+
+        def resolve(_outcome: asyncio.Future) -> None:
+            nonlocal resolved
+            with self._lock:
+                if resolved:
+                    return
+                resolved = True
+                self._pending -= 1
+                self._export_if_ready()
+            for outcome in outcomes:
+                outcome.remove_done_callback(resolve)
+
+        for outcome in outcomes:
+            outcome.add_done_callback(resolve)
+
+    def close(self, error: BaseException | None) -> None:
+        self.span.freeze_end()
+        with self._lock:
+            self._closed = True
+            self._error = error
+            self._export_if_ready()
+
+    def _export_if_ready(self) -> None:
+        if self._closed and not self._pending:
+            self.span.set("rl.batch.size", len(self.members))
+            versions = set(self.members.values())
+            if len(versions) == 1:
+                self.span.set("rl.model.version", versions.pop())
+            self.span.end(self._error)
+            self._error = None
+
+    def carrier(self) -> dict[str, Any]:
+        return {
+            "headers": self.span.headers(),
+            "context": self.span.context(),
+            "attributes": self.span.child_attributes(),
+        }
+
+
+def current_rollout() -> RolloutCall | None:
+    return _ROLLOUT_CALL.get()
+
+
 @contextmanager
-def inference_context(parent: Stage | None) -> Iterator[None]:
+def rollout_call(args: Any, rollout_id: int | None, evaluation: bool) -> Iterator[RolloutCall | None]:
+    if not enabled(args):
+        yield None
+        return
+    agentic = getattr(args, "use_agentic_rollout", False)
+    mode = (
+        "agentic"
+        if agentic
+        else ("multi_turn" if getattr(args, "custom_generate_function_path", None) else "single_turn")
+    )
+    span = Stage(
+        args,
+        "rl.rollout.generate",
+        iteration=rollout_id,
+        attributes={
+            "rl.batch.id": uuid.uuid4().hex,
+            "rl.purpose": "evaluation" if evaluation else "training",
+            "rl.model.name": model_name(args),
+            "rl.rollout.mode": mode,
+        },
+    )
+    call = RolloutCall(span)
+    token = _ROLLOUT_CALL.set(call)
+    stage_token = _CURRENT.set(span)
+    failure = None
+    try:
+        yield call
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        call.close(failure)
+        _CURRENT.reset(stage_token)
+        _ROLLOUT_CALL.reset(token)
+
+
+@contextmanager
+def inference_context(parent: Stage | None, callback: dict[str, str] | None = None) -> Iterator[None]:
     """Bind one sample/Session during its generation calls, never across
     Ray."""
-    token = _INFERENCE_PARENT.set(parent)
+    token = _INFERENCE_PARENT.set((parent, callback))
     try:
         yield
     finally:
@@ -367,7 +503,7 @@ def inference_context(parent: Stage | None) -> Iterator[None]:
 def inference_headers(headers: dict[str, str] | None = None) -> dict[str, str] | None:
     """Serialize the explicit RL parent before HTTP dispatch or Ray
     forwarding."""
-    parent = _INFERENCE_PARENT.get()
+    parent, callback = _INFERENCE_PARENT.get()
     if parent is None or parent.span is None or parent._ended or not enabled(parent.args):
         return headers
     try:
@@ -378,7 +514,16 @@ def inference_headers(headers: dict[str, str] | None = None) -> dict[str, str] |
         carrier = {
             key: value for key, value in (headers or {}).items() if key.lower() not in ("traceparent", "tracestate")
         }
-        TraceContextTextMapPropagator().inject(carrier, context=set_span_in_context(parent.span, Context()))
+        propagator = TraceContextTextMapPropagator()
+        context = set_span_in_context(parent.span, Context())
+        if callback:
+            from opentelemetry.trace import get_current_span
+
+            incoming = propagator.extract(callback, context=Context())
+            candidate = get_current_span(incoming).get_span_context()
+            if candidate.is_valid and candidate.trace_id == parent.span.get_span_context().trace_id:
+                context = incoming
+        propagator.inject(carrier, context=context)
         return carrier
     except Exception:
         logger.exception("RL OTel inference context unavailable")

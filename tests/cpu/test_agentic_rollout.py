@@ -1943,3 +1943,42 @@ async def test_concurrent_agentic_backend_requests_inherit_their_session_span(mo
             parent.end()
         for recorder in recorders:
             await recorder.aclose()
+
+
+async def test_chat_callback_sends_only_request_trace_headers_to_its_shard() -> None:
+    from starlette.requests import Request
+
+    service_cls = service_mod.AgenticChatAPIService.func_or_class
+    shard = MagicMock()
+    shard.chat.remote = AsyncMock(
+        return_value={
+            "request_id": "r1",
+            "message": {"role": "assistant", "content": "4"},
+            "finish_reason": "stop",
+            "logprobs": None,
+            "usage": {},
+        }
+    )
+    shard.mark_chat_service_response_ready.remote = AsyncMock()
+    service = SimpleNamespace(_session_shards={"s": shard})
+    for name in ("_handle_generation_request", "_shard_handle", "_complete_generation"):
+        setattr(service, name, getattr(service_cls, name).__get__(service))
+    incoming = "00-" + "1" * 32 + "-" + "2" * 16 + "-01"
+    body = json.dumps({"model": "test", "messages": [{"role": "user", "content": "2+2?"}]}).encode()
+    request = Request(
+        {
+            "type": "http",
+            "headers": [
+                (b"authorization", b"Bearer s.session-A"),
+                (b"traceparent", incoming.encode()),
+                (b"tracestate", b"vendor=abc"),
+                (b"x-extra", b"not-forwarded"),
+            ],
+        },
+        receive=AsyncMock(return_value={"type": "http.request", "body": body}),
+    )
+    res = await service_cls.chat_completions(service, request)
+    assert res.status_code == 200
+    kwargs = shard.chat.remote.await_args.kwargs
+    assert kwargs["session_id"] == "s.session-A"
+    assert kwargs["trace_headers"] == {"traceparent": incoming, "tracestate": "vendor=abc"}
