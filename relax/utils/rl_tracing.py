@@ -16,6 +16,7 @@ import atexit
 import base64
 import json
 import os
+import secrets
 import socket
 import threading
 import time
@@ -132,6 +133,7 @@ def _runtime(args: Namespace | None) -> Any:
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import SpanLimits, TracerProvider
         from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
+        from opentelemetry.sdk.trace.id_generator import IdGenerator
         from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
         instance = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex}"
@@ -161,7 +163,26 @@ def _runtime(args: Namespace | None) -> Any:
             def shutdown(self) -> None:
                 pass
 
+        class TrainingIndependentIds(IdGenerator):
+            # Megatron intentionally seeds Python's default PRNG alike on multiple ranks.
+            @staticmethod
+            def nonzero(bits: int) -> int:
+                while True:
+                    value = secrets.randbits(bits)
+                    if value:
+                        return value
+
+            def generate_span_id(self) -> int:
+                return self.nonzero(64)
+
+            def generate_trace_id(self) -> int:
+                return self.nonzero(128)
+
+            def is_trace_id_random(self) -> bool:
+                return True
+
         provider = TracerProvider(
+            id_generator=TrainingIndependentIds(),
             resource=Resource.create(
                 {
                     "service.name": "relax",

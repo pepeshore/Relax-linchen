@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -103,6 +104,25 @@ def test_disabled_is_transparent(run, monkeypatch, value):
     assert asyncio.run(reward(Namespace(), object())) is value_returned
     assert len(calls) == 1
     assert not spans(root)
+
+
+def test_trace_ids_are_independent_of_the_training_random_seed(run):
+    args, _ = run
+    previous = random.getstate()
+    roots, children = [], []
+    try:
+        with tracing.stage(args, "rl.actor.train_step") as dispatch:
+            for _ in range(2):
+                random.seed(42)
+                initial = random.getstate()
+                with tracing.stage(args, "rl.rollout.generate") as root:
+                    roots.append(root.span.get_span_context().trace_id)
+                with tracing.stage(args, "rl.actor.train_rank", parent=dispatch) as child:
+                    children.append(child.span.get_span_context().span_id)
+                assert random.getstate() == initial
+    finally:
+        random.setstate(previous)
+    assert len(set(roots)) == len(set(children)) == 2
 
 
 def test_concurrent_eval_and_training_contexts(run):

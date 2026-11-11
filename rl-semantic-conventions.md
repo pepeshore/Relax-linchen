@@ -192,6 +192,8 @@ Agentic 常驻任务在操作开始时固定 parent 和 Step。上一轮启动�
 
 展开 `rl.actor.train_step` 或 `rl.critic.train_step`，每个实际收到请求的 rank 都有一个同 trace 的直接子 span。按 `rl.rank.global` 选 rank，按 OTel Resource 的 `host.name`、`process.pid` 找到实际 worker。没有执行计算的 rank 仍有 RPC span，只展开它实际执行的阶段。训练组返回原有 Ray ObjectRef；框架不会收集各 rank 的阶段报告来重建时间线。异常在发生的层级记录；worker 进程硬退出前尚未结束的 span 可能缺失。
 
+同一训练请求的各 rank 共享 trace ID，每个 rank 和阶段都有独立的 span ID。框架从操作系统随机源分配新 ID，即使多个 rank 使用同一训练种子也能按父子 ID 还原，埋点不会消耗训练用的 Python 随机序列。
+
 训练 RPC 中实际发起权重同步时，各参与 rank 用 `rl.weight.sync` 记录自己的同步调用。发送端 rank 0 已有的 `rl.actor.publish_weights` 和 `rl.rollout.load_weights` 直接挂到它的 sync，并保留交付 Link。独立于训练请求的同步由发起侧 rank 0 记录一个 sync 根。FSDP 和独立提交的前向服务沿用各自入口。
 
 ## 3 核心阶段 span
