@@ -444,6 +444,7 @@ class InflightRequest:
     abort_count: int
     waiter: asyncio.Future[dict[str, Any]] = field(repr=False)
     wall_started_at: float
+    trace_headers: dict[str, str] | None = None
     runner_task: asyncio.Task[None] | None = field(default=None, repr=False)
     backend_started: bool = False
     sampling_params: dict[str, Any] = field(default_factory=dict)

@@ -162,3 +162,53 @@ python3 relax/entrypoints/train.py \
 ::: warning 注意
 batch 相关参数（`--global-batch-size`、`--n-samples-per-prompt`、并行度）要与产生 dump 的那次运行保持一致 —— dump 必须恰好包含一个 step 的样本量。**不要**与 `--debug-rollout-only` 或 `--load-debug-rollout-data` 同时使用，二者都会破坏其目的（不训练，或跳过 SGLang）。`forge_load` 不会触发解码期显存，因此不能替代对生成阶段峰值的测量。
 :::
+
+## 本地 RL Trace
+
+通过 `relax.entrypoints.train` 启动训练时，默认将 RL 阶段 trace 写入磁盘。每次启动新的 driver 都会生成新的 `rl.run.id`，包括重新提交作业从 checkpoint 续训。同一 driver 内的 Controller 恢复沿用原 run ID。文件默认位于 `<save>/otel-traces/<run_id>/`；没有设置 `--save` 时，使用 driver 工作目录下的 `otel-traces`。每个进程独立写入一个 OTLP JSONL 文件，每行是一次 OTLP trace 导出请求，分析时逐行合并读取。
+
+提交任务前设置 `RELAX_OTEL_DIR` 可更改输出根目录，设置 `RELAX_OTEL_ENABLED=0` 可关闭 RL trace，`OTEL_SDK_DISABLED=true` 也会关闭采集。若需要在一台机器上读取所有 worker 的数据，请使用共享持久化目录；使用节点本地磁盘时，需要分别收集各 worker 的文件。采集不依赖 Collector 地址。
+
+展开 `start services` 查看各角色的部署调用，例如 `start actor`，展开 `rl.service.restart` 查看触发角色、局部或全局恢复以及实际重新部署的角色。每次恢复有独立 trace，可用 `rl.run.id` 查询。全局恢复计时到 Controller 重建完成。副本开始构造时立即写入 `enter <role>_service`，返回或抛错时写入 `init <role>_service`。按角色和 `rl.service.deployment.id` 查询同一部署中的多次构造，再按 Resource 中的主机和 PID 定位进程。
+
+内置普通 rollout 和 Agentic rollout 会通过 W3C headers 将对应 RL span 传给 SGLang：普通请求的 parent 是 `rl.rollout.sample`，Agentic 请求使用该回调中有效、同 trace 的父上下文，缺失、无效或跨 trace 时使用当前 `rl.agent.run`。SGLang 请求继承相同 trace ID，其内部父子树保持不变。使用 `--sglang-enable-trace --sglang-otlp-traces-endpoint "$SGLANG_TRACE_ENDPOINT"` 启用后端采集；该地址必须能被各推理节点访问。后端仍单独导出，不会自动写入上述 RL 文件。
+
+仓库提供一个用于实验验证的 OTLP/gRPC 接收器，在装有 SGLang tracing 依赖的环境中运行：
+
+```bash
+PYTHONPATH=. python scripts/tools/collect_otlp_traces.py \
+  --listen "$OTLP_LISTEN" \
+  --output "$SAVE_DIR/$EXP_NAME/backend-traces/sglang.jsonl"
+```
+
+`OTLP_LISTEN` 为本机绑定的 `host:port`，`SGLANG_TRACE_ENDPOINT` 为推理节点可访问的对应地址。接收器每收到一批数据就追加一行 OTLP JSONL，关闭前等待训练请求完成及 SGLang 导出。合并分析 RL 与后端文件时，按 trace/span/parent ID 还原调用树；RL 业务属性可沿父链查询，不会自动复制到 SGLang span。
+
+`rl.agent.run` 是 Relax 的 Session span。外部 Agent 应用及工具不会自动产生自己的 OTel spans，也不会自动接入这个父链。自定义 rollout 如果自行使用 HTTP 客户端，可在真实生成调用内用 `relax.utils.rl_tracing.inference_headers` 合并出站 headers；绕过内置入口的请求需要自行接入。
+
+示例 `examples/otel_tracing/agent.py` 在进入 Session 时创建 `agent.invoke`，父节点是 Relax 传入的 `rl.agent.run`。每次模型请求创建一个 `llm.call`，并将它的上下文注入回调。两轮解题默认只调用模型。扩展示例时，用 `await call_tool(工具名, 函数, *args, **kwargs)` 执行同步或异步工具，`tool.call` 会覆盖从调用到返回或抛错的时间。示例使用 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` 导出应用 spans，Agentic smoke 脚本会将它设为 SGLang 使用的接收器。
+
+采集高吞吐、多轮推理时，导出队列不足可能导致 spans 丢失，即使请求入口关联正确也会出现缺失的父节点。上述 smoke 脚本启用 SGLang tracing 时默认设置 `SGLANG_TRACE_LEVEL=2`，保留请求 span，跳过 Level 3 的逐次解码 `decode_loop`。导出器默认使用 `OTEL_BSP_MAX_QUEUE_SIZE=65536` 和 `SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE=512`，可通过环境变量覆盖。接收器建议先写节点本地磁盘，训练及导出结束后再复制到持久化存储；应校验完整父链，不能仅检查请求入口数量。
+
+通过 `rl.run.id` 和 `rl.step.id` 查询同一步的各条 trace。`rl.iteration.index` 保留从 0 开始的 rollout 轮次。每个批次记录自身 `rl.batch.id` 和实际输入数，真实成员操作 span 与批次共用 trace 并指定真实 parent：`rl.rollout.sample` 记录一条输入的完整 rollout，`rl.reward.score` 归属于 `rl.reward.batch`。数据来源使用 Links。每次普通或 Agentic rollout 调用产生一个 `rl.rollout.generate`，直接包含本轮的样本，以及实际发起的评分批次、动态过滤、队列写入、Agentic 自定义优势计算和 OPD teacher／student prefill，其耗时包含函数返回前的等待。独立发起的评分保留根 span。不同 prompt group 的样本通过 `rl.group.id` 区分。`rl.agent.run` 是本 Session 样本的子 span。Agent 可提取子进程环境中的 `RELAX_TRACEPARENT`／`RELAX_TRACESTATE`，在发起模型请求时注入当前调用的 W3C 上下文。
+
+用 `rl.execution.side` 筛选 `rollout` 或 `training`。例如 OPD student prefill 和 Megatron 的旧策略前向都叫 `rl.actor.forward`，训练侧前向保留自身的父关系和计时。`rl.forward.purpose` 描述计算用途，两侧都可能是 `distillation`。单独调用 OPD prefill 也会标记 `rollout`，有实际所属 rollout 时才填写父节点。Agentic 常驻任务在每个操作开始时绑定当时的 rollout。写队列时，`rl.step.id` 表示谁发起写入，`rl.transfer.target.step_id` 表示写入哪个分区。
+
+在一次运行中查询某道题的所有回答和分数，可按 `rl.prompt.id` 筛选 `rl.rollout.sample` 和 `rl.reward.score`。查看 `rl.reward.batch` 时，在 `rl.reward.results` 中按每行的 `prompt_id` 筛选。按样本 ID 匹配某一次回答；一个 Session 有多份 Export 时，再用回答和评分中的 Export ID 区分。内置 JSONL 和 Parquet 加载器在打乱、套模板前识别原始行。自定义数据源可设置 `Sample.prompt_id`，来源未知时省略题目 ID。
+
+结构化结果、题目和 response 直接以完整 JSON 字符串保存在 span 属性中，新 trace 不依赖 `_ref` 附件。真实的逐样本 rollout 和评分调用创建成员 span，标记 `rl.sample.timing=operation`。批量评分、前向、优势、过滤、传输和训练将成员结果保存在批次 span 上，不生成零时长结果 span。OPD 单样本前向只保留一个真实请求 span。训练 uses 通过 update_id 关联 updates 中的更新结果。旧版 0.10 的 result span 可兼容读取，但应与执行时间线分开展示。父子 span 的耗时也不能相加。Agentic 运行还会启用已有 observation 记录，保存 Session 的请求、尝试、状态及 Export，并通过 Export ID 关联实际训练消费。无法观测的外部工具时间保持未知。这些记录包含模型输入输出，应根据训练数据设置目录权限和保留期限。
+
+使用 span 属性 `rl.producer.role` 查找记录操作的进程角色。一次 Agentic 调用依次经过 `rollout_manager`、`agentic_session_shard`、`agent` 和 `sglang`。训练由 `actor_service` 分发给 `actor_rank`；权重交付与加载确认都由发送端 rank 记录。旧 SGLang 镜像通过仓库附带的 OTLP 接收器补充此属性。
+
+展开 `rl.actor.train_step` 或 `rl.critic.train_step`，每个收到 RPC 的 worker 都有一个直接子节点 `train_rank`。总 span 记录分发到完成的耗时。各 worker 在本进程记录实际执行的前向、优势、训练及同步阶段，本地计算标为 `rl.timing.scope=rank_local`。用 `rl.rank.global` 选择 rank，用 Resource 的主机和 PID 定位进程。成员数和 CP 计算结果按本地分片解释。权重发布和加载在 rank 0 的 `rl.weight.sync` 下，继续保留交付 Link。0.17 及以前的历史 trace 可以按原有代表 rank 口径查看。
+
+RL 耗时统一标记 `rl.timing.clock=host_wall`，包含调用内部已有的等待，不表示 GPU kernel 时间。train 从实际训练函数入口开始，不包含此前 RPC 准备／预取、之后的 checkpoint 和 offload。结果整理与 trace 导出不会延长已完成操作；自定义批量评分的实际后处理仍计入，即使结果值未改变。可恢复 Sample 保持原起点，直到真正终态才结束。权重 span 使用 `source_sync`，表示源端从准备到交付／生效确认，包含暂停、转换和等待，不是目标端独立安装时间。采集不会新增设备同步或分布式 barrier。
+
+阶段结束后即追加写入文件。进程在阶段执行中被强制终止时，该阶段可能没有结束记录。写入失败会记日志，训练继续运行；rank 数据不完整时，通过 `relax.observation.partial` 保存诊断信息，不冒充完整训练结果。采集不会增加分布式通信，GPU 上的简要统计通过异步复制交给训练线程之外的读者处理。
+
+训练结束后，可检查文件格式、内联结果、父子关系和阶段覆盖：
+
+```bash
+python scripts/tools/validate_rl_traces.py /path/to/otel-traces/RUN_ID --min-train-steps 2
+```
+
+如果存在失败 span、rank 数据不完整、结果格式错误、明细缺少父 span 或训练轮次不足，检查会失败。工具汇总实际记录的阶段和优化器决策，不代表本次未运行的算法或路径也得到验证。

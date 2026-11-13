@@ -16,6 +16,7 @@ from relax.utils.opd.opd_multimodal import (
     image_inputs,
     validate_image_input_ids,
 )
+from relax.utils.rl_trace_hooks import trace_opd_forward
 from relax.utils.types import Sample
 
 
@@ -413,6 +414,7 @@ class OpdManager:
         if ids is None or ids.shape != (response_length, self.topk_worker.top_k) or np.any(ids < 0):
             raise ValueError("Native image OPD requires complete R x K query IDs before cross-topk prefill.")
 
+    @trace_opd_forward("teacher")
     async def _teacher_prefill(self, sample: Sample, session: aiohttp.ClientSession) -> bool:
         if self.response_stats is not None:
             self.response_stats.finish(sample.response_key)
@@ -529,13 +531,14 @@ class OpdManager:
 
         return True
 
+    @trace_opd_forward("actor")
     async def _student_prefill(
         self, sample: Sample, session: aiohttp.ClientSession, encode_mm_fn: EncodeMultimodalInputs | None
-    ) -> None:
+    ) -> bool:
 
         response_length = int(sample.response_length or 0)
         if response_length <= 0:
-            return
+            return False
         teacher_topk_ids = sample.teacher_topk_token_ids
 
         prompt_length = len(sample.tokens) - response_length
@@ -564,7 +567,7 @@ class OpdManager:
             session, student_url, payload, sample, "student-at-teacher-topk", sample.tokens if native else None
         )
         if resp_obj is None:
-            return
+            return False
         sample.student_at_teacher_topk_log_probs = (
             resp_obj.strict_topk(
                 "input_token_ids_logprobs", response_length, self.topk_worker.top_k, teacher_topk_ids
@@ -572,6 +575,7 @@ class OpdManager:
             if native
             else self.topk_worker.parse_prefill_other_topk(resp_obj, response_length)
         )
+        return sample.student_at_teacher_topk_log_probs is not None
 
     def _assemble_transfer(self, samples: list[Sample]) -> None:
         if self.topk_worker is None:

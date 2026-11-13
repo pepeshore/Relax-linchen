@@ -12,11 +12,13 @@ from tensordict import TensorDict
 from relax.components.base import Base
 from relax.engine.sft.image import ImageBatchSampler
 from relax.engine.sft.runtime import sft_partition_id, sft_partition_prefix
+from relax.utils.rl_service_trace import trace_replica_init
 from relax.utils.tq.lifecycle import attach_tq_client
 
 
 @serve.deployment
 class ImageSFT(Base):
+    @trace_replica_init
     def __init__(self, healthy: Any, pgs: Any, num_gpus: int, config: Any, role: str, runtime_env: Any = None) -> None:
         super().__init__()
         self.config, self.role, self.healthy = config, role, healthy

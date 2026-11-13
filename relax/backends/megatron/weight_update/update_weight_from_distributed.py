@@ -16,6 +16,7 @@ from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.logging_utils import get_logger
+from relax.utils.rl_weights_trace import begin_weights, trace_weight_call, weights_delivered
 
 from ..weight_conversion import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
@@ -97,12 +98,14 @@ class UpdateWeightFromDistributed:
         self._model_update_groups = None
 
     @torch.no_grad()
+    @trace_weight_call
     def update_weights(self) -> None:
         """Pause → flush → non-expert (TP) → expert (EP) → continue.
 
         Progress on PP source.
         """
         self.weight_version += 1
+        begin_weights(self)
 
         if dist.get_rank() == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
@@ -147,6 +150,7 @@ class UpdateWeightFromDistributed:
             self._update_expert_bucket_weights_from_distributed(named_tensors, pbar=pbar)
 
         dist.barrier(group=get_gloo_group())
+        weights_delivered(self)
         if dist.get_rank() == 0:
             # int4/fp4 post_process
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:

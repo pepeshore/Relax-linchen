@@ -19,6 +19,7 @@ from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.memory_utils import set_role as set_memory_role
+from relax.utils.rl_tracing import set_process_role
 
 
 logger = get_logger(__name__)
@@ -58,6 +59,7 @@ class TrainRayActor(RayActor):
         self.args = args
         self.role = role
         set_memory_role(role)
+        set_process_role(f"{role}_rank")
         self.with_ref = with_ref
         self.with_opd_teacher = with_opd_teacher
 

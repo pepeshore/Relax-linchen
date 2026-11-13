@@ -174,7 +174,7 @@ env_vars = runtime.setdefault("env_vars", {})
 env_vars["RAY_DEDUP_LOGS"] = "0"
 env_vars.setdefault("RAY_OVERRIDE_JOB_RUNTIME_ENV", "1")
 for key, value in os.environ.items():
-    if key.startswith(("MEGATRON_OTEL_", "NEMO_LENS_", "OTEL_")):
+    if key in ("RELAX_OTEL_ENABLED", "RELAX_OTEL_DIR") or key.startswith(("MEGATRON_OTEL_", "NEMO_LENS_", "OTEL_")):
         env_vars[key] = value
 print(json.dumps(runtime))
 PY

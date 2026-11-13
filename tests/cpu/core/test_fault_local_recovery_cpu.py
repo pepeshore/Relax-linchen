@@ -8,6 +8,7 @@ recovery tests.
 """
 
 import ast
+import json
 import sys
 import threading
 import time
@@ -19,10 +20,13 @@ from unittest.mock import Mock
 
 import pytest
 
+from relax.utils import rl_service_trace as lifecycle
 from relax.utils.fault_events import recovery
 from relax.utils.fault_events.models import FaultContext, RecoveryEvidence, new_id
 from relax.utils.fault_events.recovery import expected_evidence, observe_recovery
 from relax.utils.fault_events.runtime import FaultEventRuntime
+from relax.utils.rl_tracing import initialize_run
+from scripts.tools.validate_rl_traces import attributes
 
 
 try:
@@ -52,6 +56,7 @@ def load_classes(path, names, namespace):
     module = ast.Module(body=ast.parse("from __future__ import annotations").body + selected, type_ignores=[])
     namespace = {
         "__name__": "fault_local_cpu",
+        "lifecycle": lifecycle,
         "Enum": Enum,
         "IntEnum": IntEnum,
         "RecoveryEvidence": RecoveryEvidence,
@@ -395,7 +400,7 @@ def test_early_recovery_error_stops_checker_and_cancels_without_reusing_previous
 
 
 @pytest.mark.parametrize("raises", [False, True])
-def test_global_error_return_or_exception_is_recorded_without_false_success(runtime, raises):
+def test_global_error_return_or_exception_is_recorded_without_false_success(runtime, raises, lifecycle_disk):
     faults = observe(runtime, (Roles.actor, Roles.actor_fwd))
     controller, _ = make_controller(runtime, {Roles.actor: object(), Roles.actor_fwd: object()}, [])
     error = RuntimeError("injected global failure")
@@ -406,7 +411,11 @@ def test_global_error_return_or_exception_is_recorded_without_false_success(runt
         controller._restart_error = error
 
     controller._run_global_restart = fail_global
+    read_spans = lifecycle_disk(controller)
     controller.restart_serve(Roles.actor)
+    restart = read_spans()["rl.service.restart"]
+    assert restart["status"]["code"] == 2 and not restart.get("parentSpanId")
+    assert attributes(restart["attributes"])["rl.service.restart.mode"] == "global"
     assert controller._restart_error is error and controller._restart_done_event.is_set()
     failed = [event for event in records(runtime) if event["event_type"] == "recovery_failed"]
     assert {event["fault_id"] for event in failed} == {fault.fault_id for fault in faults}
@@ -415,12 +424,22 @@ def test_global_error_return_or_exception_is_recorded_without_false_success(runt
     assert not any(event["event_type"] == "recovery_succeeded" for event in records(runtime))
 
 
-def test_actual_global_budget_exit_terminates_all_members_once(runtime):
+def test_actual_global_budget_exit_terminates_all_members_once(runtime, lifecycle_disk):
     faults = observe(runtime, (Roles.actor, Roles.actor_fwd))
     trace = []
     controller, _ = make_controller(
         runtime, {Roles.actor: object(), Roles.actor_fwd: object()}, trace, max_global_restart=0
     )
+    read_spans = lifecycle_disk(controller)
+    original_exit = type(controller)._run_global_restart.__globals__["os"]._exit
+
+    def exit_after_export(code):
+        restart = read_spans()["rl.service.restart"]
+        assert restart["status"]["code"] == 2
+        assert read_spans()["rl.service.restart.requested"]["traceId"] == restart["traceId"]
+        original_exit(code)
+
+    type(controller)._run_global_restart.__globals__["os"]._exit = exit_after_export
     controller.restart_serve(Roles.actor)
     assert trace == [("exit", 1)]
     assert isinstance(controller._restart_error, SystemExit)
@@ -546,3 +565,50 @@ def test_actual_global_teardown_retires_old_receiver_even_when_reinit_fails(runt
         (first.fault_id, "recovery_interrupted"),
         (second.fault_id, "recovery_failed"),
     ]
+
+
+@pytest.fixture
+def lifecycle_disk(monkeypatch, tmp_path):
+    monkeypatch.setenv("RELAX_OTEL_DIR", str(tmp_path))
+    monkeypatch.setenv("RELAX_OTEL_ENABLED", "1")
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+    monkeypatch.delenv("RELAX_OTEL_RUN_ID", raising=False)
+
+    def configure(controller):
+        initialize_run(controller.config)
+
+        def read():
+            records = {}
+            for path in (tmp_path / controller.config.rl_trace_run_id).glob("*.jsonl"):
+                for line in path.read_text().splitlines():
+                    for scope in json.loads(line)["resourceSpans"][0]["scopeSpans"]:
+                        records.update((s["name"], s) for s in scope["spans"])
+            return records
+
+        return read
+
+    return configure
+
+
+@pytest.mark.parametrize("failure", [None, "step", "deploy", "no_task"])
+def test_local_restart_trace_observes_accepted_task_and_restore_outcome(lifecycle_disk, failure):
+    service = make_service([], failure=failure)
+    controller, _ = make_controller(None, {Roles.advantages: service}, [])
+    read_spans = lifecycle_disk(controller)
+    service.config = controller.config
+    controller.restart_serve(Roles.advantages)
+    records = read_spans()
+    parent = records["rl.service.restart"]
+    assert not parent.get("parentSpanId")
+    assert all(
+        s["traceId"] == parent["traceId"] and s["parentSpanId"] == parent["spanId"]
+        for s in records.values()
+        if s is not parent
+    )
+    attrs = attributes(parent["attributes"])
+    assert attrs["rl.service.restart.mode"] == "local" and attrs["rl.service.restart.attempt"] == "1"
+    assert parent.get("status", {}).get("code", 0) == (2 if failure in ("step", "deploy") else 0)
+    assert {"rl.service.stop", "start advantages", "rl.service.restart.requested"} <= records.keys()
+    if failure != "deploy":
+        assert attrs["rl.service.restart.step_restored"] == (failure != "step")
+        assert attrs["rl.service.restart.task_submitted"] == (failure != "no_task")

@@ -33,6 +33,7 @@ from relax.distributed.checkpoint_service.coordinator.service import create_dcs_
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
+from relax.utils import rl_service_trace as lifecycle
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.data.identity_window_sampler import IdentityWindowSampler
 from relax.utils.env import Envs
@@ -258,7 +259,15 @@ class Controller:
                 )
             self._autoscaler_config = None
             try:
-                self.register_all_serve()
+                with lifecycle.operation(
+                    config,
+                    "rl.service.startup",
+                    attributes={
+                        "rl.service.start.reason": "global_restart" if self._restarting else "initial",
+                        "rl.service.restart.global_count": self._global_restart_count,
+                    },
+                ):
+                    self.register_all_serve()
             except Exception as e:
                 self._report_error_to_metrics_service(e)
                 raise
@@ -844,6 +853,7 @@ class Controller:
         if not hasattr(self, "_startup_abort_event"):
             self._startup_abort_event = threading.Event()
         self._startup_abort_event.clear()
+        task = lifecycle.phase_task(self.config, phase.value, task)
         executor = None
         try:
             if self.config.fully_async:
@@ -1536,7 +1546,10 @@ class Controller:
                 self._fault_recovery = None
                 break
         try:
-            self._restart_serve(role)
+            with lifecycle.operation(self.config, "rl.service.restart", role=str(role)) as restart:
+                self._restart_serve(role)
+                if self._restart_error is not None:
+                    restart.end(self._restart_error)
         except BaseException as exc:
             self._restart_error = exc
             logger.exception("Service recovery failed")
@@ -1604,6 +1617,17 @@ class Controller:
         }
         global_restart = role in full_rewire_roles or restart_count >= 3
         self._restart_mode = "global" if global_restart else "local"
+        restart = lifecycle.current()
+        if restart is not None:
+            restart.set("rl.service.restart.mode", self._restart_mode)
+            restart.set("rl.service.restart.attempt", restart_count)
+            restart.set(
+                "rl.service.restart.reason",
+                "cross_service_wiring"
+                if role in full_rewire_roles
+                else ("role_restart_limit" if global_restart else "unhealthy"),
+            )
+            lifecycle.restart_requested(self.config, str(role), self._restart_mode, restart_count)
         self._fault_recovery = None
         if self._fault_events is not None:
             self._fault_recovery = self._fault_events.start_recovery(
@@ -1696,6 +1720,9 @@ class Controller:
             # 2. The old HealthChecker thread would otherwise loop and re-trigger _global_restart
             self._report_error_to_metrics_service(RuntimeError(error_msg))
             logger.error("Calling os._exit(1) to force-terminate the process")
+            restart = lifecycle.current()
+            if restart is not None:
+                restart.end(RuntimeError(error_msg))
             os._exit(1)
 
         # Save references needed after __init__ overwrites them
@@ -1745,7 +1772,15 @@ class Controller:
                 logger.warning(f"[Global Restart] Failed to stop heartbeat for '{svc_role}': {e}")
 
             try:
-                serve.delete(svc_role)
+                with lifecycle.operation(
+                    config,
+                    "rl.service.stop",
+                    role=str(svc_role),
+                    attributes={
+                        "rl.service.deployment.id": getattr(service, "_rl_deployment_id", None),
+                    },
+                ):
+                    serve.delete(svc_role)
                 logger.info(f"[Global Restart] Deleted Ray Serve deployment '{svc_role}'")
             except Exception as e:
                 logger.warning(f"[Global Restart] Failed to delete deployment '{svc_role}': {e}")

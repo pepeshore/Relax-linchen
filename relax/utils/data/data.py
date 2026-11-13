@@ -48,6 +48,7 @@ class Dataset(BaseDataset):
         teacher_multimodal_keys=None,
         record_source: bool = False,
         source_split: str = "train",
+        record_prompt_id: bool = False,
     ):
         # Initialize base class
         super().__init__(
@@ -72,8 +73,9 @@ class Dataset(BaseDataset):
 
         # Load all samples into memory
         self.source_split = source_split
+        self.record_source = record_source
         origin_samples = []
-        for data in read_file(path, with_source=record_source):
+        for data in read_file(path, with_source=record_source or record_prompt_id):
             sample = self._process_data(data)
             origin_samples.append(sample)
 

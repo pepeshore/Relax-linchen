@@ -11,6 +11,7 @@ from ray import serve
 from relax.components.background_loop import BackgroundLoopRunner
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import allocate_train_group
+from relax.utils.rl_service_trace import trace_replica_init
 from relax.utils.tq.lifecycle import attach_tq_client
 
 
@@ -20,6 +21,7 @@ app = FastAPI()
 @serve.deployment
 @serve.ingress(app)
 class ActorFwd(Base):
+    @trace_replica_init
     def __init__(
         self, healthy: Any, pgs: Optional[Any], num_gpus: int, config: Namespace, role: str, runtime_env: dict = None
     ) -> None:

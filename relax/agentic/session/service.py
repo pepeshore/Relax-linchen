@@ -13,7 +13,7 @@ import time
 from argparse import Namespace
 from collections import deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tuple, cast
@@ -75,6 +75,8 @@ from relax.utils.agentic_obs.records import utc_now
 from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
+from relax.utils.rl_agent_trace import start_agent_trace, trace_agentic_group
+from relax.utils.rl_tracing import set_process_role
 from relax.utils.types import get_spec_token_counts
 
 
@@ -1498,6 +1500,7 @@ class AgenticSessionShard:
         args: Namespace,
         admission_coordinator: Any,
     ) -> None:
+        set_process_role("agentic_session_shard")
         self.args = args
         self._groups: Dict[str, ResidentGroup] = {}
         # OpenAI ingress index. ResidentGroup.sessions owns each Session's
@@ -1587,6 +1590,7 @@ class AgenticSessionShard:
 
         self._notify_state_change()
 
+    @trace_agentic_group
     async def start_group(
         self,
         rollout_mode: str,
@@ -1644,6 +1648,8 @@ class AgenticSessionShard:
                         group_id=group_id,
                         rollout_mode=rollout_mode,
                         input_payload=session_spec.input_payload,
+                        rollout_trace=session_spec.rollout_trace,
+                        prompt_id=getattr(session_spec, "prompt_id", None),
                     ),
                 )
         except BaseException as error:
@@ -1698,7 +1704,7 @@ class AgenticSessionShard:
         request.pending_prefix_cache_delta["cached_tokens"] += int(meta_info.get("cached_tokens", 0) or 0)
         request.pending_prefix_cache_delta["total_prompt_tokens"] += int(meta_info.get("prompt_tokens", 0) or 0)
 
-    async def lease_group(self, group_id: str, rollout_id: int) -> None:
+    async def lease_group(self, group_id: str, rollout_id: int, *, rollout_trace: dict | None = None) -> None:
         """Move one prepared group ref into Runtime and release its IR gate."""
 
         group = self._groups[group_id]
@@ -1710,6 +1716,8 @@ class AgenticSessionShard:
         # Commit every Session ID and Runtime ownership before a drop can interleave at an await.
         for session in group.sessions:
             session.rollout_id = rollout_id
+            if session.observation is not None and session.observation.rl_trace is not None:
+                session.observation.rl_trace.assign(rollout_id, rollout_trace)
         group.ownership = GroupOwnership.RUNTIME
         self._mark_group_timing(group, "group_runtime_leased_at")
         await self._set_group_timeout_active(group, self._group_generation_open(group))
@@ -1809,9 +1817,12 @@ class AgenticSessionShard:
                 if isinstance(outcome, BaseException):
                     raise outcome
 
-    async def resume_generation(self, rollout_id: int) -> int:
+    async def resume_generation(
+        self, rollout_id: int, *, rollout_trace: dict | None = None
+    ) -> int | tuple[int, list[str]]:
         """Open the step and release prepared or interrupted Runtime groups."""
 
+        resumed: list[str] = []
         # Keep the gate closed until every resident Session carries this step's
         # rollout ID. A concurrent OpenAI request therefore cannot start with
         # the preceding step's ID.
@@ -1821,6 +1832,10 @@ class AgenticSessionShard:
                     async with session.lock:
                         if session.phase is SessionPhase.ACTIVE:
                             session.rollout_id = rollout_id
+                            if rollout_trace is not None:
+                                resumed.append(session.session_id)
+                            if session.observation is not None and session.observation.rl_trace is not None:
+                                session.observation.rl_trace.assign(rollout_id, rollout_trace)
                             if session.protection_pending_until_resume:
                                 session.protection_pending_until_resume = False
                                 session.protected_until_finalize = True
@@ -1837,7 +1852,7 @@ class AgenticSessionShard:
         for group in runtime_groups:
             await self._open_group(group)
         self._notify_state_change()
-        return self._state_revision
+        return (self._state_revision, resumed) if rollout_trace is not None else self._state_revision
 
     async def _set_runtime_timeouts_active(self, active: bool) -> None:
         """Set timeout activity for every Runtime-owned group."""
@@ -1920,6 +1935,7 @@ class AgenticSessionShard:
         stop: Optional[list[str] | str],
         seed: Optional[int],
         logprobs: bool = False,
+        trace_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Resolve one HTTP route token to the actor-local Session ref."""
 
@@ -1935,6 +1951,7 @@ class AgenticSessionShard:
                     session.observation.begin_call(request_id)
             return await self._chat(
                 session=session,
+                trace_headers=trace_headers,
                 request_id=request_id,
                 messages=messages,
                 tools=tools,
@@ -2142,6 +2159,7 @@ class AgenticSessionShard:
         seed: Optional[int],
         logprobs: bool,
         request_id: str | None = None,
+        trace_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Commit one full OpenAI request to the Forest before scheduling
         it."""
@@ -2208,10 +2226,17 @@ class AgenticSessionShard:
                 session.next_ir_sequence += 1
             if session.observation is not None:
                 session.observation.begin_call(request_id)
+                session.observation.calls[request_id].update(
+                    input_messages=copy.deepcopy(messages),
+                    tools=copy.deepcopy(tools),
+                    sampling_config=copy.deepcopy(sampling_params),
+                    model=self.args.hf_checkpoint,
+                )
                 session.observation.calls[request_id]["parent_state_hash"] = generation_parent.state_hash
             waiter = asyncio.get_running_loop().create_future()
             ir = InflightRequest(
                 request_id=request_id,
+                trace_headers=trace_headers,
                 parent_state_hash=generation_parent.state_hash,
                 rollout_id=session.rollout_id,
                 kind=kind,
@@ -2352,6 +2377,10 @@ class AgenticSessionShard:
     def _start_session(self, session: _SessionRecord, session_input: SessionInput) -> None:
         """Attach a record-owned process to one Session."""
 
+        start_agent_trace(self.args, session, session_input)
+        trace = getattr(session.observation, "rl_trace", None)
+        if trace is not None:
+            session_input = replace(session_input, agent_trace_headers=trace.span.headers())
         process = self._agent_launcher.start_agent(session_input)
         if session.observation is not None:
             log_path = self._trajectory_recorder.session_log_path(session.session_id)
@@ -2555,6 +2584,7 @@ class AgenticSessionShard:
 
         # Import in the worker so Ray does not capture the unpicklable ContextVar.
         from relax.utils.http_utils import PostObservation, post_observation
+        from relax.utils.rl_tracing import inference_context
 
         group = session.group
         runner_task = asyncio.current_task()
@@ -2605,23 +2635,32 @@ class AgenticSessionShard:
                         observation_attempt = (
                             observation.begin_attempt(ir.request_id, ir.rollout_id) if observation else None
                         )
-                        try:
-                            result = await self._generation_backend.generate(
-                                input_ids=ir.history_rollout_token_prefix + ir.pending_token_delta,
-                                sampling_params={**ir.sampling_params, "max_new_tokens": remaining_tokens},
-                                session_id=session.session_id,
-                                request_id=backend_request_id,
-                                image_data=ir.history_backend_image_data,
-                                audio_data=ir.history_backend_audio_data,
-                                video_data=ir.history_backend_video_data,
-                                return_logprob=group.rollout_mode == "train" or ir.logprobs,
-                                collect_score_centering=group.rollout_mode == "train",
-                                fail_fast_no_workers=router_recovery_enabled,
+                        if observation_attempt is not None:
+                            observation_attempt.update(
+                                backend_request_id=backend_request_id, step_id=f"iteration:{ir.rollout_id}"
                             )
+                        try:
+                            rl_trace = getattr(observation, "rl_trace", None)
+                            with inference_context(rl_trace.span if rl_trace is not None else None, ir.trace_headers):
+                                result = await self._generation_backend.generate(
+                                    input_ids=ir.history_rollout_token_prefix + ir.pending_token_delta,
+                                    sampling_params={**ir.sampling_params, "max_new_tokens": remaining_tokens},
+                                    session_id=session.session_id,
+                                    request_id=backend_request_id,
+                                    image_data=ir.history_backend_image_data,
+                                    audio_data=ir.history_backend_audio_data,
+                                    video_data=ir.history_backend_video_data,
+                                    return_logprob=group.rollout_mode == "train" or ir.logprobs,
+                                    collect_score_centering=group.rollout_mode == "train",
+                                    fail_fast_no_workers=router_recovery_enabled,
+                                )
                             if observation is not None:
                                 # Count each returned delta before cleanup or a
                                 # superseding generation gate can discard it.
                                 observation.record_backend_timing(observation_attempt, result.meta_info)
+                                observation_attempt.update(
+                                    backend_request_id=backend_request_id, metadata=copy.deepcopy(result.meta_info)
+                                )
                                 observation.generated_tokens += len(result.new_tokens)
                                 observation_attempt.update(
                                     status="aborted" if result.finish_type == "abort" else "completed",
@@ -2945,6 +2984,14 @@ class AgenticSessionShard:
                 "total_tokens": prompt_tokens + completion_tokens,
             },
         }
+        if session.observation is not None:
+            session.observation.calls[ir.request_id].update(
+                response_messages=copy.deepcopy(response_messages),
+                usage=payload["usage"],
+                finish_reason=payload["finish_reason"],
+                response_state_hash=response_node.state_hash,
+                milestones=copy.deepcopy(agentic_trace_events(ir.pending_export_metadata_patch)),
+            )
         response_node.wall_elapsed_s = time.monotonic() - ir.wall_started_at
         return payload
 
@@ -2956,6 +3003,8 @@ class AgenticSessionShard:
         """Watch one process and finalize its Session result."""
 
         process_error = await asyncio.shield(process_wait)
+        if session.observation is not None and session.observation.rl_trace is not None:
+            session.observation.rl_trace.execution_end(process_error)
 
         group = session.group
         if isinstance(process_error, AgentExecutionError):
@@ -3092,6 +3141,7 @@ class AgenticSessionShard:
         finalize_events: dict[str, float],
     ) -> SessionExportTransport:
         forest = cast(SessionForest, session.forest)
+        export_started_at = time.time()
         prepared: list[tuple[str, dict[str, Any]]] = []
         if output_records:
             for output_record in output_records:
@@ -3147,6 +3197,8 @@ class AgenticSessionShard:
                     raise _NonFinalizableExportError(
                         f"R3 export routed-experts shape {actual_shape} does not match expected {expected_shape}"
                     )
+        if session.observation is not None and session.observation.rl_trace is not None:
+            session.observation.rl_trace.capture_exports(prepared, export_started_at)
         # Publish trajectories only after every export has passed validation.
         for state_hash, export_payload in prepared:
             sample_payload = export_payload["sample_payload"]
@@ -3289,6 +3341,8 @@ class AgenticSessionShard:
             session.observation.active_ms = getattr(resources.process, "active_ms", 0.0)
             session.observation.log_ref = getattr(resources.process, "observation_log_ref", None)
         async with session.lock:
+            if session.observation is not None and session.observation.rl_trace is not None:
+                session.observation.rl_trace.capture_states(session.forest)
             session.forest = None
             session.resp_state_hash_by_request_id.clear()
             session.resources = None
@@ -3352,6 +3406,11 @@ class AgenticSessionShard:
             )
         else:
             self._observe_session(session, "rollout", "completed", is_terminal=True)
+        if session.observation is not None and session.observation.rl_trace is not None:
+            trace_error = outcome if isinstance(outcome, BaseException) else None
+            if failure is not None and failure[1] in ("execution", "infra"):
+                trace_error = trace_error or RuntimeError(f"{failure[0]}: {failure[2]}")
+            session.observation.rl_trace.finish(trace_error)
         session.result_cell.publish(outcome)
         group.sessions.remove(session)
         self._notify_state_change(group)
@@ -3458,6 +3517,7 @@ class AgenticChatAPIService:
         shard: Any,
         session_id: str,
         normalized: dict[str, Any],
+        trace_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         try:
             response = await shard.chat.remote(
@@ -3469,6 +3529,7 @@ class AgenticChatAPIService:
                 stop=normalized["stop"],
                 seed=normalized["seed"],
                 logprobs=normalized["logprobs"],
+                **({"trace_headers": trace_headers} if trace_headers else {}),
             )
         except (ray.exceptions.RayTaskError, ray.exceptions.TaskCancelledError) as error:
             if not _is_ray_task_cancelled(error):
@@ -3546,6 +3607,9 @@ class AgenticChatAPIService:
                     shard=shard,
                     session_id=session_id,
                     normalized=normalized,
+                    trace_headers={
+                        k: request.headers[k] for k in ("traceparent", "tracestate") if k in request.headers
+                    },
                 )
             except Exception as error:
                 logger.warning("Agentic completion failed: %s", error, exc_info=True)

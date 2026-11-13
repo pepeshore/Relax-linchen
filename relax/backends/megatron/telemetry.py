@@ -35,6 +35,8 @@ def initialize(args: Namespace) -> None:
     from megatron.training import global_vars
     from nemo.lens import NemoLensConfig, setup_telemetry
 
+    from relax.utils import rl_tracing
+
     config = NemoLensConfig.from_env(
         prefix="MEGATRON_OTEL", fallback_prefix="NEMO_LENS", span_group_cls=MegatronSpanGroup
     )
@@ -42,19 +44,23 @@ def initialize(args: Namespace) -> None:
         raise ValueError("Set NEMO_LENS_RUN_ID to one shared run ID before submitting the Ray job.")
     config.service_name = os.environ.get("OTEL_SERVICE_NAME", "relax-megatron-smoke")
     run_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"relax/megatron-otel/{config.run_id}"))
+    resource = {
+        "relax.run.id": config.run_id,
+        "nemo.lens.job_uuid": run_uuid,
+        "nemo.lens.run_uuid": run_uuid,
+        "dl.tensor_parallel.size": args.tensor_model_parallel_size,
+        "dl.pipeline_parallel.size": args.pipeline_model_parallel_size,
+        "dl.context_parallel.size": args.context_parallel_size,
+        "dl.expert_parallel.size": args.expert_model_parallel_size,
+    }
+    if rl_tracing.enabled(args):
+        resource["rl.run.id"] = rl_tracing.run_id(args)
+        resource["rl.producer.role"] = rl_tracing.process_role()
     _handle = setup_telemetry(
         config,
         rank=args.rank,
         world_size=args.world_size,
-        resource_attributes={
-            "relax.run.id": config.run_id,
-            "nemo.lens.job_uuid": run_uuid,
-            "nemo.lens.run_uuid": run_uuid,
-            "dl.tensor_parallel.size": args.tensor_model_parallel_size,
-            "dl.pipeline_parallel.size": args.pipeline_model_parallel_size,
-            "dl.context_parallel.size": args.context_parallel_size,
-            "dl.expert_parallel.size": args.expert_model_parallel_size,
-        },
+        resource_attributes=resource,
     )
     # The pinned MCore exposes a getter but no setter. Native checkpoint and
     # schedule code consult this handle in addition to Lens's span-group state.
@@ -99,12 +105,27 @@ def flush() -> None:
 def observe_step(rollout_id: int, step_id: int, role: str) -> Iterator[Any]:
     """Parent native spans to a Relax update and flush on success or
     failure."""
+    parent_context = nullcontext()
+    if _handle is not None and _handle.is_exporting:
+        from relax.utils.rl_train_trace import current_window_span
+
+        parent = current_window_span()
+        if parent is not None and parent.span is not None:
+            from opentelemetry.trace import use_span
+
+            # Lens reads OTel's current span. The RL window owns its end time and error recording.
+            parent_context = use_span(
+                parent.span, end_on_exit=False, record_exception=False, set_status_on_exception=False
+            )
     try:
-        with span(
-            "step",
-            "relax.train.step",
-            **{"relax.rollout_id": rollout_id, "relax.step_id": step_id, "relax.role": role},
-        ) as current:
+        with (
+            parent_context,
+            span(
+                "step",
+                "relax.train.step",
+                **{"relax.rollout_id": rollout_id, "relax.step_id": step_id, "relax.role": role},
+            ) as current,
+        ):
             yield current
     finally:
         flush()

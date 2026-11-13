@@ -16,6 +16,7 @@ from relax.distributed.ray.placement_group import (
     _require_node_group_markers,
     create_placement_group,
 )
+from relax.utils import rl_service_trace as lifecycle
 from relax.utils.fault_events.models import RecoveryEvidence
 from relax.utils.fault_events.recovery import observe_recovery
 from relax.utils.logging_utils import get_logger
@@ -140,13 +141,16 @@ class Service:
                 **ray_actor_options.get("resources", {}),
                 resource: 0.001,
             }
+        config = lifecycle.deployment_config(self.config, self.role)
+        deployment = getattr(config, "_rl_service_deployment", None)
+        self._rl_deployment_id = deployment["origin"]["span_id"] if deployment else None
         if self.data_source is not None:
             self.service = self.cls.options(ray_actor_options=ray_actor_options, max_constructor_retry_count=1).bind(
-                self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env
+                self.healthy, pgs, config, data_source=self.data_source, runtime_env=self.runtime_env
             )
         else:
             self.service = self.cls.options(ray_actor_options=ray_actor_options, max_constructor_retry_count=1).bind(
-                self.healthy, pgs, self.num_gpus, self.config, self.role, runtime_env=self.runtime_env
+                self.healthy, pgs, self.num_gpus, config, self.role, runtime_env=self.runtime_env
             )
         logger.info(f"[{self.role}] Deploying service...")
         self.handle = serve.run(self.service, name=self.role, route_prefix=f"/{self.role}")
@@ -288,7 +292,15 @@ class Service:
         except Exception as e:
             logger.warning(f"[{self.role}] Failed to gracefully stop old deployment: {e}")
         try:
-            serve.delete(self.role)
+            with lifecycle.operation(
+                self.config,
+                "rl.service.stop",
+                role=str(self.role),
+                attributes={
+                    "rl.service.deployment.id": getattr(self, "_rl_deployment_id", None),
+                },
+            ):
+                serve.delete(self.role)
             logger.info(f"[{self.role}] Ray Serve deployment deleted")
         except Exception as e:
             logger.warning(f"[{self.role}] Failed to delete Ray Serve deployment: {e}")
@@ -300,7 +312,13 @@ class Service:
         pgs = self._ensure_placement_group()
 
         recovery_load_path(self.config)  # Ensure config has the correct checkpoint paths after restart
-        self._deploy(pgs)
+        with lifecycle.operation(
+            self.config,
+            "rl.service.start",
+            role=str(self.role),
+            attributes={"rl.service.gpus": getattr(self, "num_gpus", None)},
+        ):
+            self._deploy(pgs)
         observe_recovery(fault_observer, observed=RecoveryEvidence.DEPLOYED)
         logger.info(f"[{self.role}] Service redeployed successfully")
 
@@ -312,16 +330,30 @@ class Service:
             current_step = ray.get(self.healthy.get_current_step.remote(role=self.role))
             logger.warning(f"[{self.role}] Failed to get current step, defaulting to step: {current_step}: {e}")
 
+        restart = lifecycle.current()
         try:
-            self._http_call(self.role, "/set_step", method="POST", params={"step": current_step})
+            with lifecycle.operation(
+                self.config,
+                "rl.service.restore_step",
+                role=str(self.role),
+                attributes={"rl.service.restore.step": current_step},
+            ):
+                self._http_call(self.role, "/set_step", method="POST", params={"step": current_step})
+            if restart is not None:
+                restart.set("rl.service.restart.step_restored", True)
             logger.info(f"[{self.role}] Restored step to {current_step}")
             observe_recovery(fault_observer, observed=RecoveryEvidence.STEP_RESTORED)
         except Exception as e:
+            if restart is not None:
+                restart.set("rl.service.restart.step_restored", False)
+                restart.mark_error(e)
             observe_recovery(fault_observer, failed=RecoveryEvidence.STEP_RESTORED)
             logger.warning(f"[{self.role}] Failed to restore step: {e}")
 
         self._task_ref = None
         task_ref = self.run()
+        if restart is not None:
+            restart.set("rl.service.restart.task_submitted", task_ref is not None)
         if task_ref is not None:
             observe_recovery(fault_observer, observed=RecoveryEvidence.TASK_SUBMITTED)
         logger.info(f"[{self.role}] Service task re-launched after restart, task_ref={task_ref}")

@@ -1,5 +1,9 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from collections import defaultdict
 from dataclasses import dataclass
+
+from relax.utils.rl_trace_hooks import trace_filter
 
 
 @dataclass
@@ -8,6 +12,7 @@ class DynamicFilterOutput:
     reason: str | None = None
 
 
+@trace_filter
 def call_dynamic_filter(fn, *args, **kwargs):
     if fn is None:
         return DynamicFilterOutput(keep=True)

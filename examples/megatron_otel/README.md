@@ -135,6 +135,14 @@ DRY_RUN=1 bash examples/megatron_otel/scripts/run-qwen35-35B-A3B-dapo-8xgpu-colo
 
 ## Observe native spans
 
+When Relax RL tracing is enabled, Lens records the framework's `rl.run.id` and the producing rank's
+`rl.producer.role` on its Resource. `NEMO_LENS_RUN_ID` continues to identify the Lens run.
+In an instrumented training RPC, each exported `relax.train.step` is a child of the rank-local
+`rl.actor.train` or `rl.critic.train` operation. Use the OTel trace ID and parent span ID to
+join the native records from the configured Lens exporter to the framework's local trace files.
+Set `RELAX_OTEL_DIR` to a shared directory to collect the framework JSONL files from every node.
+The launcher forwards this setting and `RELAX_OTEL_ENABLED` to the Ray job.
+
 Console export is enabled by default, on training rank 0. The script copies all
 `MEGATRON_OTEL_*`, `NEMO_LENS_*` and `OTEL_*` variables into the Ray job runtime
 environment, so they reach workers instead of remaining only in the submitting

@@ -15,6 +15,7 @@ from relax.distributed.coordination import RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import sft_partition_id
 from relax.utils.async_utils import run
+from relax.utils.rl_service_trace import trace_replica_init
 from relax.utils.tq.lifecycle import attach_tq_client
 
 
@@ -30,6 +31,7 @@ class Critic(Base):
     non-"ppo" ``advantage_estimator`` and skip that gate.
     """
 
+    @trace_replica_init
     def __init__(
         self, healthy: Any, pgs: Optional[Any], num_gpus: int, config: Namespace, role: str, runtime_env: dict = None
     ) -> None:

@@ -29,6 +29,7 @@ from relax.distributed.ray.placement_group import create_genrm_managers
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.rl_service_trace import trace_replica_init
 
 
 app = FastAPI()
@@ -147,6 +148,7 @@ class GenRM(Base):
     one or more genRM instances (models/configs), routed by ``route_key``.
     """
 
+    @trace_replica_init
     def __init__(
         self,
         healthy: Any,

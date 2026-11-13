@@ -336,6 +336,9 @@ class SessionInput:
     rollout_mode: str
     group_id: str
     input_payload: dict[str, Any] = field(default_factory=dict)
+    rollout_trace: dict[str, Any] | None = None
+    agent_trace_headers: dict[str, str] | None = None
+    prompt_id: str | None = None
 
     def to_agent_payload(self) -> dict[str, Any]:
         return copy.deepcopy(self.input_payload)
@@ -353,6 +356,7 @@ class ManagedAgentProcess:
         self._launcher = launcher
         self._spec = spec
         self._session_id = session_input.session_id
+        self._trace_headers = session_input.agent_trace_headers or {}
         self._group_id = session_input.group_id
         self._rollout_mode = session_input.rollout_mode
         self._remaining_timeout = spec.timeout_s
@@ -460,6 +464,12 @@ class ManagedAgentProcess:
                 "RELAX_INPUT_JSON": str(input_path),
                 "RELAX_OUTPUT_JSON": str(output_path),
             }
+            for header in ("traceparent", "tracestate"):
+                key = f"RELAX_{header.upper()}"
+                if header in self._trace_headers:
+                    env[key] = self._trace_headers[header]
+                else:
+                    env.pop(key, None)
             mark_agentic_event(process_events, "managed_prepare_end_at")
             try:
                 mark_agentic_event(process_events, "managed_launch_start_at")

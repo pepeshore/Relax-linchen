@@ -21,6 +21,7 @@ from relax.engine.sft.runtime import (
 )
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
+from relax.utils.rl_service_trace import trace_replica_init
 from relax.utils.tq.lifecycle import attach_tq_client
 
 
@@ -51,6 +52,7 @@ class Actor(Base):
     - sync: Waits for rollout data before each training step
     """
 
+    @trace_replica_init
     def __init__(
         self,
         healthy: Any,
@@ -293,10 +295,10 @@ class Actor(Base):
             ray.get(self.actor_model.train_hybrid(self.step))
         elif self.config.fully_async:
             ray.get(self.actor_model.train_fully_async(self.step))
-            # Save model checkpoint if needed
-            self._maybe_save_model()
         else:
             ray.get(self.actor_model.async_train(self.step))
+        if self.config.fully_async and not self.config.hybrid:
+            self._maybe_save_model()
         return True
 
     def _maybe_save_model(self) -> None:

@@ -11,6 +11,7 @@ import ray
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.rl_trace_hooks import record_reward_route, trace_batched_reward, trace_reward
 from relax.utils.types import Sample
 
 from .dapo_genrm import async_compute_score_genrm
@@ -382,6 +383,11 @@ class RewardExecutor:
                 fallback=getattr(args, "rm_type_fallback", None),
                 sample_index=getattr(sample, "index", None),
             )
+            record_reward_route(
+                sample,
+                route.rm_type or "zero_fallback",
+                "model" if route.rm_type in ("dapo-genrm", "remote_rm") else "rule",
+            )
             if route.zero_reward:
                 # Fallback "zero": no dispatch. Reuse the dummy reward so the
                 # 0.0 is reward-key aware and cannot mix dict/scalar shapes.
@@ -468,6 +474,7 @@ register_reward("dapo-genrm", async_compute_score_genrm, mode="async")
 register_reward("dummy", lambda args, sample: _dummy_reward(args), mode="async")
 
 
+@trace_reward
 async def async_rm(args, sample: Sample, **kwargs):
     """Single-sample reward computation.
 
@@ -477,6 +484,7 @@ async def async_rm(args, sample: Sample, **kwargs):
     return await _get_reward_executor(args).execute(args, sample, **kwargs)
 
 
+@trace_batched_reward
 async def batched_async_rm(
     args,
     samples: list[Sample],

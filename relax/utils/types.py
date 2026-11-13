@@ -178,6 +178,8 @@ class Sample:
             return info
 
     prefix_cache_info: PrefixCacheInfo = field(default_factory=PrefixCacheInfo)
+    # Identity of the original dataset row, shared by its sampled answers and exports.
+    prompt_id: str | None = None
 
     def to_dict(self):
         value = self.__dict__.copy()

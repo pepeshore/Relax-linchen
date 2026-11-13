@@ -28,6 +28,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_merge_mode,
 )
 from relax.utils.reloadable_process_group import retain_process_groups
+from relax.utils.rl_weights_trace import begin_weights, trace_weight_call, weights_delivered
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .expert_layout import DirectExpertLayout, direct_expert_chunk, expert_slice_chunk
@@ -444,6 +445,7 @@ class UpdateWeightFromTensor:
             )
 
     @torch.no_grad()
+    @trace_weight_call
     def update_weights(self) -> None:
         """version++, flush caches, process buckets with pipelining.
 
@@ -464,6 +466,7 @@ class UpdateWeightFromTensor:
             return
 
         self.weight_version += 1
+        begin_weights(self)
 
         # Pause/flush must cover both IPC and distributed-broadcast engines,
         # otherwise NCCL-path engines see torn reads and stale radix-KV cache.
@@ -565,6 +568,8 @@ class UpdateWeightFromTensor:
         # weight chunks when their parameters get reshaped by post_process.
         dist.barrier(group=get_gloo_group())
 
+        weights_delivered(self)
+
         # int4/fp4 post_process
         if self._route_experts:
             if getattr(self, "_auto_expert_routing", False):
@@ -649,10 +654,12 @@ class UpdateWeightFromTensor:
         else:
             self._sync_lora_delta_only()
 
+    @trace_weight_call
     def _sync_base_and_lora(self) -> None:
         """First-time sync: push base-only weights, then register the LoRA
         adapter."""
         self.weight_version += 1
+        begin_weights(self)
 
         rank = dist.get_rank()
         if rank == 0:
@@ -730,7 +737,9 @@ class UpdateWeightFromTensor:
 
         dist.barrier(group=get_gloo_group())
         self._resume_generation_after_adapter_push(push_error)
+        weights_delivered(self)
 
+    @trace_weight_call
     def _sync_lora_delta_only(self) -> None:
         """Subsequent syncs: refresh ONLY the LoRA adapter on the rollout
         engines.
@@ -753,6 +762,7 @@ class UpdateWeightFromTensor:
             self._lora_sync.prev_state = new_state
             return
 
+        begin_weights(self)
         logger.info("Adapter mode: refreshing LoRA adapter")
 
         rank = dist.get_rank()
@@ -772,6 +782,7 @@ class UpdateWeightFromTensor:
 
         dist.barrier(group=get_gloo_group())
         self._resume_generation_after_adapter_push(push_error)
+        weights_delivered(self)
         self._lora_sync.prev_state = new_state
 
     def _resume_generation_after_adapter_push(self, push_error: Exception | None) -> None:

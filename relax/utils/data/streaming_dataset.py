@@ -902,6 +902,7 @@ class StreamingDataset(BaseDataset):
         teacher_multimodal_keys: Optional[dict] = None,
         record_source: bool = False,
         source_split: str = "train",
+        record_prompt_id: bool = False,
     ):
         """Initialize the streaming dataset.
 
@@ -953,11 +954,12 @@ class StreamingDataset(BaseDataset):
 
         # Streaming-specific components
         self.source_split = source_split
+        self.record_source = record_source
         paths, row_slice = resolve_path_plan(path)
         if len(paths) == 1 and row_slice is None:
-            self.reader = StreamingReader(paths[0], with_source=record_source)
+            self.reader = StreamingReader(paths[0], with_source=record_source or record_prompt_id)
         else:
-            self.reader = CompositeStreamingReader(paths, row_slice, with_source=record_source)
+            self.reader = CompositeStreamingReader(paths, row_slice, with_source=record_source or record_prompt_id)
         self.buffer = SampleBuffer(max_size=buffer_size)
         self.index_manager = IndexManager(len(self.reader), seed=seed)
 

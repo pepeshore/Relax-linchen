@@ -895,7 +895,9 @@ class BaseDataset(abc.ABC):
         from relax.utils.agentic_obs.source import SourceRow, snapshot_source
 
         source = (
-            snapshot_source(data, metadata_key=self.metadata_key, split=getattr(self, "source_split", "train"))
+            snapshot_source(
+                data, metadata_key=self.metadata_key, split=self.source_split, copy_payload=self.record_source
+            )
             if isinstance(data, SourceRow)
             else None
         )
@@ -917,5 +919,8 @@ class BaseDataset(abc.ABC):
             teacher_prompt_key=self.teacher_prompt_key,
             teacher_multimodal_keys=self.teacher_multimodal_keys,
         )
-        sample.agentic_prompt_source = source
+        if source is not None:
+            sample.prompt_id = source["prompt_id"]
+            if self.record_source:
+                sample.agentic_prompt_source = source
         return sample

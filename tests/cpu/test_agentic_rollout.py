@@ -2000,3 +2000,108 @@ def test_routing_replay_preserves_selected_session_branch():
     np.testing.assert_array_equal(sibling.rollout_routed_experts, sibling_routes)
     np.testing.assert_array_equal(first.rollout_routed_experts, first_routes)
     np.testing.assert_array_equal(next_routes, np.full((7, 2, 2), 20, dtype=np.int32))
+
+
+@pytest.mark.asyncio
+async def test_concurrent_agentic_backend_requests_inherit_their_session_span(monkeypatch, tmp_path):
+    from relax.agentic.observability import SessionObservation, ShardTrajectoryRecorder
+    from relax.utils import rl_tracing as tracing
+
+    monkeypatch.setenv("RELAX_OTEL_ENABLED", "1")
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+    args = Namespace(rl_trace_run_id="agent-parent-test", rl_trace_dir=str(tmp_path / "otel"))
+    parents = [tracing.Stage(args, "rl.agent.run") for _ in range(2)]
+    ready = asyncio.Event()
+    entered = 0
+    calls = []
+    recorders = []
+
+    async def post(url, payload, headers=None, **kwargs):
+        nonlocal entered
+        entered += 1
+        if entered == 2:
+            ready.set()
+        await ready.wait()
+        calls.append((payload["rid"], dict(headers)))
+        return {
+            "output_ids": [7],
+            "meta_info": {"id": payload["rid"], "weight_version": "7", "finish_reason": {"type": "stop"}},
+        }
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    tasks = []
+    try:
+        for index, parent in enumerate(parents):
+            shard, group, session, ir = _router_recovery_shard()
+            session.session_id = f"session-{index}"
+            ir.request_id = f"request-{index}"
+            session.observation = SessionObservation()
+            session.observation.rl_trace = SimpleNamespace(span=parent)
+            shard._trajectory_recorder = ShardTrajectoryRecorder(
+                Namespace(dump_agentic_obs=str(tmp_path / str(index)), agentic_obs_run_id="retry"), shard_ordinal=index
+            )
+            recorders.append(shard._trajectory_recorder)
+            adapter = _backend_adapter(lifecycle_enabled=False)
+            adapter._args.sglang_router_policy = "consistent_hashing"
+            shard._generation_backend = adapter
+            shard._apply_generate_result = lambda request, result: request.pending_token_delta.extend(
+                result.new_tokens
+            )
+            shard._terminal_response_locked = lambda **kwargs: {"ok": True}
+            task = asyncio.create_task(shard._run_ir(session, ir))
+            ir.runner_task = task
+            tasks.append(task)
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+        assert tracing.inference_headers() is None
+        assert len(calls) == 2
+        for request_id, headers in calls:
+            index = int(request_id.split(":")[0].split("-")[-1])
+            context = parents[index].context()
+            assert (
+                headers["traceparent"] == f"00-{context['trace_id']}-{context['span_id']}-{context['trace_flags']:02x}"
+            )
+            assert headers["X-SMG-Routing-Key"] == f"session-{index}"
+    finally:
+        for parent in parents:
+            parent.end()
+        for recorder in recorders:
+            await recorder.aclose()
+
+
+async def test_chat_callback_sends_only_request_trace_headers_to_its_shard() -> None:
+    from starlette.requests import Request
+
+    service_cls = service_mod.AgenticChatAPIService.func_or_class
+    shard = MagicMock()
+    shard.chat.remote = AsyncMock(
+        return_value={
+            "request_id": "r1",
+            "message": {"role": "assistant", "content": "4"},
+            "finish_reason": "stop",
+            "logprobs": None,
+            "usage": {},
+        }
+    )
+    shard.mark_chat_service_response_ready.remote = AsyncMock()
+    service = SimpleNamespace(_session_shards={"s": shard})
+    for name in ("_handle_generation_request", "_shard_handle", "_complete_generation"):
+        setattr(service, name, getattr(service_cls, name).__get__(service))
+    incoming = "00-" + "1" * 32 + "-" + "2" * 16 + "-01"
+    body = json.dumps({"model": "test", "messages": [{"role": "user", "content": "2+2?"}]}).encode()
+    request = Request(
+        {
+            "type": "http",
+            "headers": [
+                (b"authorization", b"Bearer s.session-A"),
+                (b"traceparent", incoming.encode()),
+                (b"tracestate", b"vendor=abc"),
+                (b"x-extra", b"not-forwarded"),
+            ],
+        },
+        receive=AsyncMock(return_value={"type": "http.request", "body": body}),
+    )
+    res = await service_cls.chat_completions(service, request)
+    assert res.status_code == 200
+    kwargs = shard.chat.remote.await_args.kwargs
+    assert kwargs["session_id"] == "s.session-A"
+    assert kwargs["trace_headers"] == {"traceparent": incoming, "tracestate": "vendor=abc"}

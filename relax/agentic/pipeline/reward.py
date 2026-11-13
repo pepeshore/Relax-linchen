@@ -18,6 +18,7 @@ from relax.agentic.profile import mark_sample_agentic_event
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.utils.logging_utils import get_logger
+from relax.utils.rl_trace_hooks import trace_custom_advantage
 from relax.utils.types import Sample
 
 
@@ -129,6 +130,7 @@ class RewardDomain:
                 sample.reward = reward
                 mark_sample_agentic_event(sample, "reward_end_at", reward_end_at)
 
+    @trace_custom_advantage
     async def apply_custom_advantage(self, group: GroupExport) -> bool:
         """Write per-export custom advantage values or reject the whole
         Group."""

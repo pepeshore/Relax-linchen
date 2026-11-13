@@ -90,6 +90,10 @@ from relax.utils.opd.opd_utils import (
 )
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from relax.utils.replay import capture_hooks
+from relax.utils.rl_trace_hooks import trace_forward, trace_iteration
+from relax.utils.rl_tracing import enabled, model_name
+from relax.utils.rl_train_trace import training_rpc, window
+from relax.utils.rl_weights_trace import trace_weight_sync
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
@@ -1322,6 +1326,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         del rollout_data["rollout_indexer_topk"]
 
+    @trace_forward
     def compute_log_prob(
         self,
         data_iterator: list[DataIterator],
@@ -1415,8 +1420,10 @@ class MegatronTrainRayActor(TrainRayActor):
         """Backward-compatible name kept for existing internal call sites."""
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
+    @training_rpc
     @manual_gc_training
-    def train(self, rollout_id: int) -> None:
+    @trace_iteration
+    def train(self, rollout_id: int, *, trace_headers: dict[str, str] | None = None) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
             if self.genrm_manager is not None:
@@ -2017,15 +2024,23 @@ class MegatronTrainRayActor(TrainRayActor):
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
-        rollout_data.update(
-            forward_only(
-                get_values,
-                self.args,
-                self.model,
-                data_iterator,
-                num_microbatches,
+        with window(
+            self.args,
+            "critic",
+            rollout_id,
+            name="rl.critic.forward",
+            data=rollout_data,
+            attributes={"rl.model.name": model_name(self.args, "critic"), "rl.backend.name": "megatron"},
+        ):
+            rollout_data.update(
+                forward_only(
+                    get_values,
+                    self.args,
+                    self.model,
+                    data_iterator,
+                    num_microbatches,
+                )
             )
-        )
         # Ship values to TransferQueue before we sleep — CP all-gather needs
         # live NCCL groups and .cpu() needs live GPU memory.
         self._put_critic_values_to_transfer_queue(rollout_data)
@@ -2332,12 +2347,17 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_train_done:
             self._wait_for_previous_eval()
 
+    @trace_iteration
     def compute_ref_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
 
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for compute_ref_log_prob.")
         data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
+        if enabled(self.args):
+            data_fields.append(
+                "sample_export_ids" if getattr(self.args, "use_agentic_rollout", False) else "sample_indices"
+            )
         if self.args.multimodal_keys is not None:
             data_fields.append("multimodal_train_inputs")
 
@@ -2374,6 +2394,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.recv_weight_fully_async(rollout_id)
         log_perf_data_fwd(self.args, rollout_id)
 
+    @trace_iteration
     def compute_actor_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             if self.args.use_rollout_routing_replay:
@@ -2382,6 +2403,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 os.environ["ROUTING_REPLAY_STAGE"] = "record"
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for compute_actor_log_prob.")
         data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
+        if enabled(self.args):
+            data_fields.append(
+                "sample_export_ids" if getattr(self.args, "use_agentic_rollout", False) else "sample_indices"
+            )
         if self.args.multimodal_keys is not None:
             data_fields.append("multimodal_train_inputs")
 
@@ -2572,8 +2597,10 @@ class MegatronTrainRayActor(TrainRayActor):
             if clear_routing_replay_forward:
                 RoutingReplay.clear_all_forward()
 
+    @training_rpc
     @manual_gc_training
-    def train_hybrid(self, rollout_id) -> None:
+    @trace_iteration
+    def train_hybrid(self, rollout_id: int, *, trace_headers: dict[str, str] | None = None) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
         pipeline (transfer queue with max-staleness).
@@ -2827,8 +2854,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_train_done:
             self._wait_for_previous_eval()
 
+    @training_rpc
     @manual_gc_training
-    def train_async(self, rollout_id) -> None:
+    @trace_iteration
+    def train_async(self, rollout_id: int, *, trace_headers: dict[str, str] | None = None) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
 
@@ -3048,6 +3077,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("old_actor")
 
     @timer
+    @trace_weight_sync
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
@@ -3302,6 +3332,7 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
     @timer
+    @trace_weight_sync
     def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:
         """Fully async version of update_weights, which will be called by actor
         train engine after it train update.

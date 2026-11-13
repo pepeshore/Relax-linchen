@@ -925,6 +925,9 @@ def get_batch(
                     total - response
                     for total, response in zip(batch["total_lengths"], batch["response_lengths"], strict=True)
                 ]
+    from relax.utils.rl_train_trace import prepare_batch
+
+    prepare_batch(batch)
     batch = move_tensors_to_device(batch, batch["tokens"].device)
     if pack_device is not None:
         batch = PrepackedBatch(batch)

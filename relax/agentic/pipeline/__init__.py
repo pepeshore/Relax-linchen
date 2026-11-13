@@ -72,6 +72,8 @@ class SessionSpec:
     sampling_params: dict[str, Any] | None = None
     observation_stage_id: str | None = None
     observation_started_at: str | None = None
+    rollout_trace: dict[str, Any] | None = None
+    prompt_id: str | None = None
 
 
 @dataclass

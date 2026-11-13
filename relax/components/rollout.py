@@ -19,6 +19,7 @@ from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
+from relax.utils.rl_service_trace import trace_replica_init
 from relax.utils.tq.lifecycle import attach_tq_client
 
 
@@ -324,6 +325,7 @@ ROLLOUT_SERVE_MAX_ONGOING_REQUESTS = Envs.ROLLOUT_SERVE_MAX_ONGOING_REQUESTS
 class Rollout(Base):
     """The class to run rollout and convert rollout data to training data."""
 
+    @trace_replica_init
     def __init__(
         self,
         healthy: Any,

@@ -16,7 +16,7 @@ import time
 import uuid
 from argparse import Namespace
 from collections import deque
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Deque, List, Optional, Tuple, cast
 
@@ -51,6 +51,9 @@ from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_values
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
+from relax.utils.rl_trace_hooks import resident_rollout_parent, trace_iteration
+from relax.utils.rl_tracing import Stage, current_rollout, iteration_context
+from relax.utils.rl_tracing import enabled as rl_tracing_enabled
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
 from relax.utils.types import Sample
@@ -119,25 +122,36 @@ async def _run_group(
 
     requires_complete_group = reward_domain.group_rm or reward_domain.custom_advantage_func is not None
 
-    def observe_reward(samples: list[Sample]):
-        return stage_recorder.observe(
-            samples,
-            rollout_id=current_rollout_id(),
-            group_id=stream.group_id,
-            stage="reward",
-            operation="provided_reward" if all(s.reward is not None for s in samples) else "rm",
-        )
+    @asynccontextmanager
+    async def observe_reward(samples: list[Sample]):
+        current = current_rollout_id()
+        with iteration_context(current):
+            async with stage_recorder.observe(
+                samples,
+                rollout_id=current,
+                group_id=stream.group_id,
+                stage="reward",
+                operation="provided_reward" if all(s.reward is not None for s in samples) else "rm",
+            ) as result:
+                yield result
 
-    def observe_filter(group: GroupExport, operation: str):
-        if stage_recorder is None:
-            return nullcontext({})
-        return stage_recorder.observe(
-            group.samples,
-            rollout_id=current_rollout_id(),
-            group_id=group.group_id,
-            stage="filter",
-            operation=operation,
-        )
+    @asynccontextmanager
+    async def observe_filter(group: GroupExport, operation: str):
+        current = current_rollout_id()
+        with iteration_context(current):
+            context = (
+                stage_recorder.observe(
+                    group.samples,
+                    rollout_id=current,
+                    group_id=group.group_id,
+                    stage="filter",
+                    operation=operation,
+                )
+                if stage_recorder is not None
+                else nullcontext({})
+            )
+            async with context as result:
+                yield result
 
     try:
         if requires_complete_group:
@@ -225,9 +239,7 @@ async def _run_group(
             return None
         if opd_manager is None:
             return scored_group
-        from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
-
-        await opd_manager.prefill(scored_group.samples, _encode_multimodal_inputs)
+        await opd_manager.prefill(scored_group.samples)
         return scored_group
     except BaseException as error:
         reward_domain.discard_group_progress(stream)
@@ -275,6 +287,7 @@ class AgenticResidentPipeline:
         self._group_observations: dict[asyncio.Task[Optional[GroupExport]], _GroupObservation] = {}
         self._finalized_groups: Deque[GroupExport] = deque()
         self._active_step: Optional[_StepContext] = None
+        self._rollout_parent: Stage | None = None
         self._stage_recorder = StageRecorder(args)
 
     def snapshot(self) -> dict[str, object]:
@@ -299,10 +312,21 @@ class AgenticResidentPipeline:
             snapshot["teacher_responses"] = self._opd_manager.response_stats.metrics()
         return snapshot
 
+    @trace_iteration
     async def run_step(self, rollout_id: int) -> RolloutFnTrainOutput:
         """Generate one rollout step while resident Group refs may cross
         steps."""
 
+        rollout = current_rollout()
+        self._rollout_parent = rollout.span if rollout is not None else None
+        try:
+            # A Group task can outlive a step. Resolve its owner when each operation starts.
+            with resident_rollout_parent(lambda: self._rollout_parent):
+                return await self._run_step(rollout_id)
+        finally:
+            self._rollout_parent = None
+
+    async def _run_step(self, rollout_id: int) -> RolloutFnTrainOutput:
         started_at = time.monotonic()
         await start_sglang_profile(self.args, rollout_id)
         profile_stopped = False
@@ -1209,6 +1233,7 @@ def _build_eval_samples(
             system_prompt=args.system_prompt,
             custom_prompt_func=custom_prompt_func,
             record_source=agentic_obs_enabled(args),
+            record_prompt_id=rl_tracing_enabled(args),
             source_split="eval",
         )
         samples = []
@@ -1231,6 +1256,7 @@ def _build_eval_samples(
         resources.shutdown()
 
 
+@trace_iteration
 async def eval_rollout(args, rollout_id: int) -> RolloutFnEvalOutput:
     recorder = StageRecorder(args, rollout_mode="eval")
     group_ids: set[str] = set()

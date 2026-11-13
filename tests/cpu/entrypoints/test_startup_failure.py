@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import yaml
 
+from relax.utils import rl_service_trace as lifecycle
 from relax.utils.agentic_obs.run_hooks import RunRecorder
 
 
@@ -30,6 +31,7 @@ def _load_definitions(path, names, namespace):
     # These orchestration functions only need mocked service APIs. Avoid importing
     # CUDA/Megatron dependencies just to exercise their actual control flow.
     namespace.setdefault("Callable", Callable)
+    namespace.setdefault("lifecycle", lifecycle)
     tree = ast.parse((ROOT / path).read_text())
     tree.body = [
         node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names
@@ -55,6 +57,8 @@ def _train_namespace():
         "RunRecorder": RunRecorder,
         "post_process_env": lambda args, env: env,
         "init_tracking": Mock(),
+        "initialize_run": Mock(),
+        "flush_rl_traces": Mock(),
         "maybe_pin_baseline_to_stable": Mock(),
         "_ctrl": None,
         "_shutdown_done": False,
@@ -322,6 +326,7 @@ def _service_phase(fully_async, *, phase=_FakePhase.DEPLOY, serve_dict=None, rem
     wanted = {"_run_service_phase", "_abort_service_phase"}
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
+        "lifecycle": lifecycle,
         "concurrent": SimpleNamespace(futures=concurrent.futures),
         "threading": threading,
         "logger": Mock(),

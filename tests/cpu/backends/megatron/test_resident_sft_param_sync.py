@@ -4,6 +4,7 @@
 Megatron."""
 
 import ast
+import sys
 from argparse import Namespace
 from contextlib import nullcontext
 from pathlib import Path
@@ -21,6 +22,7 @@ from relax.engine.sft.runtime import (
     should_skip_sft_weight_management,
 )
 from relax.utils.env import Envs
+from relax.utils.rl_trace_hooks import trace_train
 
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -108,7 +110,9 @@ def test_resident_sft_preserves_hooks_across_single_step_calls(monkeypatch, enab
         chunk.current_parameters = False
         return {}, 0.0
 
+    monkeypatch.setitem(sys.modules, "megatron.training", SimpleNamespace(get_args=lambda: args))
     namespace = dict(
+        trace_train=trace_train,
         observe_step=observe_step,
         Envs=Envs,
         get_args=lambda: args,

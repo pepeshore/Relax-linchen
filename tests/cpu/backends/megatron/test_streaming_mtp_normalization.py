@@ -16,6 +16,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from relax.utils.rl_trace_hooks import trace_train
+
 
 _ROOT = Path(__file__).resolve().parents[4]
 
@@ -98,7 +100,9 @@ def _train_loop(monkeypatch, step, *, enable_mtp=True, per_token=False):
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
     from relax.backends.megatron.telemetry import observe_step
 
+    monkeypatch.setitem(sys.modules, "megatron.training", SimpleNamespace(get_args=lambda: args))
     namespace = {
+        "trace_train": trace_train,
         "observe_step": observe_step,
         "torch": torch,
         "get_args": lambda: args,

@@ -14,6 +14,7 @@ from unittest.mock import Mock
 import pytest
 
 from relax.components.background_loop import BackgroundLoopRunner
+from relax.utils import rl_service_trace as lifecycle
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -104,7 +105,9 @@ def test_actor_early_stop_is_not_success_or_health_failure(health):
 
 
 def controller_fixture():
-    ns = dict(logger=logging.getLogger(__name__), run=asyncio.run, asyncio=asyncio, Optional=Optional)
+    ns = dict(
+        lifecycle=lifecycle, logger=logging.getLogger(__name__), run=asyncio.run, asyncio=asyncio, Optional=Optional
+    )
     cls = load_methods(
         "relax/core/controller.py", "Controller", {"restart_serve", "training_loop", "_consume_restart_cycle"}, ns
     )
@@ -365,6 +368,7 @@ def test_failed_recovery_cancels_a_pending_serve_response_and_unblocks_training(
 def test_early_recovery_failure_signals_and_cancels(failure):
     ctrl = controller_fixture()
     ns = dict(
+        lifecycle=lifecycle,
         logger=logging.getLogger(__name__),
         resolve_sft_algo_key=lambda config: "sft",
         ALGOS={"sft": {"actor": object}},
@@ -411,6 +415,7 @@ def test_recovery_dispatch_signals_only_after_work_finishes(role, global_restart
     ctrl = controller_fixture()
     roles = SimpleNamespace(**{name: name for name in ("actor", "rollout", "actor_fwd", "critic", "reference")})
     ns = dict(
+        lifecycle=lifecycle,
         logger=logging.getLogger(__name__),
         resolve_sft_algo_key=lambda config: "sft",
         ALGOS={"sft": {role: object}},

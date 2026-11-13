@@ -61,6 +61,7 @@ from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.multimodal.config import MultimodalConfig
+from relax.utils.rl_service_trace import trace_replica_init
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.training.eval_config import build_named_prompt_data_configs
@@ -560,6 +561,7 @@ class _SFTBatchProducerActor:
 
 @serve.deployment
 class SFT(Base):
+    @trace_replica_init
     def __init__(self, healthy, pgs, num_gpus, config, role, runtime_env=None):  # noqa: ARG002
         super().__init__()
         self.config = config

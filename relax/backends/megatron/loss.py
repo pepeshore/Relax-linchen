@@ -27,6 +27,9 @@ from relax.utils.opd.opd_utils import (
     validate_opd_topk_gather,
 )
 from relax.utils.replay import capture_hooks
+from relax.utils.rl_trace_hooks import trace_advantage
+from relax.utils.rl_train_trace import capture as capture_rl_consumption
+from relax.utils.rl_train_trace import mark_incomplete as mark_rl_incomplete
 from relax.utils.training.dataset_metrics import dataset_loss_sums, finalize_dataset_loss_metrics
 from relax.utils.training.fused_ce import ce_implementation, te_cross_entropy
 from relax.utils.training.ppo_utils import (
@@ -688,6 +691,7 @@ def get_values(
     return torch.empty((0,), device=logits.device), res
 
 
+@trace_advantage
 def compute_advantages_and_returns(
     args: Namespace, rollout_data: RolloutBatch, *, inline_log_probs: bool = False
 ) -> None:
@@ -873,6 +877,7 @@ def compute_advantages_and_returns(
 
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
+    capture_rl_consumption(args, {**rollout_data, "padded_total_lengths": padded_total_lengths})
 
 
 def vanilla_tis_function(
@@ -988,6 +993,7 @@ def policy_loss_function(
         "tis", "ois", "tis_clipfrac" are included when the respective features
         are enabled.
     """
+    final_response_masks = batch["loss_masks"]
     # OPD uses the original batch masks, even when TIS replaces the policy reducer below.
     opd_metric_reducer = sum_of_sample_mean
 
@@ -1176,6 +1182,7 @@ def policy_loss_function(
         else:
             tis_func = vanilla_tis_function
         pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
+        final_response_masks = modified_response_masks
 
         # Rebuild with the modified numerator mask while preserving the original
         # logical-sample denominator. The masks are sliced with CP in the reducer.
@@ -1209,6 +1216,17 @@ def policy_loss_function(
     else:
         pg_loss_reducer = sum_of_sample_mean
 
+    # OPD retains the original mask; OPSM gates only the policy term.
+    capture_masks = batch["loss_masks"] if getattr(args, "use_opd", False) else final_response_masks
+    gate = (
+        opsm_mask
+        if args.use_opsm and args.entropy_coef == 0 and not args.use_kl_loss and not getattr(args, "use_opd", False)
+        else None
+    )
+    if not getattr(args, "custom_pg_loss_reducer_function_path", None):
+        capture_rl_consumption(args, batch, capture_masks, local_gate=gate)
+    else:
+        mark_rl_incomplete("custom policy reducer does not expose its final token mask")
     pg_loss = pg_loss_reducer(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
@@ -1363,6 +1381,7 @@ def value_loss_function(
         Tuple of `(loss, metrics)` where `loss` is a scalar tensor and
         `metrics` contains detached scalars "value_loss" and "value_clipfrac".
     """
+    capture_rl_consumption(args, batch)
     old_values = torch.cat(batch["values"], dim=0)
 
     _, values = get_values(

@@ -54,6 +54,16 @@ from relax.utils.opd.opd_multimodal import (
     validate_prompt_token_ids,
 )
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
+from relax.utils.rl_trace_hooks import (
+    generation_batch,
+    seal_generation_batch,
+    trace_generation,
+    trace_generation_window,
+    trace_iteration,
+    track_generation_task,
+)
+from relax.utils.rl_tracing import enabled as rl_tracing_enabled
+from relax.utils.rl_tracing import inference_headers
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.score_centering import (
     append_score_centering_candidates,
@@ -187,7 +197,7 @@ class GenerateState(metaclass=SingletonMeta):
         if rollout abort has been signalled by the time the permit is acquired.
         """
         async with self.inference_permit():
-            return await post(url, payload, headers=headers)
+            return await post(url, payload, headers=inference_headers(headers))
 
     def reset(self) -> None:
         self.remaining_batch_size = 0
@@ -211,23 +221,27 @@ class GenerateState(metaclass=SingletonMeta):
             self.last_step_current_deficit = 0
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
-        max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
-        for group in samples:
-            task = asyncio.create_task(
-                generate_and_rm_group(
-                    self.args,
+        with generation_batch(self.args):
+            max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
+            for group in samples:
+                task = track_generation_task(
+                    asyncio.create_task(
+                        generate_and_rm_group(
+                            self.args,
+                            group,
+                            sampling_params=self.sampling_params.copy(),
+                            evaluation=False,
+                        )
+                    ),
                     group,
-                    sampling_params=self.sampling_params.copy(),
-                    evaluation=False,
                 )
-            )
-            # If any sample in the group has been aborted >= partial_rollout_max_aborted_count,
-            # mark this task as protected so it won't be aborted again.
-            if max_aborted_count is not None and any(sample.abort_count >= max_aborted_count for sample in group):
-                self.protected_pendings.add(task)
-            else:
-                self.pendings.add(task)
-        self.remaining_batch_size += len(samples)
+                # If any sample in the group has been aborted >= partial_rollout_max_aborted_count,
+                # mark this task as protected so it won't be aborted again.
+                if max_aborted_count is not None and any(sample.abort_count >= max_aborted_count for sample in group):
+                    self.protected_pendings.add(task)
+                else:
+                    self.pendings.add(task)
+            self.remaining_batch_size += len(samples)
 
 
 async def _run_image_processor(
@@ -351,6 +365,7 @@ def _decode_rollout_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np
 async def _post_generation(
     args: Namespace, state: "GenerateState", url: str, payload: dict, headers: dict | None, evaluation: bool
 ) -> Any:
+    headers = inference_headers(headers)
     router_recovery_enabled = not evaluation and args.fully_async and not args.use_slime_router
     for attempt in range(2):
         if attempt and state.abort_event.is_set():
@@ -654,6 +669,7 @@ async def generate(
     return sample
 
 
+@trace_generation
 async def _dispatch_generate(
     state: "GenerateState",
     args: Namespace,
@@ -816,7 +832,10 @@ async def generate_and_rm_group(
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
         tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+            track_generation_task(
+                asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation)),
+                [sample],
+            )
         )
 
     group = await asyncio.gather(*tasks)
@@ -900,6 +919,11 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
 
         if not args.partial_rollout:
+            from relax.utils.rl_sample_trace import discard_samples
+
+            for task in done:
+                if not task.cancelled() and task.exception() is None:
+                    discard_samples(args, task.result())
             continue
 
         # for partial rollout, collect the partial samples into the data buffer
@@ -919,6 +943,7 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
     return aborted_samples, completed_protected_samples
 
 
+@trace_iteration
 async def generate_rollout_async(
     args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]], data_system_client: Any
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
@@ -1342,6 +1367,7 @@ async def generate_rollout_async(
 EVAL_PROMPT_DATASET = {}
 
 
+@trace_iteration
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[RolloutFnEvalOutput, list[list[Sample]]]:
 
     state = GenerateState(args)
@@ -1361,6 +1387,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[RolloutFnEvalO
         state.evaluating -= 1
 
 
+@trace_generation_window
 async def eval_rollout_single_dataset(
     args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
 ) -> dict[str, dict[str, Any]]:
@@ -1375,7 +1402,8 @@ async def eval_rollout_single_dataset(
     global EVAL_PROMPT_DATASET
 
     prepare_model_maybe_update_args(args, completeness="metadata")
-    cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template)
+    record_prompt_id = rl_tracing_enabled(args)
+    cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template, record_prompt_id)
     if cache_key not in EVAL_PROMPT_DATASET:
         tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
@@ -1393,6 +1421,8 @@ async def eval_rollout_single_dataset(
             apply_chat_template_kwargs=args.apply_chat_template_kwargs,
             use_audio_in_video=args.use_audio_in_video,
             system_prompt=args.system_prompt,
+            record_prompt_id=record_prompt_id,
+            source_split="eval",
         )
     dataset = EVAL_PROMPT_DATASET[cache_key]
 
@@ -1421,6 +1451,7 @@ async def eval_rollout_single_dataset(
                 sample.index = sample_index
                 sample_index += 1
                 sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
+                sample.metadata["_rl_group_id"] = f"eval:{dataset_cfg.name}:{rollout_id}:{_i}"
                 sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
                 group.append(sample)
             sampling_params = base_sampling_params
@@ -1428,13 +1459,17 @@ async def eval_rollout_single_dataset(
                 sampling_params = base_sampling_params.copy()
                 sampling_params["sampling_seed"] = args.rollout_seed
             tasks.append(
-                asyncio.create_task(
-                    generate_and_rm_group(args, group, sampling_params=sampling_params, evaluation=True)
+                track_generation_task(
+                    asyncio.create_task(
+                        generate_and_rm_group(args, group, sampling_params=sampling_params, evaluation=True)
+                    ),
+                    group,
                 )
             )
 
         data = []
         do_print = True
+        seal_generation_batch()
         pbar = tqdm(total=len(tasks), desc=f"Eval {dataset_cfg.name}", disable=not do_print)
         for coro in asyncio.as_completed(tasks):
             group = await coro
@@ -1457,19 +1492,24 @@ async def eval_rollout_single_dataset(
                 sample.index = sample_index
                 sample_index += 1
                 sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
+                sample.metadata["_rl_group_id"] = f"eval:{dataset_cfg.name}:{rollout_id}:{_i}"
                 sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
                 sampling_params = base_sampling_params
                 if getattr(args, "sglang_enable_deterministic_inference", False):
                     sampling_params = base_sampling_params.copy()
                     sampling_params["sampling_seed"] = args.rollout_seed + j
                 tasks.append(
-                    asyncio.create_task(
-                        generate_and_rm(args, sample, sampling_params=sampling_params, evaluation=True)
+                    track_generation_task(
+                        asyncio.create_task(
+                            generate_and_rm(args, sample, sampling_params=sampling_params, evaluation=True)
+                        ),
+                        [sample],
                     )
                 )
 
         data = []
         do_print = True
+        seal_generation_batch()
         pbar = tqdm(total=len(tasks), desc=f"Eval {dataset_cfg.name}", disable=not do_print)
         for coro in asyncio.as_completed(tasks):
             sample = await coro

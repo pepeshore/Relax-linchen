@@ -346,6 +346,10 @@ async def test_old_partition_is_paid_before_current(monkeypatch, max_staleness, 
     assert state.last_step_current_deficit == expected_deficit
 
 
+def _eval_cache_key(args, cfg):
+    return cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template, sglang_rollout.rl_tracing_enabled(args))
+
+
 @pytest.mark.parametrize("group_rm", [False, True])
 @pytest.mark.asyncio
 async def test_eval_excludes_aborted_scored_and_unscored_samples(monkeypatch, group_rm):
@@ -379,7 +383,7 @@ async def test_eval_excludes_aborted_scored_and_unscored_samples(monkeypatch, gr
     rewards = [{"eval_score": 99}, None, {"eval_score": 1}, {"eval_score": 2}, None]
     dataset = SimpleNamespace(samples=[Sample(prompt="x") for _ in states])
     monkeypatch.setattr(sglang_rollout, "prepare_model_maybe_update_args", lambda *_args, **_kwargs: None)
-    monkeypatch.setitem(sglang_rollout.EVAL_PROMPT_DATASET, cfg.cache_key + (args.hf_checkpoint, False), dataset)
+    monkeypatch.setitem(sglang_rollout.EVAL_PROMPT_DATASET, _eval_cache_key(args, cfg), dataset)
 
     async def generate(args, sample, sampling_params, evaluation=False):
         sample.status = states[sample.index]
@@ -423,7 +427,7 @@ async def test_eval_discards_whole_aborted_reward_group(monkeypatch):
     monkeypatch.setattr(sglang_rollout, "prepare_model_maybe_update_args", lambda *_args, **_kwargs: None)
     monkeypatch.setitem(
         sglang_rollout.EVAL_PROMPT_DATASET,
-        cfg.cache_key + (args.hf_checkpoint, False),
+        _eval_cache_key(args, cfg),
         SimpleNamespace(samples=[Sample(prompt="x")]),
     )
 
@@ -475,7 +479,7 @@ async def test_eval_keeps_original_complete_prompt_groups(monkeypatch, group_rm,
     monkeypatch.setattr(sglang_rollout, "prepare_model_maybe_update_args", lambda *_args, **_kwargs: None)
     monkeypatch.setitem(
         sglang_rollout.EVAL_PROMPT_DATASET,
-        cfg.cache_key + (args.hf_checkpoint, False),
+        _eval_cache_key(args, cfg),
         SimpleNamespace(samples=[Sample(prompt="A"), Sample(prompt="B")]),
     )
 
@@ -510,3 +514,46 @@ async def test_eval_keeps_original_complete_prompt_groups(monkeypatch, group_rm,
     assert out["group_size"] == 2
     assert out["num_prompts"] == 2 and out["num_valid_prompts"] == 1
     assert compute_pass_rate(out["rewards"], out["group_size"]) == {"pass@1": 0.5, "pass@2": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_standard_generation_retry_preserves_parent_and_routing(monkeypatch, tmp_path):
+    from relax.utils import rl_tracing as tracing
+
+    monkeypatch.setenv("RELAX_OTEL_ENABLED", "1")
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+    args = _router_args(fully_async=True)
+    args.rl_trace_run_id = "retry-parent"
+    args.rl_trace_dir = str(tmp_path)
+    parent = tracing.Stage(args, "rl.rollout.sample")
+    calls = []
+
+    async def post(url, payload, headers=None, **kwargs):
+        calls.append(dict(headers))
+        if len(calls) == 1:
+            raise _status_error(503, body={"error": {"code": "no_available_workers"}})
+        return {"ok": True}
+
+    async def timeout(*args, **kwargs):
+        args[0].close()
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(sglang_rollout, "post", post)
+    monkeypatch.setattr(sglang_rollout.asyncio, "wait_for", timeout)
+    try:
+        with tracing.inference_context(parent):
+            assert await _post_generation(
+                args,
+                SimpleNamespace(abort_event=asyncio.Event()),
+                "http://test/generate",
+                {},
+                {"X-SMG-Routing-Key": "group"},
+                False,
+            ) == {"ok": True}
+        assert tracing.inference_headers() is None
+        assert len(calls) == 2 and calls[0] == calls[1]
+        context = parent.context()
+        assert calls[0]["traceparent"] == f"00-{context['trace_id']}-{context['span_id']}-{context['trace_flags']:02x}"
+        assert calls[0]["X-SMG-Routing-Key"] == "group"
+    finally:
+        parent.end()

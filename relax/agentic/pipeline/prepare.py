@@ -10,6 +10,7 @@ from typing import Any, Callable, Deque, Optional, Tuple, cast
 
 from relax.agentic.pipeline import GroupInput
 from relax.agentic.pipeline.runtime import RuntimeDomain, RuntimeGroupStream
+from relax.utils.rl_tracing import current_rollout
 from relax.utils.types import Sample
 
 
@@ -65,6 +66,8 @@ class PrepareDomain:
 
         if self._prepare_fetch_task is None and gap > 0:
             self._prepare_fetch_task = asyncio.create_task(self._fetch_group_inputs(gap), name="agentic-prepare-fetch")
+            if rollout := current_rollout():
+                rollout.track_admission(self._prepare_fetch_task)
             self._prepare_fetch_task.add_done_callback(lambda _task: self._progress_callback())
 
     def collect(self) -> None:
@@ -136,6 +139,8 @@ class PrepareDomain:
             self._prepare_group(group_input, launch_decision),
             name=f"agentic-prepare:{group_input.group_id}",
         )
+        if rollout := current_rollout():
+            rollout.track_admission(launch_decision, prepare_task)
         self._warming_prepare_tasks[prepare_task] = (group_input, launch_decision)
         prepare_task.add_done_callback(self._on_prepare_finished)
 
