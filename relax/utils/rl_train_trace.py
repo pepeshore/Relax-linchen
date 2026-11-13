@@ -14,7 +14,7 @@ import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import CancelledError, Future
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
@@ -133,6 +133,17 @@ def current_window_span() -> Stage | None:
     return window["span"] if window is not None else None
 
 
+def _native_parent(operation: Stage) -> AbstractContextManager:
+    """Expose the executing rank or phase to instrumentation using the OTel
+    API."""
+    if operation.span is None:
+        return nullcontext()
+    from opentelemetry.trace import use_span
+
+    # The RL stage owns the end timestamp and error recording.
+    return use_span(operation.span, end_on_exit=False, record_exception=False, set_status_on_exception=False)
+
+
 def training_rpc(function: Callable) -> Callable:
     @wraps(function)
     def call(owner: Any, rollout_id: int, *args: Any, trace_headers: dict | None = None, **kwargs: Any) -> Any:
@@ -156,7 +167,8 @@ def training_rpc(function: Callable) -> Callable:
             request = _RankRequest(rank, owner._rank)
             token = _REQUEST.set(request)
             try:
-                return function(owner, rollout_id, *args, **kwargs)
+                with _native_parent(rank):
+                    return function(owner, rollout_id, *args, **kwargs)
             finally:
                 rank.freeze_end()
                 _REQUEST.reset(token)
@@ -224,7 +236,8 @@ def window(
     token = _CURRENT.set(local)
     failure = None
     try:
-        yield
+        with _native_parent(operation):
+            yield
     except BaseException as error:
         failure = error
         raise

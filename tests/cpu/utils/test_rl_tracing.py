@@ -1949,14 +1949,19 @@ def test_native_megatron_step_inherits_rank_local_training_window(run, monkeypat
 
     @train.training_rpc
     def execute(owner, rollout_id):
+        with train.window(args, "reference", rollout_id, name="rl.reference.forward"):
+            with tracer.start_as_current_span("megatron.microbatch.forward"):
+                pass
+        with tracer.start_as_current_span("between_phases"):
+            pass
         with train.window(args, "actor", rollout_id):
             with telemetry.observe_step(rollout_id, 0, "actor"):
-                with tracer.start_as_current_span("megatron.microbatch.forward"):
-                    raise RuntimeError("failed forward")
+                with tracer.start_as_current_span("megatron.microbatch.backward"):
+                    raise RuntimeError("failed backward")
 
     with tracing.stage(args, "rl.actor.train_step") as dispatch:
         owner = SimpleNamespace(args=args, role="actor", _rank=0, _world_size=1)
-        with pytest.raises(RuntimeError, match="failed forward"):
+        with pytest.raises(RuntimeError, match="failed backward"):
             execute(owner, 2, trace_headers=dispatch.headers())
 
     (rank,) = spans(root, "rl.actor.train_rank")
@@ -1966,7 +1971,12 @@ def test_native_megatron_step_inherits_rank_local_training_window(run, monkeypat
     assert operation["parentSpanId"] == rank["spanId"]
     assert operation["traceId"] == f"{step.context.trace_id:032x}"
     assert operation["spanId"] == f"{step.parent.span_id:016x}"
-    assert native["megatron.microbatch.forward"].parent == step.context
+    assert native["megatron.microbatch.backward"].parent == step.context
+    (reference,) = spans(root, "rl.reference.forward")
+    for child, parent in ((native["megatron.microbatch.forward"], reference), (native["between_phases"], rank)):
+        assert child.parent is not None
+        assert f"{child.context.trace_id:032x}" == parent["traceId"]
+        assert f"{child.parent.span_id:016x}" == parent["spanId"]
     assert trace.get_current_span() is previous
     assert train.current_window_span() is None
     with telemetry.observe_step(3, 0, "actor"):

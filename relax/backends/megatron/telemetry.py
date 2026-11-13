@@ -105,27 +105,12 @@ def flush() -> None:
 def observe_step(rollout_id: int, step_id: int, role: str) -> Iterator[Any]:
     """Parent native spans to a Relax update and flush on success or
     failure."""
-    parent_context = nullcontext()
-    if _handle is not None and _handle.is_exporting:
-        from relax.utils.rl_train_trace import current_window_span
-
-        parent = current_window_span()
-        if parent is not None and parent.span is not None:
-            from opentelemetry.trace import use_span
-
-            # Lens reads OTel's current span. The RL window owns its end time and error recording.
-            parent_context = use_span(
-                parent.span, end_on_exit=False, record_exception=False, set_status_on_exception=False
-            )
     try:
-        with (
-            parent_context,
-            span(
-                "step",
-                "relax.train.step",
-                **{"relax.rollout_id": rollout_id, "relax.step_id": step_id, "relax.role": role},
-            ) as current,
-        ):
+        with span(
+            "step",
+            "relax.train.step",
+            **{"relax.rollout_id": rollout_id, "relax.step_id": step_id, "relax.role": role},
+        ) as current:
             yield current
     finally:
         flush()

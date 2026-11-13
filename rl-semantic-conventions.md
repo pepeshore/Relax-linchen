@@ -208,6 +208,8 @@ Agentic 常驻任务在操作开始时固定 parent 和 Step。上一轮启动�
 
 ### 问答：Megatron 原生 span 如何接入训练链路？
 
+训练 RPC 执行期间，rank 将自己的 span 设为当前 OTel 上下文。进入已埋点的前向或训练阶段时，当前上下文切换到该阶段，离开时恢复。因此重新计算 logprob 时导出的 `megatron.microbatch.forward` 属于正在执行的 `rl.actor.forward` 或 `rl.reference.forward`；直接由 RPC 在阶段之外生成的 span 继承该 rank。启动进程等发生在训练请求之前的操作有自己的生命周期。
+
 同时启用框架 RL tracing 和 Megatron Lens 时，实际导出的 `relax.train.step` 继承本 rank 的 `rl.actor.train` 或 `rl.critic.train` 的 trace ID，并以该操作作为直接父节点。该 step 对应一次优化器更新，内部的前反向和优化器 span 由 Lens 的 span group 与 rank 采样策略控制。Lens Resource 中的 `rl.run.id` 与 `rl.producer.role` 标记框架运行及产出进程。Lens 的运行标识和导出目标仍由实验配置决定。按 trace ID 和 parent span ID 可跨两个导出端还原调用树。
 
 ### 问答：一个训练请求如何对应多个 Megatron 进程？
