@@ -26,7 +26,7 @@ from relax.utils.rl_tracing import (
     inference_context,
     iteration_context,
     model_name,
-    stage,
+    telemetry,
 )
 
 
@@ -203,15 +203,10 @@ class GenerationBatch:
             # not close siblings that are still generating.
             self.owners[identity] = task
         if identities and self.observation is None:
-            self.observation = Stage(
-                self.args,
-                "rl.rollout.generate",
-                attributes={
-                    "rl.batch.id": uuid.uuid4().hex,
-                    "rl.purpose": "evaluation" if self.evaluation else "training",
-                    "rl.model.name": model_name(self.args),
-                    "rl.backend.name": "sglang",
-                },
+            self.observation = telemetry(self.args).rollout_generate(
+                purpose="evaluation" if self.evaluation else "training",
+                model_name=model_name(self.args),
+                backend_name="sglang",
             )
         if self.observation is not None:
             self.observation.set("rl.backend.name", "sglang")
@@ -336,17 +331,20 @@ def trace_generation(function: Callable) -> Callable:
                 batch.finish(sample, results, error)
         # If a custom callback generates directly, retain its framework invocation.
         rollout = current_rollout()
-        attrs = {
-            "rl.batch.id": uuid.uuid4().hex,
-            "rl.batch.size": 1,
-            "rl.purpose": "evaluation" if kwargs.get("evaluation", False) else "training",
-            "rl.rollout.mode": "multi_turn"
-            if getattr(sample, "generate_function_path", None) or getattr(args, "custom_generate_function_path", None)
-            else "single_turn",
-            "rl.model.name": model_name(args),
-            "rl.backend.name": "sglang",
-        }
-        scope = nullcontext(rollout.span) if rollout else stage(args, "rl.rollout.generate", attributes=attrs)
+        scope = (
+            nullcontext(rollout.span)
+            if rollout
+            else telemetry(args).rollout_generate(
+                batch_size=1,
+                purpose="evaluation" if kwargs.get("evaluation", False) else "training",
+                mode="multi_turn"
+                if getattr(sample, "generate_function_path", None)
+                or getattr(args, "custom_generate_function_path", None)
+                else "single_turn",
+                model_name=model_name(args),
+                backend_name="sglang",
+            )
+        )
         with scope as observation:
             detail = admit_sample(args, sample, observation)
             results, error = [], None
@@ -431,7 +429,7 @@ def trace_reward(function: Callable) -> Callable:
         }
         value, error = None, None
         token = _REWARD_BATCH.set(batch)
-        with stage(args, "rl.reward.score", parent=batch.observation, attributes=attrs, links=source) as observation:
+        with telemetry(args).reward_score(parent=batch.observation, attributes=attrs, links=source) as observation:
             try:
                 value = await function(args, sample, **kwargs)
                 return value
@@ -470,9 +468,7 @@ class RewardBatch:
         self.sealed = False
         self.error: BaseException | None = None
         self.end_time: int | None = None
-        self.observation = Stage(
-            args,
-            "rl.reward.batch",
+        self.observation = telemetry(args).reward_batch(
             **_rollout_stage_options({**reward_attributes(args, evaluation), "rl.batch.id": uuid.uuid4().hex}, parent),
         )
         for sample in samples:
@@ -643,9 +639,7 @@ def trace_transfer(function: Callable) -> Callable:
             return await function(args, batch_samples, batch_count, rollout_id, *rest, **kwargs)
         samples = _samples(batch_samples)
         data = {"export_ids": [export_id(sample) for sample in samples], "send_start_time": time.time()}
-        with stage(
-            args,
-            "rl.data.transfer",
+        with telemetry(args).data_transfer(
             links=_sources(samples),
             **_rollout_stage_options(
                 {
@@ -697,9 +691,7 @@ def trace_filter(function: Callable) -> Callable:
             return function(fn, *args, **kwargs)
         config = args[0] if len(args) > 1 else None
         samples = _samples(args[1] if len(args) > 1 else args[0])
-        with stage(
-            config,
-            "rl.data.filter",
+        with telemetry(config).data_filter(
             links=_sources(samples),
             **_rollout_stage_options(
                 {
@@ -773,7 +765,7 @@ def trace_forward(function: Callable) -> Callable:
                 "rl.execution.side": "training",
             }
         )
-        with stage(owner.args, name, attributes=attrs, active=active) as observation:
+        with telemetry(owner.args).forward(role, attributes=attrs, active=active) as observation:
             result = function(
                 owner, data_iterator, num_microbatches, store_prefix=store_prefix, collect_topk=collect_topk
             )
@@ -847,9 +839,7 @@ def trace_agentic_transfer(function: Callable) -> Callable:
             return await function(args=args, batch_samples=batch_samples, partition_id=partition_id, **kwargs)
         samples = _samples(batch_samples)
         data = {"export_ids": [export_id(sample) for sample in samples], "send_start_time": time.time()}
-        with stage(
-            args,
-            "rl.data.transfer",
+        with telemetry(args).data_transfer(
             links=_sources(samples),
             **_rollout_stage_options(
                 {
@@ -895,9 +885,7 @@ def trace_custom_advantage(function: Callable) -> Callable:
     async def call(owner: Any, group: Any) -> Any:
         if not enabled(owner.args):
             return await function(owner, group)
-        with stage(
-            owner.args,
-            "rl.advantage.compute",
+        with telemetry(owner.args).advantage_compute(
             **_rollout_stage_options(
                 {"rl.advantage.estimator": callable_name(owner.custom_advantage_func), "rl.execution.side": "rollout"}
             ),
@@ -931,8 +919,8 @@ def trace_opd_forward(role: str) -> Callable:
                 )
             else:
                 attrs["rl.forward.purpose"] = "distillation"
-            with stage(
-                owner.args, f"rl.{role}.forward", links=_sources([sample]), **_rollout_stage_options(attrs)
+            with telemetry(owner.args).forward(
+                role, links=_sources([sample]), **_rollout_stage_options(attrs)
             ) as observation:
                 result = await function(owner, sample, *args, **kwargs)
                 observation.freeze_end()

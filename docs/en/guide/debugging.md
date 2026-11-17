@@ -165,6 +165,28 @@ Keep batch-related args (`--global-batch-size`, `--n-samples-per-prompt`, parall
 
 ## Local RL traces
 
+RL spans use the independent **RL Lens** package (`rl-lens`, Python import
+`rl_lens`). Relax declares `rl-lens[otel]==0.1.0` in `requirements.txt` and keeps
+its configuration/object adapters in `relax.utils.rl_tracing`. The SDK sources,
+tests and semantic conventions live in the separate `rl-lens` repository;
+Relax does not bundle a copy.
+
+Before the first PyPI release, build/install the SDK from its repository before
+installing Relax. With both repositories checked out side by side:
+
+```bash
+python -m pip install -e '../rl-lens[otel]'
+python -m pip install -e .
+```
+
+For cluster runs, install the same RL Lens wheel/version in the driver and every
+Ray worker's Python environment. Uploading only Relax with `--working-dir` does
+not distribute the SDK. Verify the installation in each environment:
+
+```bash
+python -c 'import rl_lens; from importlib.metadata import version; print(version("rl-lens"), rl_lens.__file__)'
+```
+
 Training launched through `relax.entrypoints.train` records RL stages to disk by default. Each new driver launch gets a new `rl.run.id`, including a new job that resumes a checkpoint. In-process Controller recovery keeps the current run ID. Files are written under `<save>/otel-traces/<run_id>/`; without `--save`, the root is `otel-traces` in the driver working directory. Each process writes its own OTLP JSONL file. Each line is an OTLP trace export request, so concatenate the files for analysis rather than parsing the entire directory as one JSON document.
 
 Set `RELAX_OTEL_DIR` before submission to choose another output root, or `RELAX_OTEL_ENABLED=0` to disable RL traces. `OTEL_SDK_DISABLED=true` also disables them. Use a shared, persistent filesystem when you want to read all workers' output from one machine; on node-local disks, collect files from each worker separately. No collector endpoint is required.
@@ -190,6 +212,8 @@ The example in `examples/otel_tracing/agent.py` starts an `agent.invoke` span un
 For high-throughput multi-turn inference, an undersized exporter queue can drop spans and leave missing parents even when request entry points are linked correctly. When SGLang tracing is enabled, the smoke script sets `SGLANG_TRACE_LEVEL=2` by default. It retains request spans and omits the per-iteration `decode_loop` spans from Level 3. The exporter defaults to `OTEL_BSP_MAX_QUEUE_SIZE=65536` and `SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE=512`; environment variables can override these values. Prefer node-local receiver storage, then copy it to persistent storage after training and export finish. Validate the full parent chain, not only request counts.
 
 Join traces for the same step using `rl.run.id` and `rl.step.id`. The attribute `rl.iteration.index` preserves the framework's zero-based rollout counter. Each batch has its own `rl.batch.id` and actual input count. Spans for actual member operations share the batch trace and name their parent explicitly: `rl.rollout.sample` records a complete input rollout, and `rl.reward.score` belongs to `rl.reward.batch`. Links identify the data each operation consumes. Each ordinary or agentic rollout invocation owns one `rl.rollout.generate` through return, including waits inside that invocation. Its samples and the scoring batches, dynamic filters, queue writes, Agentic custom advantage calculations and OPD teacher/student prefills it starts are direct children. Standalone scoring creates a root batch span. Identify prompt groups on samples with `rl.group.id`. Each Session’s `rl.agent.run` is a child of its sample. An Agent can extract `RELAX_TRACEPARENT` and optional `RELAX_TRACESTATE` at startup and inject its current span into each callback.
+
+Native Megatron spans still use the opt-in Nemo Lens provider. The RL Lens SDK owns the framework spans; it does not replace Megatron's provider. While a rank request or training phase executes, Relax makes that SDK span the current OpenTelemetry span with `use_span`. Native Megatron spans therefore inherit its trace ID and parent span ID even though the providers export separately. Collect both exports to reconstruct the full parent chain. Merely installing `rl-lens` does not enable native Megatron tracing; see the [Megatron OTel example](https://github.com/pepeshore/Relax-linchen/blob/codex/megatron020-rl-otel/examples/megatron_otel/README.md) for initialization and exporter settings.
 
 Use `rl.execution.side` to select `rollout` or `training` for forward and advantage spans. For example, OPD student prefill and Megatron’s old-policy forward both use `rl.actor.forward`. The training-side forward retains its own timing and parentage. `rl.forward.purpose` describes the calculation and can be `distillation` on either side. A standalone OPD prefill still records `rollout` as its side. It has a parent only when a rollout owns the call. Resident tasks bind each operation to the rollout active at its start. For a queue write, `rl.step.id` identifies the calling step and `rl.transfer.target.step_id` identifies the destination.
 

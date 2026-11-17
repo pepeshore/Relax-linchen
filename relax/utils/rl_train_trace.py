@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterator
 
 from relax.utils.agentic_obs.writers import BoundedWorker, best_effort
 from relax.utils.logging_utils import get_logger
-from relax.utils.rl_tracing import Stage, enabled, iteration_attributes, model_name, stage
+from relax.utils.rl_tracing import Stage, enabled, iteration_attributes, model_name, telemetry
 
 
 logger = get_logger(__name__)
@@ -76,16 +76,13 @@ def dispatch_training(group: Any, method: str, rollout_id: int) -> list:
     if getattr(group.args, "train_backend", "megatron") != "megatron" or not enabled(group.args):
         return [getattr(worker, method).remote(rollout_id) for worker in workers]
 
-    parent = Stage(
-        group.args,
-        f"rl.{group.role}.train_step",
+    parent = telemetry(group.args).train_step(
+        group.role,
         producer_role=f"{group.role}_service",
         iteration=rollout_id,
-        attributes={
-            "rl.execution.side": "training",
-            "rl.backend.name": "megatron",
-            "rl.rank.world_size": len(workers),
-        },
+        execution_side="training",
+        backend_name="megatron",
+        world_size=len(workers),
     )
     headers = parent.headers()
     kwargs = {"trace_headers": headers} if headers else {}
@@ -150,18 +147,13 @@ def training_rpc(function: Callable) -> Callable:
         if not trace_headers or not enabled(owner.args):
             return function(owner, rollout_id, *args, **kwargs)
 
-        attrs = {
-            "rl.execution.side": "training",
-            "rl.backend.name": "megatron",
-            "rl.timing.scope": "rank_local",
-            "rl.rank.global": owner._rank,
-            "rl.rank.world_size": owner._world_size,
-        }
-        with stage(
-            owner.args,
-            f"rl.{owner.role}.train_rank",
+        with telemetry(owner.args).train_rank(
+            owner.role,
             iteration=rollout_id,
-            attributes=attrs,
+            execution_side="training",
+            backend_name="megatron",
+            rank=owner._rank,
+            world_size=owner._world_size,
             parent_headers=trace_headers,
         ) as rank:
             request = _RankRequest(rank, owner._rank)

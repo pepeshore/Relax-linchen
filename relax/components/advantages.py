@@ -18,7 +18,7 @@ from relax.utils.opd.opd_utils import (
 )
 from relax.utils.rl_service_trace import trace_replica_init
 from relax.utils.rl_trace_hooks import record_cpu_advantage
-from relax.utils.rl_tracing import enabled, stage
+from relax.utils.rl_tracing import enabled, telemetry
 from relax.utils.tq.lifecycle import attach_tq_client
 from relax.utils.training.ppo_utils import compute_approx_kl
 
@@ -113,9 +113,7 @@ class Advantages(Base):
                     self._logger.info(
                         f"Successfully got rollout_id: {step} data from transfer queue for compute advantages and returns."
                     )
-                    with stage(
-                        self.config,
-                        "rl.advantage.compute",
+                    with telemetry(self.config).advantage_compute(
                         producer_role="advantages_service",
                         iteration=step,
                         attributes={

@@ -10,7 +10,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from relax.utils.agentic_obs.writers import best_effort
-from relax.utils.rl_tracing import Stage, current_stage, enabled, model_name, stage
+from relax.utils.rl_tracing import current_stage, enabled, model_name, telemetry
 from relax.utils.rl_train_trace import current_rank_span
 
 
@@ -33,7 +33,7 @@ def trace_weight_sync(function: Callable) -> Callable:
         elif getattr(owner.args, "debug_train_only", False) or getattr(owner.args, "debug_rollout_only", False):
             return function(owner, *args, **kwargs)
         attrs = {"rl.execution.side": "training", "rl.rank.global": owner._rank, "rl.backend.name": "megatron"}
-        with stage(owner.args, "rl.weight.sync", parent=rank, attributes=attrs):
+        with telemetry(owner.args).weight_sync(parent=rank, attributes=attrs):
             return function(owner, *args, **kwargs)
 
     return call
@@ -87,12 +87,10 @@ def begin_weights(owner: Any) -> None:
     }
     sync = current_stage()
     parent = sync if sync is not None and sync.name == "rl.weight.sync" else None
-    publication = Stage(
-        owner.args, "rl.actor.publish_weights", parent=parent, attributes={**attrs, "rl.backend.name": "megatron"}
+    publication = telemetry(owner.args).actor_publish_weights(
+        parent=parent, attributes={**attrs, "rl.backend.name": "megatron"}
     )
-    activation = Stage(
-        owner.args,
-        "rl.rollout.load_weights",
+    activation = telemetry(owner.args).rollout_load_weights(
         parent=parent,
         attributes={
             **attrs,

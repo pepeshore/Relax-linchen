@@ -13,6 +13,8 @@ from functools import partial
 from types import SimpleNamespace
 
 import pytest
+from rl_lens import RLTracer, TraceConfig, current_stage, iteration_context
+from rl_lens import tracing as sdk_tracing
 
 from relax.utils import rl_trace_hooks as hooks
 from relax.utils import rl_tracing as tracing
@@ -87,6 +89,22 @@ def test_error_preserves_exception_and_marks_span(run):
     assert error.value is original
     record = spans(root)[0]
     assert record["status"] == {"message": "ValueError: actual failure", "code": 2}
+
+
+def test_stage_scope_starts_on_entry_and_supports_reusable_decorators(run):
+    args, root = run
+    scope = tracing.stage(args, "rl.actor.train")
+    assert not spans(root)
+    with tracing.iteration_context(4), scope:
+        assert tracing.current_stage().span.attributes["rl.iteration.index"] == 4
+
+    @tracing.stage(args, "rl.critic.train")
+    def train(value):
+        return value
+
+    assert train(1) == 1
+    assert train(2) == 2
+    assert len(spans(root, "rl.critic.train")) == 2
 
 
 @pytest.mark.parametrize("value", ["0", "false", "off", "no"])
@@ -563,7 +581,7 @@ def test_failed_transfer_does_not_invent_ack(run):
 
 def test_storage_failure_does_not_break_business(run, monkeypatch):
     args, _ = run
-    monkeypatch.setattr(tracing, "_runtime", lambda args: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(sdk_tracing, "_runtime", lambda args: (_ for _ in ()).throw(OSError("disk full")))
     with tracing.stage(args, "rl.actor.train") as observation:
         observation.data("rl.train.results", {"updates": []})
     assert observation.context() is None
@@ -1358,7 +1376,7 @@ def test_async_training_starts_at_train_call_not_rpc_entry(run, monkeypatch):
 def test_filter_excludes_result_serialization_time(run, monkeypatch):
     args, root = run
     clock = {"now": 100}
-    monkeypatch.setattr(tracing.time, "time_ns", lambda: clock["now"])
+    monkeypatch.setattr(sdk_tracing.time, "time_ns", lambda: clock["now"])
     original = hooks._record_filter_results
 
     def record(*args):
@@ -1382,7 +1400,7 @@ def test_custom_reward_batch_times_postprocessing_and_excludes_result_serializat
     args, root = run
     args.custom_rm_path = "custom.scorer"
     clock = {"now": 100}
-    monkeypatch.setattr(tracing.time, "time_ns", lambda: clock["now"])
+    monkeypatch.setattr(sdk_tracing.time, "time_ns", lambda: clock["now"])
     original = hooks._record_batched_values
 
     def record(*args):
@@ -1808,7 +1826,7 @@ def test_prefetched_agent_keeps_first_parent_and_links_consumer(run):
 def test_rollout_prefetch_counts_late_admission_without_extending_duration(run, monkeypatch):
     args, root = run
     now = {"ns": 100}
-    monkeypatch.setattr(tracing.time, "time_ns", lambda: now["ns"])
+    monkeypatch.setattr(sdk_tracing.time, "time_ns", lambda: now["ns"])
 
     async def exercise():
         loop = asyncio.get_running_loop()
@@ -1996,7 +2014,7 @@ def test_native_megatron_resource_preserves_lens_identity(run, monkeypatch, rela
     args.context_parallel_size = args.expert_model_parallel_size = 1
     monkeypatch.setenv("MEGATRON_OTEL_ENABLED", "1")
     monkeypatch.setenv("RELAX_OTEL_ENABLED", str(int(relax_enabled)))
-    monkeypatch.setattr(tracing, "_PROCESS_ROLE", (os.getpid(), "actor_rank"))
+    monkeypatch.setattr(sdk_tracing, "_PROCESS_ROLE", (os.getpid(), "actor_rank"))
     captured = {}
     lens_config = SimpleNamespace(run_id="explicit-lens-id", exporter="console", span_groups="step")
 
@@ -2024,3 +2042,29 @@ def test_native_megatron_resource_preserves_lens_identity(run, monkeypatch, rela
     if relax_enabled:
         assert resource["rl.run.id"] == args.rl_trace_run_id
         assert resource["rl.producer.role"] == "actor_rank"
+
+
+def test_installed_sdk_and_relax_share_context_without_implicit_parentage(tmp_path, monkeypatch):
+    from argparse import Namespace
+
+    from relax.utils import rl_tracing as relax_tracing
+
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+    monkeypatch.setenv("RELAX_OTEL_ENABLED", "1")
+    args = Namespace(rl_trace_run_id="mixed", rl_trace_dir=str(tmp_path))
+    tracer = RLTracer(TraceConfig("mixed", str(tmp_path)))
+    with iteration_context(7), tracer.rollout_generate() as outer:
+        assert relax_tracing.current_stage() is outer
+        with relax_tracing.telemetry(args).actor_train(algorithm="grpo") as independent:
+            assert current_stage() is independent
+            assert relax_tracing.iteration_attributes()["rl.iteration.index"] == 7
+        assert current_stage() is outer
+    assert current_stage() is None
+    records = []
+    for path in tmp_path.rglob("*.jsonl"):
+        for line in path.read_text().splitlines():
+            for resource in json.loads(line)["resourceSpans"]:
+                for scope in resource["scopeSpans"]:
+                    records.extend(scope["spans"])
+    assert len({span["traceId"] for span in records}) == 2
+    assert all(not span.get("parentSpanId") for span in records)

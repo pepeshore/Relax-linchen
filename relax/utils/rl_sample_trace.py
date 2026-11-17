@@ -11,7 +11,7 @@ from typing import Any
 
 from relax.utils.agentic_obs.source import sample_prompt_id
 from relax.utils.agentic_obs.writers import best_effort
-from relax.utils.rl_tracing import Stage, current_rollout, iteration_attributes, run_id
+from relax.utils.rl_tracing import Stage, current_rollout, iteration_attributes, run_id, telemetry
 
 
 _LIVE: dict[tuple[str, str], SampleTrace] = {}
@@ -46,7 +46,7 @@ class SampleTrace:
             attrs["rl.group.id"] = str(group)
         attrs.pop("rl.step.id", None)
         attrs.pop("rl.iteration.index", None)
-        self.span = Stage(args, "rl.rollout.sample", parent=parent, attributes=attrs, inherit_iteration=False)
+        self.span = telemetry(args).rollout_sample(parent=parent, attributes=attrs, inherit_iteration=False)
         self.memberships: list[dict[str, Any]] = []
         self.version: str | None = None
         if getattr(sample, "prompt", None) is not None:

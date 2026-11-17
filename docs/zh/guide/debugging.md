@@ -165,6 +165,26 @@ batch 相关参数（`--global-batch-size`、`--n-samples-per-prompt`、并行�
 
 ## 本地 RL Trace
 
+RL span 使用独立的 **RL Lens** 包（发行名 `rl-lens`，Python 导入名
+`rl_lens`）。Relax 在 `requirements.txt` 中声明 `rl-lens[otel]==0.1.0`，
+只在 `relax.utils.rl_tracing` 中保留配置和对象适配层。SDK 源码、测试和语义约定
+由独立的 `rl-lens` 仓库维护，Relax 不再打包 SDK 副本。
+
+首次发布到 PyPI 前，先从 SDK 仓库安装，再安装 Relax。两个仓库同级放置时：
+
+```bash
+python -m pip install -e '../rl-lens[otel]'
+python -m pip install -e .
+```
+
+集群运行前，在 driver 和每个 Ray worker 使用的 Python 环境中安装同一版本的
+RL Lens wheel。只用 `--working-dir` 上传 Relax 不会分发 SDK。各节点可用以下命令
+核对安装版本和实际导入位置：
+
+```bash
+python -c 'import rl_lens; from importlib.metadata import version; print(version("rl-lens"), rl_lens.__file__)'
+```
+
 通过 `relax.entrypoints.train` 启动训练时，默认将 RL 阶段 trace 写入磁盘。每次启动新的 driver 都会生成新的 `rl.run.id`，包括重新提交作业从 checkpoint 续训。同一 driver 内的 Controller 恢复沿用原 run ID。文件默认位于 `<save>/otel-traces/<run_id>/`；没有设置 `--save` 时，使用 driver 工作目录下的 `otel-traces`。每个进程独立写入一个 OTLP JSONL 文件，每行是一次 OTLP trace 导出请求，分析时逐行合并读取。
 
 提交任务前设置 `RELAX_OTEL_DIR` 可更改输出根目录，设置 `RELAX_OTEL_ENABLED=0` 可关闭 RL trace，`OTEL_SDK_DISABLED=true` 也会关闭采集。若需要在一台机器上读取所有 worker 的数据，请使用共享持久化目录；使用节点本地磁盘时，需要分别收集各 worker 的文件。采集不依赖 Collector 地址。
@@ -190,6 +210,8 @@ PYTHONPATH=. python scripts/tools/collect_otlp_traces.py \
 采集高吞吐、多轮推理时，导出队列不足可能导致 spans 丢失，即使请求入口关联正确也会出现缺失的父节点。上述 smoke 脚本启用 SGLang tracing 时默认设置 `SGLANG_TRACE_LEVEL=2`，保留请求 span，跳过 Level 3 的逐次解码 `decode_loop`。导出器默认使用 `OTEL_BSP_MAX_QUEUE_SIZE=65536` 和 `SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE=512`，可通过环境变量覆盖。接收器建议先写节点本地磁盘，训练及导出结束后再复制到持久化存储；应校验完整父链，不能仅检查请求入口数量。
 
 通过 `rl.run.id` 和 `rl.step.id` 查询同一步的各条 trace。`rl.iteration.index` 保留从 0 开始的 rollout 轮次。每个批次记录自身 `rl.batch.id` 和实际输入数，真实成员操作 span 与批次共用 trace 并指定真实 parent：`rl.rollout.sample` 记录一条输入的完整 rollout，`rl.reward.score` 归属于 `rl.reward.batch`。数据来源使用 Links。每次普通或 Agentic rollout 调用产生一个 `rl.rollout.generate`，直接包含本轮的样本，以及实际发起的评分批次、动态过滤、队列写入、Agentic 自定义优势计算和 OPD teacher／student prefill，其耗时包含函数返回前的等待。独立发起的评分保留根 span。不同 prompt group 的样本通过 `rl.group.id` 区分。`rl.agent.run` 是本 Session 样本的子 span。Agent 可提取子进程环境中的 `RELAX_TRACEPARENT`／`RELAX_TRACESTATE`，在发起模型请求时注入当前调用的 W3C 上下文。
+
+Megatron 原生 span 仍由按需启用的 Nemo Lens provider 生成。RL Lens SDK 负责框架 span，不替换 Megatron 的 provider。执行 rank 请求或训练阶段时，Relax 通过 `use_span` 将对应的 SDK span 设为当前 OpenTelemetry span；Megatron 的原生 span 因此继承它的 trace ID 和父 span ID，两套 provider 分别导出。重建完整父子链路时需要同时采集两份输出。仅安装 `rl-lens` 不会启用 Megatron 原生 tracing；初始化和导出配置见 [Megatron OTel 示例](https://github.com/pepeshore/Relax-linchen/blob/codex/megatron020-rl-otel/examples/megatron_otel/README.md)。
 
 用 `rl.execution.side` 筛选 `rollout` 或 `training`。例如 OPD student prefill 和 Megatron 的旧策略前向都叫 `rl.actor.forward`，训练侧前向保留自身的父关系和计时。`rl.forward.purpose` 描述计算用途，两侧都可能是 `distillation`。单独调用 OPD prefill 也会标记 `rollout`，有实际所属 rollout 时才填写父节点。Agentic 常驻任务在每个操作开始时绑定当时的 rollout。写队列时，`rl.step.id` 表示谁发起写入，`rl.transfer.target.step_id` 表示写入哪个分区。
 

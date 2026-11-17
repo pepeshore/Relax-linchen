@@ -6,14 +6,13 @@ from __future__ import annotations
 
 import copy
 import time
-import uuid
 from contextvars import ContextVar
 from datetime import datetime
 from functools import wraps
 from typing import Any
 
 from relax.utils.agentic_obs.writers import best_effort
-from relax.utils.rl_tracing import Stage, enabled, iteration_attributes, model_name
+from relax.utils.rl_tracing import enabled, iteration_attributes, model_name, telemetry
 
 
 def _timestamps(value: Any) -> Any:
@@ -43,19 +42,14 @@ class AgentBatch:
         self.steps: set[int] = set()
         self.error: BaseException | None = None
         self.versions: dict[str, str | None] = {}
-        self.span = Stage(
-            args,
-            "rl.rollout.generate",
+        self.span = telemetry(args).rollout_generate(
             inherit_iteration=False,
-            attributes={
-                "rl.batch.id": uuid.uuid4().hex,
-                "rl.batch.size": len(sessions),
-                "rl.group.id": group_id,
-                "rl.purpose": "evaluation" if mode == "eval" else "training",
-                "rl.rollout.mode": "agentic",
-                "rl.model.name": model_name(args),
-                "rl.backend.name": "sglang",
-            },
+            batch_size=len(sessions),
+            purpose="evaluation" if mode == "eval" else "training",
+            mode="agentic",
+            model_name=model_name(args),
+            backend_name="sglang",
+            attributes={"rl.group.id": group_id},
         )
 
     @best_effort
@@ -139,9 +133,7 @@ class AgentTrace:
         attrs = {k: v for k, v in attrs.items() if k not in ("rl.step.id", "rl.iteration.index")}
         self.batch_id = attrs.get("rl.batch.id")
         self.memberships: list[dict[str, str]] = [{"batch_id": self.batch_id}]
-        self.sample = Stage(
-            args,
-            "rl.rollout.sample",
+        self.sample = telemetry(args).rollout_sample(
             parent=self.batch.span if self.batch else None,
             parent_headers=origin["headers"] if origin else None,
             inherit_iteration=False,
@@ -156,9 +148,7 @@ class AgentTrace:
         )
         if session_input.input_payload.get("messages") is not None:
             self.sample.data("rl.sample.input", session_input.input_payload["messages"])
-        self.span = Stage(
-            args,
-            "rl.agent.run",
+        self.span = telemetry(args).agent_run(
             parent=self.sample,
             inherit_iteration=False,
             attributes={
